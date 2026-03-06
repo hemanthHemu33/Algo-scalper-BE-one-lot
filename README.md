@@ -579,3 +579,12 @@ SL will jump to protect ~₹175 (0.25R) minimum.
 Strong winners beyond 1.5R will trail tighter and exit quicker on pullbacks.
 Time-stop exits will try a fast LIMIT first, and if not filled in ~2s they’ll escalate.
 After exits, you’ll see cooldown behavior based on exit reason.
+
+<!-- **********************Math for your 4 capital levels (₹50k / 1L / 1.5L / 2L)************ -->
+
+Daily max loss (6.5%) and per-trade budget (÷4)
+
+₹50,000 → daily = ₹3,250 → per-trade budget = ₹812.5
+₹1,00,000 → daily = ₹6,500 → per-trade budget = ₹1,625
+₹1,50,000 → daily = ₹9,750 → per-trade budget = ₹2,437.5
+₹2,00,000 → daily = ₹13,000 → per-trade budget = ₹3,250
