@@ -33,6 +33,7 @@ A production-ready, Zerodha Kite Connect–powered **scalping engine** that:
 - [Alerts & notifications](#alerts--notifications)
 - [Sockets / live dashboard stream](#sockets--live-dashboard-stream)
 - [API endpoints](#api-endpoints)
+- [Backtesting](#backtesting)
 - [Scripts](#scripts)
 - [Deployment (Render)](#deployment-render)
 - [Operations & runbook](#operations--runbook)
@@ -420,6 +421,152 @@ Key endpoints:
 
 ---
 
+## Backtesting
+
+The backtest framework extends the existing replay engine and option backtest path. It does not replace the live engine or reimplement signal logic from scratch.
+
+### Prerequisites
+
+- MongoDB must be running.
+- `.env` must be configured.
+- Kite API key must be valid.
+- Access token must exist in the token store.
+- Instruments cache should be refreshed before option-universe prep.
+- Historical underlying candles must already be backfilled.
+- Historical option candles must already be prepared when running in `OPT` mode.
+
+### Data preparation
+
+```bash
+npm run sync:instruments
+npm run bt:backfill -- --token=260105 --from=2026-01-01 --to=2026-01-31T23:59:59+05:30 --interval=1 --chunkDays=10
+npm run bt:prepare-options -- --underlyingToken=260105 --underlying="NIFTY 50" --optionType=ALL --from=2026-01-01 --to=2026-01-31 --interval=1 --strikeStep=50 --scanSteps=3 --refreshInstruments=true
+```
+
+### Sample configs
+
+- `config/backtests/nifty_opt_1m_sample.json`
+- `config/backtests/nifty_opt_matrix_sample.json`
+- `config/backtests/nifty_opt_walkforward_sample.json`
+
+These configs use the framework sections added for reproducible runs:
+
+- `metadata`
+- `data`
+- `instrument`
+- `execution`
+- `capital`
+- `risk`
+- `strategies`
+- `exits`
+- `reports`
+- `acceptance`
+- `matrix`
+- `walkForward`
+
+### Validate data
+
+```bash
+npm run bt:validate-data -- --config=config/backtests/nifty_opt_1m_sample.json
+```
+
+The validation command runs independently before a replay. It checks timestamp monotonicity, duplicate candles, missing gaps, session violations, underlying continuity, option coverage, contract availability, and writes a structured report.
+
+- `validation.lookAheadGuard=true` keeps the future-candle / look-ahead check enabled.
+- `validation.lookAheadGuard=false` skips only that look-ahead check; other integrity checks still run.
+- `strategy.optimizerGateEnabled` is not supported in backtest configs and now fails fast if provided.
+
+### Run one backtest
+
+```bash
+npm run bt:run -- --config=config/backtests/nifty_opt_1m_sample.json
+```
+
+Existing direct CLI flags still work, but config-driven runs are the preferred path for reproducibility.
+
+### Example NIFTY options workflow
+
+```bash
+npm install
+npm run sync:instruments
+npm run bt:backfill -- --token=260105 --from=2026-01-01 --to=2026-01-31T23:59:59+05:30 --interval=1 --chunkDays=10
+npm run bt:prepare-options -- --underlyingToken=260105 --underlying="NIFTY 50" --optionType=ALL --from=2026-01-01 --to=2026-01-31 --interval=1 --refreshInstruments=true
+npm run bt:validate-data -- --config=config/backtests/nifty_opt_1m_sample.json
+npm run bt:run -- --config=config/backtests/nifty_opt_1m_sample.json
+```
+
+### Report folder layout
+
+Each single run writes a full report pack under `reports/backtests/<runId>/`:
+
+- `run_config.json`
+- `run_summary.json`
+- `run_summary.md`
+- `trade_log.csv` / `trade_log.json`
+- `signal_log.csv` / `signal_log.json`
+- `admission_log.csv` / `admission_log.json`
+- `rejection_log.csv` / `rejection_log.json`
+- `daily_report.csv`
+- `strategy_report.csv`
+- `monthly_report.csv`
+- `regime_report.csv`
+- `reason_breakdown.csv`
+- `equity_curve.csv`
+- `drawdown_curve.csv`
+- `execution_report.json`
+- `data_quality_report.json`
+- `acceptance_report.json`
+
+### Matrix sensitivity runs
+
+```bash
+npm run bt:matrix -- --config=config/backtests/nifty_opt_matrix_sample.json
+```
+
+The matrix runner expands the configured parameter grid, runs each child replay sequentially, keeps failures in the batch summary instead of crashing the whole job, and writes:
+
+- `reports/backtests/matrix/<matrixRunId>/matrix_summary.csv`
+- `reports/backtests/matrix/<matrixRunId>/matrix_summary.json`
+- `reports/backtests/matrix/<matrixRunId>/matrix_summary.md`
+
+### Walk-forward validation
+
+```bash
+npm run bt:wfa -- --config=config/backtests/nifty_opt_walkforward_sample.json
+```
+
+The walk-forward runner splits the period into train/test folds, optionally evaluates a candidate grid on each train window, selects the best candidate, runs the test window, and writes:
+
+- `reports/backtests/wfa/<wfaRunId>/fold_summary.csv`
+- `reports/backtests/wfa/<wfaRunId>/fold_summary.json`
+- `reports/backtests/wfa/<wfaRunId>/fold_summary.md`
+- `reports/backtests/wfa/<wfaRunId>/oos_summary.csv`
+- `reports/backtests/wfa/<wfaRunId>/oos_summary.json`
+- `reports/backtests/wfa/<wfaRunId>/best_params_by_fold.json`
+
+### Acceptance verdict
+
+`acceptance_report.json` is the machine-readable pass/fail artifact for a normal run. It includes:
+
+- `verdict`
+- `passed`
+- rule-by-rule results
+- failed rules
+- warnings
+- headline interpretation
+
+Matrix summaries include the acceptance verdict for each child run. Walk-forward summaries include an out-of-sample acceptance verdict.
+
+### Common failure modes
+
+- Empty or thin option datasets because `bt:prepare-options` was skipped or run for the wrong date range.
+- `MISSING_INSTRUMENT_METADATA` because instruments were not synced before preparing options.
+- `MISSING_OPTION_CANDLE` or option coverage gaps because the selected contracts were not backfilled for all sessions.
+- Config validation errors because `data.from` / `data.to` are invalid or `reports.outputDir` points to a file.
+- Immediate run failure in strict mode because the validation report contains hard-fail issues.
+
+---
+
 ## Scripts
 
 Useful CLI utilities:
@@ -438,11 +585,23 @@ Useful CLI utilities:
   ```
 - **Run backtest engine** (supports EQ and dynamic OPT contracts)
   ```bash
-  npm run bt:run -- --mode=OPT --token=260105 --underlying="NIFTY 50" --dynamicContracts=true --from=2025-01-01 --to=2025-01-31 --interval=1 --qty=50 --forceEodExit=true
+  npm run bt:run -- --config=config/backtests/nifty_opt_1m_sample.json
+  ```
+- **Validate dataset for backtests**
+  ```bash
+  npm run bt:validate-data -- --config=config/backtests/nifty_opt_1m_sample.json
   ```
 - **Prepare option universe + historical candles for backtests**
   ```bash
   npm run bt:prepare-options -- --underlyingToken=260105 --underlying="NIFTY 50" --optionType=ALL --from=2025-01-01 --to=2025-01-31 --interval=1 --refreshInstruments=true
+  ```
+- **Matrix sensitivity runner**
+  ```bash
+  npm run bt:matrix -- --config=config/backtests/nifty_opt_matrix_sample.json
+  ```
+- **Walk-forward runner**
+  ```bash
+  npm run bt:wfa -- --config=config/backtests/nifty_opt_walkforward_sample.json
   ```
 
 ---

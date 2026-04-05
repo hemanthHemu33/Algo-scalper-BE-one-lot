@@ -1,0 +1,339 @@
+{
+  "version": "repo-cal-v1",
+  "source": "repo:signal_score_calibration.json",
+  "active": true,
+  "fallbackReason": null,
+  "defaults": {
+    "raw": {
+      "floor": 58,
+      "ceil": 92,
+      "shape": 1
+    },
+    "qualityWeights": {
+      "patternQuality": 0.27,
+      "volumeQuality": 0.17,
+      "anchorQuality": 0.22,
+      "structureQuality": 0.34
+    },
+    "contextWeights": {
+      "regimeAlignment": 0.21,
+      "freshness": 0.14,
+      "antiChop": 0.09,
+      "stageScore": 0.13,
+      "mtfAgreementScore": 0.16,
+      "antiGap": 0.05,
+      "selectorParticipation": 0.22
+    },
+    "finalWeights": {
+      "normalizedConfidence": 0.33,
+      "qualityScore": 0.34,
+      "contextScore": 0.33
+    },
+    "bias": 0
+  },
+  "intervals": {
+    "FAST": {
+      "qualityWeights": {
+        "patternQuality": 0.25,
+        "volumeQuality": 0.18,
+        "anchorQuality": 0.21,
+        "structureQuality": 0.36
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.19,
+        "freshness": 0.16,
+        "antiChop": 0.1,
+        "stageScore": 0.14,
+        "mtfAgreementScore": 0.16,
+        "antiGap": 0.05,
+        "selectorParticipation": 0.2
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.31,
+        "qualityScore": 0.35,
+        "contextScore": 0.34
+      },
+      "bias": 0
+    },
+    "INTRADAY": {
+      "qualityWeights": {
+        "patternQuality": 0.27,
+        "volumeQuality": 0.16,
+        "anchorQuality": 0.23,
+        "structureQuality": 0.34
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.21,
+        "freshness": 0.14,
+        "antiChop": 0.09,
+        "stageScore": 0.13,
+        "mtfAgreementScore": 0.17,
+        "antiGap": 0.05,
+        "selectorParticipation": 0.21
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.33,
+        "qualityScore": 0.34,
+        "contextScore": 0.33
+      },
+      "bias": 0
+    },
+    "SLOW": {
+      "qualityWeights": {
+        "patternQuality": 0.29,
+        "volumeQuality": 0.15,
+        "anchorQuality": 0.24,
+        "structureQuality": 0.32
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.23,
+        "freshness": 0.12,
+        "antiChop": 0.09,
+        "stageScore": 0.12,
+        "mtfAgreementScore": 0.18,
+        "antiGap": 0.05,
+        "selectorParticipation": 0.21
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.34,
+        "qualityScore": 0.33,
+        "contextScore": 0.33
+      },
+      "bias": 0.5
+    }
+  },
+  "families": {
+    "TREND": {
+      "raw": {
+        "floor": 60,
+        "ceil": 93,
+        "shape": 0.96
+      },
+      "qualityWeights": {
+        "patternQuality": 0.24,
+        "volumeQuality": 0.14,
+        "anchorQuality": 0.24,
+        "structureQuality": 0.38
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.24,
+        "freshness": 0.12,
+        "antiChop": 0.08,
+        "stageScore": 0.11,
+        "mtfAgreementScore": 0.17,
+        "antiGap": 0.04,
+        "selectorParticipation": 0.24
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.31,
+        "qualityScore": 0.36,
+        "contextScore": 0.33
+      },
+      "bias": 0.5
+    },
+    "BREAKOUT": {
+      "raw": {
+        "floor": 61,
+        "ceil": 94,
+        "shape": 0.94
+      },
+      "qualityWeights": {
+        "patternQuality": 0.23,
+        "volumeQuality": 0.19,
+        "anchorQuality": 0.22,
+        "structureQuality": 0.36
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.24,
+        "freshness": 0.13,
+        "antiChop": 0.08,
+        "stageScore": 0.11,
+        "mtfAgreementScore": 0.16,
+        "antiGap": 0.04,
+        "selectorParticipation": 0.24
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.31,
+        "qualityScore": 0.37,
+        "contextScore": 0.32
+      },
+      "bias": 1
+    },
+    "VWAP": {
+      "raw": {
+        "floor": 56,
+        "ceil": 91,
+        "shape": 0.92
+      },
+      "qualityWeights": {
+        "patternQuality": 0.24,
+        "volumeQuality": 0.17,
+        "anchorQuality": 0.27,
+        "structureQuality": 0.32
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.22,
+        "freshness": 0.13,
+        "antiChop": 0.09,
+        "stageScore": 0.12,
+        "mtfAgreementScore": 0.17,
+        "antiGap": 0.04,
+        "selectorParticipation": 0.23
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.32,
+        "qualityScore": 0.34,
+        "contextScore": 0.34
+      },
+      "bias": 0.5
+    },
+    "OPEN": {
+      "raw": {
+        "floor": 68,
+        "ceil": 95,
+        "shape": 0.9
+      },
+      "qualityWeights": {
+        "patternQuality": 0.21,
+        "volumeQuality": 0.2,
+        "anchorQuality": 0.24,
+        "structureQuality": 0.35
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.24,
+        "freshness": 0.16,
+        "antiChop": 0.07,
+        "stageScore": 0.11,
+        "mtfAgreementScore": 0.15,
+        "antiGap": 0.03,
+        "selectorParticipation": 0.24
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.29,
+        "qualityScore": 0.39,
+        "contextScore": 0.32
+      },
+      "bias": 2
+    },
+    "MOMENTUM": {
+      "raw": {
+        "floor": 63,
+        "ceil": 95,
+        "shape": 0.95
+      },
+      "qualityWeights": {
+        "patternQuality": 0.22,
+        "volumeQuality": 0.23,
+        "anchorQuality": 0.18,
+        "structureQuality": 0.37
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.23,
+        "freshness": 0.15,
+        "antiChop": 0.08,
+        "stageScore": 0.11,
+        "mtfAgreementScore": 0.15,
+        "antiGap": 0.04,
+        "selectorParticipation": 0.24
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.31,
+        "qualityScore": 0.38,
+        "contextScore": 0.31
+      },
+      "bias": 0.5
+    },
+    "MEAN_REVERSION": {
+      "raw": {
+        "floor": 58,
+        "ceil": 90,
+        "shape": 1
+      },
+      "qualityWeights": {
+        "patternQuality": 0.27,
+        "volumeQuality": 0.14,
+        "anchorQuality": 0.25,
+        "structureQuality": 0.34
+      },
+      "contextWeights": {
+        "regimeAlignment": 0.22,
+        "freshness": 0.14,
+        "antiChop": 0.1,
+        "stageScore": 0.13,
+        "mtfAgreementScore": 0.14,
+        "antiGap": 0.05,
+        "selectorParticipation": 0.22
+      },
+      "finalWeights": {
+        "normalizedConfidence": 0.34,
+        "qualityScore": 0.33,
+        "contextScore": 0.33
+      },
+      "bias": 0
+    }
+  },
+  "strategies": {
+    "orb": {
+      "bias": 2.5
+    },
+    "breakout": {
+      "bias": 1.5
+    },
+    "vwap_reclaim": {
+      "contextWeights": {
+        "mtfAgreementScore": 0.18,
+        "selectorParticipation": 0.23
+      },
+      "bias": 1
+    },
+    "ema_pullback": {
+      "qualityWeights": {
+        "patternQuality": 0.23,
+        "volumeQuality": 0.13,
+        "anchorQuality": 0.24,
+        "structureQuality": 0.4
+      }
+    },
+    "rsi_fade": {
+      "contextWeights": {
+        "antiChop": 0.11,
+        "selectorParticipation": 0.2
+      }
+    },
+    "fakeout": {
+      "contextWeights": {
+        "freshness": 0.16,
+        "antiChop": 0.12
+      }
+    },
+    "wick_reversal": {
+      "qualityWeights": {
+        "patternQuality": 0.3,
+        "anchorQuality": 0.24,
+        "structureQuality": 0.31
+      }
+    },
+    "volume_spike": {
+      "qualityWeights": {
+        "patternQuality": 0.24,
+        "volumeQuality": 0.24,
+        "anchorQuality": 0.16,
+        "structureQuality": 0.36
+      }
+    },
+    "bb_squeeze": {
+      "qualityWeights": {
+        "patternQuality": 0.22,
+        "volumeQuality": 0.18,
+        "anchorQuality": 0.22,
+        "structureQuality": 0.38
+      }
+    },
+    "ema_cross": {
+      "contextWeights": {
+        "selectorParticipation": 0.24,
+        "antiChop": 0.11
+      }
+    }
+  }
+}

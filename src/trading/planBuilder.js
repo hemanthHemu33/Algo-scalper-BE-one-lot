@@ -241,6 +241,7 @@ function buildTradePlan({
   entryPremium,
   premiumTick,
   atrPctUnderlying,
+  rrFloorOverride,
   nowTs = Date.now(),
 }) {
   const dir = String(side || "").toUpperCase();
@@ -254,7 +255,11 @@ function buildTradePlan({
   );
   const k = pickK(env, style);
   const m = pickM(env, style);
-  const minRr = minRR(env, style);
+  const styleMinRr = minRR(env, style);
+  const rrOverride = safeNum(rrFloorOverride, null);
+  const effectiveMinRr = Number.isFinite(rrOverride)
+    ? Math.max(styleMinRr, rrOverride)
+    : styleMinRr;
 
   const entryU = safeNum(entryUnderlying);
   if (!Number.isFinite(entryU) || entryU <= 0)
@@ -381,7 +386,7 @@ function buildTradePlan({
     const dist = Math.abs(cand.level - entryU);
     if (Number.isFinite(em) && em > 0 && dist > em * reachMult) continue;
     const rr = dist / R;
-    if (rr >= minRr) {
+    if (rr >= effectiveMinRr) {
       chosen = { ...cand, rr, dist, R };
       break;
     }
@@ -390,13 +395,17 @@ function buildTradePlan({
   if (!chosen) {
     const dist = Math.abs(atrTargetU - entryU);
     const rr = dist / R;
-    if (rr >= minRr && Number.isFinite(dist) && dist > 0) {
+    if (rr >= effectiveMinRr && Number.isFinite(dist) && dist > 0) {
       chosen = { level: atrTargetU, tag: "ATR_TARGET_FALLBACK", rr, dist, R };
     }
   }
 
   if (!chosen)
-    return { ok: false, reason: "no_target_meets_minRR", meta: { minRr, R } };
+    return {
+      ok: false,
+      reason: "no_target_meets_minRR",
+      meta: { minRr: effectiveMinRr, styleMinRr, effectiveMinRr, R },
+    };
 
   const targetU = chosen.level;
   const rrUnderlying = chosen.rr;
@@ -410,7 +419,9 @@ function buildTradePlan({
     style,
     k,
     m,
-    minRr,
+    minRr: effectiveMinRr,
+    styleMinRr,
+    effectiveMinRr,
     slReason,
     targetReason: chosen.tag,
     rrUnderlying,
@@ -525,7 +536,7 @@ function buildTradePlan({
           premiumTick: t,
           premiumCandles,
           optionMeta,
-          rrMin: minRr,
+          rrMin: effectiveMinRr,
         })
       : { ok: false, reason: "disabled" };
 
@@ -542,7 +553,7 @@ function buildTradePlan({
       stopP = roundToTick(stopP, t, "down");
 
       const Rp = Math.abs(premEntry - stopP);
-      const minTarget = premEntry + minRr * (Rp || 0);
+      const minTarget = premEntry + effectiveMinRr * (Rp || 0);
 
       // Avoid unrealistic targets: prefer the closer target, but enforce minRR.
       const closerTarget = Math.min(

@@ -218,6 +218,11 @@ class SignalTelemetry {
     const item = {
       ts: Date.now(),
       dayKey: this._state.dayKey,
+      signalId:
+        signal?.signalId ||
+        meta?.signalId ||
+        signal?.signalLifecycleId ||
+        null,
       token: Number(token) || null,
       strategyId: sid,
       strategyStyle: style,

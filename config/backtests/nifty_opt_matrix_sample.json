@@ -1,0 +1,75 @@
+{
+  "metadata": {
+    "name": "nifty_opt_matrix_jan_2026",
+    "seed": 42,
+    "tags": ["sample", "matrix"]
+  },
+  "data": {
+    "from": "2026-01-01T00:00:00+05:30",
+    "to": "2026-01-31T23:59:59+05:30",
+    "interval": 1,
+    "warmup": 80
+  },
+  "instrument": {
+    "mode": "OPT",
+    "token": 260105,
+    "underlying": "NIFTY 50",
+    "dynamicContracts": true,
+    "optionType": "CE",
+    "strikeStep": 50,
+    "scanSteps": 3
+  },
+  "execution": {
+    "execRealism": true,
+    "eventBroker": true,
+    "calibrationMode": "fixed",
+    "slippageBps": 3,
+    "partialFillProbability": 0.15,
+    "minPartialFillRatio": 0.35
+  },
+  "capital": {
+    "initialCapital": 50000,
+    "capitalPerTrade": 20000
+  },
+  "risk": {
+    "riskPerTradeInr": 500,
+    "maxDailyLossInr": 1500,
+    "maxConcurrentPositions": 1,
+    "maxTradesPerDay": 3
+  },
+  "strategies": {
+    "qtyMode": "risk_based",
+    "defaultQty": 50,
+    "confidenceThreshold": 60
+  },
+  "exits": {
+    "rrTarget": 1.4,
+    "slPctFallback": 0.7
+  },
+  "reports": {
+    "outputDir": "reports/backtests",
+    "writeCsv": true,
+    "writeJson": true,
+    "writeMarkdown": true,
+    "persistMongo": false
+  },
+  "acceptance": {
+    "minTrades": 10,
+    "minProfitFactor": 1.0,
+    "maxDrawdownPct": 25
+  },
+  "validation": {
+    "dataQualityMode": "warn",
+    "lookAheadGuard": true
+  },
+  "matrix": {
+    "dimensions": {
+      "strategies.confidenceThreshold": [55, 60, 65],
+      "execution.slippageBps": [2, 3, 5],
+      "execution.partialFillProbability": [0.1, 0.15],
+      "risk.maxTradesPerDay": [2, 3],
+      "risk.riskPerTradeInr": [400, 500],
+      "execution.delayMs": [0, 60000]
+    }
+  }
+}

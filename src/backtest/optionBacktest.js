@@ -95,6 +95,7 @@ async function buildOptionBacktestProvider({
   }
 
   const tokenCandleMap = new Map();
+  let duplicateTimestampCount = 0;
   const allTokenIds = instruments.map((i) => Number(i.instrument_token)).filter((x) => Number.isFinite(x));
   const q = { instrument_token: { $in: allTokenIds } };
   if (tsFrom || tsTo) {
@@ -107,7 +108,9 @@ async function buildOptionBacktestProvider({
   for (const c of optionCandles) {
     const tok = Number(c.instrument_token);
     if (!tokenCandleMap.has(tok)) tokenCandleMap.set(tok, new Map());
-    tokenCandleMap.get(tok).set(new Date(c.ts).toISOString(), c);
+    const key = new Date(c.ts).toISOString();
+    if (tokenCandleMap.get(tok).has(key)) duplicateTimestampCount += 1;
+    tokenCandleMap.get(tok).set(key, c);
   }
 
   function pickExpiry(tsMs) {
@@ -191,6 +194,17 @@ async function buildOptionBacktestProvider({
       optionTokens: allTokenIds.length,
       optionCandles: optionCandles.length,
       expiryCount: expiries.length,
+      duplicateTimestampCount,
+      tokensWithoutCandles: allTokenIds.filter((token) => !tokenCandleMap.get(token)?.size).length,
+    },
+    listTokens() {
+      return allTokenIds.slice();
+    },
+    listInstruments() {
+      return instruments.slice();
+    },
+    getInstrument(token) {
+      return byToken.get(Number(token)) || null;
     },
     getCandlesByToken(token) {
       return Array.from(tokenCandleMap.get(Number(token))?.values() || []).sort((a, b) => new Date(a.ts) - new Date(b.ts));
@@ -215,7 +229,11 @@ async function buildOptionBacktestProvider({
       const best = pool[0];
       return {
         selectedToken: best.token,
-        selected: best,
+        selected: {
+          ...best,
+          selectionModel: "BACKTEST_SIMPLIFIED",
+          liveEquivalent: false,
+        },
         snapshot: {
           underlyingToken: Number(underlyingToken),
           underlyingPrice: Number(underlyingPrice),
@@ -223,6 +241,9 @@ async function buildOptionBacktestProvider({
           optionType: String(optionType).toUpperCase(),
           rows: pool,
           selectedToken: best.token,
+          selectionModel: "BACKTEST_SIMPLIFIED",
+          liveEquivalent: false,
+          parity: "NON_LIVE_EQUIVALENT",
         },
       };
     },

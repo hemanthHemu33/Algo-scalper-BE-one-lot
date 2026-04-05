@@ -364,6 +364,157 @@ function scoreCandidate({
   return s;
 }
 
+function buildContractSelectionObservability(
+  candidate,
+  { selectedByFallback = false, fallbackReason = null } = {},
+) {
+  const eligibilityPassed = Boolean(candidate?.ok);
+  const minEligibilityChecksPassed = Boolean(candidate?.hardOk);
+  const rankingScore = Number(candidate?.score);
+  const normalizedFallbackReason = selectedByFallback
+    ? String(fallbackReason || "ROUTER_RELAXATION")
+    : null;
+
+  return {
+    ok: eligibilityPassed,
+    eligibilityPassed,
+    minEligibilityChecksPassed,
+    rankingScore: Number.isFinite(rankingScore) ? rankingScore : null,
+    rankingScoreSemantics: "LOWER_IS_BETTER",
+    selectedByFallback: Boolean(selectedByFallback),
+    fallbackReason: normalizedFallbackReason,
+    selectedReason: selectedByFallback
+      ? `FALLBACK_${normalizedFallbackReason}`
+      : eligibilityPassed
+        ? "PRIMARY_ELIGIBLE"
+        : minEligibilityChecksPassed
+          ? "HARD_GATES_ONLY"
+          : "FAILED_ELIGIBILITY",
+  };
+}
+
+function buildCandidateDebugRow(candidate, options = {}) {
+  const observability = buildContractSelectionObservability(candidate, options);
+  return {
+    tradingsymbol: candidate.row.tradingsymbol,
+    instrument_token: Number(candidate.row.instrument_token),
+    exchange: candidate.row.exchange || null,
+    expiry:
+      expiryISOInTz(candidate.row.expiry) ||
+      candidate.row.expiry ||
+      null,
+    strike: Number(candidate.row.strike),
+    ltp: Number(candidate.row.ltp),
+    spread_bps: Number(candidate.row.spread_bps),
+    spread_bps_change: Number(candidate.row.spread_bps_change),
+    depth_qty_top: Number(candidate.row.depth_qty_top ?? 0),
+    liq_score: Number(candidate.liqScore ?? 0),
+    liquidityGateOk: !!candidate.liquidityGateOk,
+    volume: Number(candidate.row.volume ?? 0),
+    oi: Number(candidate.row.oi ?? 0),
+    oi_change: Number(candidate.row.oi_change),
+    delta: finiteNumberOrNull(candidate.row.delta),
+    gamma: Number(candidate.row.gamma),
+    iv_pts: Number(candidate.row.iv_pts),
+    iv_change_pts: Number(candidate.row.iv_change_pts),
+    vega_1pct: Number(candidate.row.vega_1pct),
+    theta_per_day: Number(candidate.row.theta_per_day),
+    health_score: Number(candidate.row.health_score),
+    book_flicker: Number(candidate.row.book_flicker ?? 0),
+    impact_cost_bps: Number(candidate.row.impact_cost_bps),
+    distSteps: Number(candidate.distSteps),
+    score: Number(candidate.score),
+    ok: observability.ok,
+    eligibilityPassed: observability.eligibilityPassed,
+    minEligibilityChecksPassed: observability.minEligibilityChecksPassed,
+    rankingScore: observability.rankingScore,
+    rankingScoreSemantics: observability.rankingScoreSemantics,
+    selectedByFallback: observability.selectedByFallback,
+    fallbackReason: observability.fallbackReason,
+    selectedReason: observability.selectedReason,
+    hardOk: !!candidate.hardOk,
+    premOk: !!candidate.premOk,
+    spreadOk: !!candidate.spreadOk,
+    spreadTrendOk: !!candidate.spreadTrendOk,
+    depthOk: !!candidate.depthOk,
+    deltaOk: !!candidate.deltaOk,
+    gammaOk: !!candidate.gammaOk,
+    ivOk: !!candidate.ivOk,
+    ivTrendOk: !!candidate.ivTrendOk,
+    healthOk: !!candidate.healthOk,
+    flickerOk: !!candidate.flickerOk,
+  };
+}
+
+function buildFallbackTraceEntry({
+  stage,
+  expiryISO,
+  nextExpiry,
+  relaxed,
+}) {
+  return {
+    stage: Math.max(0, Number(stage ?? 0)),
+    expiry: expiryISO || null,
+    nextExpiry: nextExpiry || null,
+    relaxed: Array.isArray(relaxed) ? relaxed.slice() : [],
+  };
+}
+
+function buildAlternateContractSelection(baseSelection, candidate, options = {}) {
+  const observability = buildContractSelectionObservability(candidate, options);
+  return {
+    ...baseSelection,
+    instrument_token: Number(candidate?.row?.instrument_token),
+    exchange: candidate?.row?.exchange || baseSelection?.exchange || null,
+    tradingsymbol:
+      candidate?.row?.tradingsymbol || baseSelection?.tradingsymbol || null,
+    segment: candidate?.row?.segment || baseSelection?.segment || null,
+    lot_size: Number(candidate?.row?.lot_size ?? baseSelection?.lot_size ?? 1),
+    tick_size: normalizeTickSize(
+      candidate?.row?.tick_size ?? baseSelection?.tick_size,
+    ),
+    strike: Number(candidate?.row?.strike ?? baseSelection?.strike ?? 0),
+    pickedAt: new Date().toISOString(),
+    ltp: Number(candidate?.row?.ltp),
+    bps: Number(candidate?.row?.spread_bps),
+    depth: Number(candidate?.row?.depth_qty_top ?? 0),
+    iv: Number.isFinite(Number(candidate?.row?.iv))
+      ? Number(candidate.row.iv)
+      : null,
+    iv_pts: Number.isFinite(Number(candidate?.row?.iv_pts))
+      ? Number(candidate.row.iv_pts)
+      : null,
+    iv_change_pts: Number.isFinite(Number(candidate?.row?.iv_change_pts))
+      ? Number(candidate.row.iv_change_pts)
+      : null,
+    delta: finiteNumberOrNull(candidate?.row?.delta),
+    gamma: Number.isFinite(Number(candidate?.row?.gamma))
+      ? Number(candidate.row.gamma)
+      : null,
+    vega_1pct: Number.isFinite(Number(candidate?.row?.vega_1pct))
+      ? Number(candidate.row.vega_1pct)
+      : null,
+    theta_per_day: Number.isFinite(Number(candidate?.row?.theta_per_day))
+      ? Number(candidate.row.theta_per_day)
+      : null,
+    oi: Number(candidate?.row?.oi ?? 0),
+    oi_change: Number.isFinite(Number(candidate?.row?.oi_change))
+      ? Number(candidate.row.oi_change)
+      : null,
+    spread_bps_change: Number.isFinite(Number(candidate?.row?.spread_bps_change))
+      ? Number(candidate.row.spread_bps_change)
+      : null,
+    health_score: Number(candidate?.row?.health_score ?? 0),
+    meta: {
+      ...(baseSelection?.meta || {}),
+      selectionObservability: observability,
+      topCandidates: undefined,
+      alternateContracts: undefined,
+      alternateSource: "ROUTER_ALTERNATE_CANDIDATE",
+    },
+  };
+}
+
 function _median(nums) {
   const a = (nums || [])
     .filter((x) => Number.isFinite(x))
@@ -499,6 +650,7 @@ async function pickOptionContractForSignal({
   forceExpiryISO,
   gateStage = 0,
   triedExpiries = [],
+  fallbackTrace = [],
   nowMs = Date.now(),
 }) {
   const u = resolveUnderlyingFromUniverse({
@@ -1040,35 +1192,7 @@ async function pickOptionContractForSignal({
 
       const debugTop =
         debugTopN > 0
-          ? scored.slice(0, debugTopN).map((x) => ({
-              tradingsymbol: x.row.tradingsymbol,
-              instrument_token: Number(x.row.instrument_token),
-              strike: Number(x.row.strike),
-              ltp: Number(x.row.ltp),
-              spread_bps: Number(x.row.spread_bps),
-              depth_qty_top: Number(x.row.depth_qty_top ?? 0),
-              liq_score: Number(x.liqScore ?? 0),
-              liquidityGateOk: !!x.liquidityGateOk,
-              delta: finiteNumberOrNull(x.row.delta),
-              gamma: Number(x.row.gamma),
-              iv_pts: Number(x.row.iv_pts),
-              health_score: Number(x.row.health_score),
-              book_flicker: Number(x.row.book_flicker ?? 0),
-              score: Number(x.score),
-              ok: !!x.ok,
-              hardOk: !!x.hardOk,
-              premOk: !!x.premOk,
-              spreadOk: !!x.spreadOk,
-              spreadTrendOk: !!x.spreadTrendOk,
-              depthOk: !!x.depthOk,
-              liquidityGateOk: !!x.liquidityGateOk,
-              deltaOk: !!x.deltaOk,
-              gammaOk: !!x.gammaOk,
-              ivOk: !!x.ivOk,
-              ivTrendOk: !!x.ivTrendOk,
-              healthOk: !!x.healthOk,
-              flickerOk: !!x.flickerOk,
-            }))
+          ? scored.slice(0, debugTopN).map((x) => buildCandidateDebugRow(x))
           : undefined;
 
       logger.warn(
@@ -1100,6 +1224,9 @@ async function pickOptionContractForSignal({
           3: ["deltaBand"],
           4: ["gammaGate"],
         };
+        const relaxed = nextExpiry
+          ? ["nextExpiry"]
+          : relaxedByStage[nextStage] || [];
         const nextArgs = {
           kite,
           universe,
@@ -1113,6 +1240,15 @@ async function pickOptionContractForSignal({
           forceExpiryISO: nextExpiry || expiryISO,
           gateStage: nextStage,
           triedExpiries: Array.from(triedSet),
+          fallbackTrace: [
+            ...(fallbackTrace || []),
+            buildFallbackTraceEntry({
+              stage,
+              expiryISO,
+              nextExpiry,
+              relaxed,
+            }),
+          ],
         };
         logger.warn(
           {
@@ -1123,7 +1259,7 @@ async function pickOptionContractForSignal({
             stage,
             nextExpiry,
             nextStage,
-            relaxed: nextExpiry ? ["nextExpiry"] : (relaxedByStage[nextStage] || []),
+            relaxed,
           },
           "[options] fallback retry triggered",
         );
@@ -1159,6 +1295,7 @@ async function pickOptionContractForSignal({
           greeksRequired,
           oiContext,
           topCandidates: debugTop,
+          fallbackTrace,
         },
       };
     }
@@ -1167,42 +1304,21 @@ async function pickOptionContractForSignal({
   const poolForDebug = eligible.length > 0 ? eligible : scored;
   const topCandidates =
     debugTopN > 0
-      ? poolForDebug.slice(0, debugTopN).map((x) => ({
-          tradingsymbol: x.row.tradingsymbol,
-          instrument_token: Number(x.row.instrument_token),
-          strike: Number(x.row.strike),
-          ltp: Number(x.row.ltp),
-          spread_bps: Number(x.row.spread_bps),
-          spread_bps_change: Number(x.row.spread_bps_change),
-          depth_qty_top: Number(x.row.depth_qty_top ?? 0),
-          liq_score: Number(x.liqScore ?? 0),
-          liquidityGateOk: !!x.liquidityGateOk,
-          volume: Number(x.row.volume ?? 0),
-          oi: Number(x.row.oi ?? 0),
-          oi_change: Number(x.row.oi_change),
-          delta: finiteNumberOrNull(x.row.delta),
-          gamma: Number(x.row.gamma),
-          iv_pts: Number(x.row.iv_pts),
-          iv_change_pts: Number(x.row.iv_change_pts),
-          vega_1pct: Number(x.row.vega_1pct),
-          theta_per_day: Number(x.row.theta_per_day),
-          health_score: Number(x.row.health_score),
-          book_flicker: Number(x.row.book_flicker ?? 0),
-          impact_cost_bps: Number(x.row.impact_cost_bps),
-          distSteps: Number(x.distSteps),
-          score: Number(x.score),
-          ok: !!x.ok,
-          hardOk: !!x.hardOk,
-          premOk: !!x.premOk,
-          spreadOk: !!x.spreadOk,
-          spreadTrendOk: !!x.spreadTrendOk,
-          depthOk: !!x.depthOk,
-          deltaOk: !!x.deltaOk,
-          gammaOk: !!x.gammaOk,
-          ivOk: !!x.ivOk,
-          ivTrendOk: !!x.ivTrendOk,
-        }))
+      ? poolForDebug.slice(0, debugTopN).map((x) => buildCandidateDebugRow(x))
       : undefined;
+  const routerFallbackUsed =
+    premiumBandFallbackUsed ||
+    stage > 0 ||
+    (Array.isArray(fallbackTrace) && fallbackTrace.length > 0);
+  const routerFallbackReason = premiumBandFallbackUsed
+    ? "PREMIUM_BAND_ONLY"
+    : routerFallbackUsed
+      ? "ROUTER_RELAXATION"
+      : null;
+  const selectionObservability = buildContractSelectionObservability(best, {
+    selectedByFallback: routerFallbackUsed,
+    fallbackReason: routerFallbackReason,
+  });
 
   const selection = {
     underlying,
@@ -1244,6 +1360,14 @@ async function pickOptionContractForSignal({
       policy: picked?.policy || null,
       dteDays: Number.isFinite(dteDays) ? dteDays : null,
       premiumBandFallbackUsed,
+      selectionPath: {
+        stage,
+        selectedByFallback: routerFallbackUsed,
+        fallbackReason: routerFallbackReason,
+        expiryPolicy: picked?.policy || null,
+        triedExpiries: Array.from(new Set([...(triedExpiries || []), expiryISO])),
+        fallbackTrace: Array.isArray(fallbackTrace) ? fallbackTrace.slice() : [],
+      },
       strikeSelection: {
         mode: strikeSelectionMode,
         baseDesiredStrike,
@@ -1276,6 +1400,7 @@ async function pickOptionContractForSignal({
         topN: liqGateTopN,
         eligibleCount: liquidityEligible.length,
       },
+      selectionObservability,
       oiContext,
       weights,
       fromCache: !!chain?.fromCache,
@@ -1283,6 +1408,33 @@ async function pickOptionContractForSignal({
       topCandidates,
     },
   };
+
+  const alternateContractTopN = Math.max(
+    0,
+    Math.min(Number(env.OPT_ALTERNATE_CONTRACT_TOP_N ?? 3), 10),
+  );
+  const alternateCandidates =
+    alternateContractTopN > 0
+      ? poolForDebug
+          .filter(
+            (candidate) =>
+              Number(candidate?.row?.instrument_token) !==
+              Number(best?.row?.instrument_token),
+          )
+          .slice(0, alternateContractTopN)
+      : [];
+  selection.meta.alternateContracts = alternateCandidates.map(
+    (candidate, index) => {
+      const altSelection = buildAlternateContractSelection(selection, candidate);
+      return {
+        ...altSelection,
+        meta: {
+          ...altSelection.meta,
+          alternateRank: index + 1,
+        },
+      };
+    },
+  );
 
   // Log selection (helps debugging)
   logger.info(
@@ -1306,7 +1458,15 @@ async function pickOptionContractForSignal({
         gamma: best.row.gamma,
         ivPts: best.row.iv_pts,
         score: best.score,
-        ok: premiumBandFallbackUsed ? true : best.ok,
+        ok: selectionObservability.ok,
+        eligibilityPassed: selectionObservability.eligibilityPassed,
+        minEligibilityChecksPassed:
+          selectionObservability.minEligibilityChecksPassed,
+        rankingScore: selectionObservability.rankingScore,
+        rankingScoreSemantics: selectionObservability.rankingScoreSemantics,
+        selectedByFallback: selectionObservability.selectedByFallback,
+        fallbackReason: selectionObservability.fallbackReason,
+        selectedReason: selectionObservability.selectedReason,
         premiumBandFallbackUsed,
         oiWall: selection?.meta?.oiContext?.wall || null,
       },
@@ -1323,5 +1483,7 @@ module.exports = {
   INDEX_TO_CHAIN,
   chainRootFromSpot,
   buildOptionSubscriptionCandidates,
+  buildContractSelectionObservability,
+  getPremiumBandForUnderlying,
   pickOptionContractForSignal,
 };

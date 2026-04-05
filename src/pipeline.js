@@ -15,8 +15,8 @@ const { backfillCandles } = require("./market/backfill");
 const {
   evaluateOnCandleClose,
   evaluateOnCandleTick,
+  resetSignalLayerState,
 } = require("./strategy/strategyEngine");
-const { getMinCandlesForSignal } = require("./strategy/minCandles");
 const { RiskEngine } = require("./risk/riskEngine");
 const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
@@ -42,6 +42,9 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   const risk = new RiskEngine();
   const trader = new TradeManager({ kite, riskEngine: risk });
+  let stopped = false;
+  let stopPromise = null;
+  let candleFinalizerTimer = null;
 
   let tokensRef = [];
   let tokensSet = new Set();
@@ -50,15 +53,50 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   let signalTokensSet = new Set();
   const tickSignalState = new Map();
 
+  function previewEmitEnabled() {
+    return String(process.env.SIGNAL_PREVIEW_EMIT ?? env.SIGNAL_PREVIEW_EMIT ?? "true") === "true";
+  }
+
+  function previewActionableEnabled() {
+    return String(process.env.SIGNAL_PREVIEW_ACTIONABLE ?? env.SIGNAL_PREVIEW_ACTIONABLE ?? "false") === "true";
+  }
+
+  async function emitSignalPreview(signal) {
+    telemetry.recordDecision({
+      signal,
+      token: signal.instrument_token,
+      outcome: "PREVIEW_DISPATCHED",
+      stage: "pipeline_preview",
+      reason: signal.reason,
+      meta: {
+        confidence: signal.confidence,
+        regime: signal.regime,
+        signalStage: signal.signalStage,
+        setupLineage: signal.setupLineage || signal.meta?.setupLineage || null,
+      },
+    });
+
+    if (!previewEmitEnabled()) return;
+    if (typeof trader.onSignalPreview === "function") {
+      await trader.onSignalPreview(signal);
+    }
+  }
+
   // Separate queue for runtime subscription/backfills (avoid deadlocks with main serial queue)
   let subsSerial = Promise.resolve();
   function enqueueSubs(fn, label) {
-    subsSerial = subsSerial.then(fn).catch((e) => {
-      logger.warn(
-        { e: e?.message || String(e), label },
-        "[pipeline] subscription task failed",
-      );
-    });
+    if (stopped) return Promise.resolve({ ok: false, stopped: true });
+    subsSerial = subsSerial
+      .then(async () => {
+        if (stopped) return { ok: false, stopped: true };
+        return fn();
+      })
+      .catch((e) => {
+        logger.warn(
+          { e: e?.message || String(e), label },
+          "[pipeline] subscription task failed",
+        );
+      });
     return subsSerial;
   }
 
@@ -66,32 +104,50 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   let serial = Promise.resolve();
 
   function enqueue(fn, label) {
-    serial = serial.then(fn).catch((e) => {
-      logger.warn(
-        { e: e?.message || String(e), label },
-        "[pipeline] task failed",
-      );
-    });
+    if (stopped) return Promise.resolve({ ok: false, stopped: true });
+    serial = serial
+      .then(async () => {
+        if (stopped) return { ok: false, stopped: true };
+        return fn();
+      })
+      .catch((e) => {
+        logger.warn(
+          { e: e?.message || String(e), label },
+          "[pipeline] task failed",
+        );
+      });
     return serial;
   }
 
-  async function initForTokens(tokens) {
+  async function initForTokens(tokens, opts = {}) {
+    if (stopped) return;
+    resetSignalLayerState();
+    tickSignalState.clear();
     tokensRef = Array.isArray(tokens) ? tokens : [];
     tokensSet = new Set(
       tokensRef
         .map((t) => Number(t))
         .filter((n) => Number.isFinite(n) && n > 0),
     );
-    // Freeze the initial universe as "signal tokens".
+    const explicitSignalTokens = Array.isArray(opts.signalTokens)
+      ? opts.signalTokens
+      : tokensRef;
+    // Freeze only the intended signal-source tokens.
     // Runtime-added tokens (options) should not generate strategy signals.
-    signalTokensSet = new Set(tokensSet);
+    signalTokensSet = new Set(
+      explicitSignalTokens
+        .map((t) => Number(t))
+        .filter((n) => Number.isFinite(n) && n > 0),
+    );
     await trader.init();
+    if (stopped) return;
 
     // Classify index tokens once so candle builder can suppress volume warnings
     // (index ticks are volume-less by design, even in quote/full modes).
     try {
       const idx = [];
       for (const t of tokensRef) {
+        if (stopped) return;
         const tok = Number(t);
         if (!Number.isFinite(tok) || tok <= 0) continue;
         try {
@@ -109,11 +165,14 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     }
 
     for (const intervalMin of intervals) await ensureIndexes(intervalMin);
+    if (stopped) return;
 
     let totalBackfill = 0;
     let weakBackfillCount = 0;
     for (const token of tokensRef) {
+      if (stopped) return;
       for (const intervalMin of intervals) {
+        if (stopped) return;
         try {
           const candles = await backfillCandles({
             kite,
@@ -129,7 +188,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
             weakBackfillCount += 1;
             logger.warn(
               { token, intervalMin, count },
-              "[backfill] insufficient candles for signal evaluation (need >= 50)",
+              "[backfill] limited initial history primed; some strategies may wait for additional candles",
             );
           }
         } catch (e) {
@@ -140,6 +199,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         }
       }
     }
+    if (stopped) return;
 
     alert("info", "🧩 Pipeline primed", {
       tokens: tokensRef.length,
@@ -151,6 +211,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   // Allow seeding subscription view (primarily for admin visibility)
   function setSubscribedTokens(tokens) {
+    if (stopped) return;
     tokensRef = Array.isArray(tokens) ? tokens : [];
     tokensSet = new Set(
       tokensRef
@@ -161,6 +222,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   // Runtime subscribe for OPT mode: subscribe chosen option token & optionally backfill candles.
   async function addTokens(tokens, opts = {}) {
+    if (stopped) return { ok: false, error: "pipeline_stopped" };
     const enabled = String(env.RUNTIME_SUBSCRIBE_ENABLED || "true") === "true";
     if (!enabled) return { ok: false, error: "runtime_subscribe_disabled" };
 
@@ -262,6 +324,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     return {
       ok: true,
       tokens: Array.from(tokensSet).sort((a, b) => a - b),
+      signalTokens: Array.from(signalTokensSet).sort((a, b) => a - b),
       count: tokensSet.size,
     };
   }
@@ -270,16 +333,25 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   if (typeof trader.setRuntimeAddTokens === "function") {
     trader.setRuntimeAddTokens(addTokens);
   }
+  if (typeof trader.setRuntimeGetCandles === "function") {
+    trader.setRuntimeGetCandles((token, intervalMin, limit) =>
+      candleCache.getCandles(token, intervalMin, limit),
+    );
+  }
 
   async function reconcile() {
+    if (stopped) return { ok: false, stopped: true };
     return enqueue(async () => {
+      if (stopped) return { ok: false, stopped: true };
       await trader.reconcile(tokensRef);
       logger.info("[reconcile] done");
     }, "reconcile");
   }
 
   async function handleClosedCandles(closed) {
+    if (stopped) return;
     for (const c of closed || []) {
+      if (stopped) return;
 
       const tok = Number(c.instrument_token);
       const isSignalTok =
@@ -287,9 +359,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         signalTokensSet.size &&
         signalTokensSet.has(tok);
 
-      if (isSignalTok) {
-        candleCache.addCandle(c);
-      }
+      candleCache.addCandle(c);
 
       // Persist candles asynchronously (avoid DB writes in the hot tick loop)
       // Default: persist only signal tokens (underlying universe).
@@ -314,7 +384,8 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         const candleTs = c?.ts ? new Date(c.ts).getTime() : null;
         if (
           Number.isFinite(candleTs) &&
-          st?.lastSignalCandleTs === candleTs
+          st?.lastSignalCandleTs === candleTs &&
+          st?.lastSignalStage === "bar_close_confirmed"
         ) {
           continue;
         }
@@ -330,22 +401,24 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         c.interval_min,
         Number(env.CANDLE_CACHE_LIMIT ?? 400),
       );
-      const minCandles = getMinCandlesForSignal(env, c.interval_min);
       const signal = await evaluateOnCandleClose({
         instrument_token: c.instrument_token,
         intervalMin: c.interval_min,
-        candles: cached.length >= minCandles ? cached : null,
+        candles: cached.length ? cached : null,
       });
 
       if (signal) {
         logger.info(
           {
+            signalId: signal.signalId || null,
             token: signal.instrument_token,
             side: signal.side,
             reason: signal.reason,
             strategyId: signal.strategyId,
             confidence: signal.confidence,
             regime: signal.regime,
+            regimeSnapshotId: signal.regimeSnapshotId || null,
+            signalStage: signal.signalStage,
           },
           "[signal]",
         );
@@ -357,12 +430,18 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
           reason: signal.reason,
           meta: { confidence: signal.confidence, regime: signal.regime },
         });
+        tickSignalState.set(`${tok}:${Number(c.interval_min ?? 0)}`, {
+          ...(tickSignalState.get(`${tok}:${Number(c.interval_min ?? 0)}`) || {}),
+          lastSignalCandleTs: c?.ts ? new Date(c.ts).getTime() : null,
+          lastSignalStage: signal.signalStage || "bar_close_confirmed",
+        });
         await trader.onSignal(signal);
       }
     }
   }
 
   async function handleTickSignals(candleTicks) {
+    if (stopped) return;
     if (String(env.SIGNAL_TICK_CONFIRM_ENABLED || "false") !== "true") return;
     if (!allowSignalsNow()) return;
 
@@ -370,11 +449,13 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     const nowMs = Date.now();
 
     for (const t of candleTicks || []) {
+      if (stopped) return;
       const tok = Number(t.instrument_token);
       if (!Number.isFinite(tok)) continue;
       if (signalTokensSet.size && !signalTokensSet.has(tok)) continue;
 
       for (const intervalMin of intervals) {
+        if (stopped) return;
         const live = candleBuilder.getCurrentCandle(tok, intervalMin);
         if (!live?.ts) continue;
 
@@ -436,6 +517,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
         if (signal) {
           logger.info(
             {
+              signalId: signal.signalId || null,
               token: signal.instrument_token,
               side: signal.side,
               reason: signal.reason,
@@ -443,21 +525,33 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
               confidence: signal.confidence,
               regime: signal.regime,
               stage: signal.stage,
+              regimeSnapshotId: signal.regimeSnapshotId || null,
+              signalStage: signal.signalStage,
             },
             "[signal:tick]",
           );
-          telemetry.recordDecision({
-            signal,
-            token: signal.instrument_token,
-            outcome: "DISPATCHED",
-            stage: "pipeline_tick",
-            reason: signal.reason,
-            meta: { confidence: signal.confidence, regime: signal.regime },
-          });
-          await trader.onSignal(signal);
+          if (signal.isProvisional === true && !previewActionableEnabled()) {
+            await emitSignalPreview(signal);
+          } else {
+            telemetry.recordDecision({
+              signal,
+              token: signal.instrument_token,
+              outcome: "DISPATCHED",
+              stage: "pipeline_tick",
+              reason: signal.reason,
+              meta: {
+                confidence: signal.confidence,
+                regime: signal.regime,
+                signalStage: signal.signalStage,
+                setupLineage: signal.setupLineage || signal.meta?.setupLineage || null,
+              },
+            });
+            await trader.onSignal(signal);
+          }
           tickSignalState.set(key, {
             ...tickSignalState.get(key),
             lastSignalCandleTs: candleTs,
+            lastSignalStage: signal.signalStage || "tick_preview",
           });
         }
       }
@@ -492,11 +586,13 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     return closeTs >= open && closeTs <= close;
   }
   async function processTicksOnce(ticks) {
+    if (stopped) return;
     try {
       marketHealth.onTicks(ticks || []);
     } catch (err) { reportFault({ code: "PIPELINE_CATCH", err, message: "[src/pipeline.js] caught and continued" }); }
     // tick->trader (LTP updates + throttled risk checks)
     for (const t of ticks || []) {
+      if (stopped) return;
       try {
         trader.onTick(t);
       } catch (e) {
@@ -513,17 +609,21 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   async function onTicks(ticks) {
+    if (stopped) return { ok: false, stopped: true };
     // serialize processing to avoid overlap
     return enqueue(() => processTicksOnce(ticks), "onTicks");
   }
 
   async function onOrderUpdate(order) {
+    if (stopped) return { ok: false, stopped: true };
     return enqueue(async () => {
+      if (stopped) return { ok: false, stopped: true };
       await trader.onOrderUpdate(order);
     }, "onOrderUpdate");
   }
 
   async function ocoReconcile() {
+    if (stopped) return { ok: false, stopped: true };
     if (typeof trader.positionFirstReconcile !== "function") return;
     return enqueue(
       () => trader.positionFirstReconcile("oco_timer"),
@@ -532,6 +632,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   async function setKillSwitch(enabled, reason) {
+    if (stopped) return { ok: false, stopped: true };
     // Persist kill-switch in DB via TradeManager so it survives restarts.
     if (typeof trader.setKillSwitch === "function") {
       await trader.setKillSwitch(!!enabled, reason || "ADMIN");
@@ -541,6 +642,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   async function status() {
+    if (stopped) return { stopped: true };
     return trader.status();
   }
 
@@ -549,6 +651,7 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   }
 
   async function candleFinalizerTick() {
+    if (stopped) return;
     if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") !== "true") return;
 
     const closed = candleBuilder.finalizeDue(new Date(), {
@@ -563,9 +666,58 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   if (String(env.CANDLE_TIMER_FINALIZER_ENABLED || "true") === "true") {
     const everyMs = Number(env.CANDLE_FINALIZER_INTERVAL_MS ?? 1000);
-    setInterval(() => {
+    candleFinalizerTimer = setInterval(() => {
       enqueue(() => candleFinalizerTick(), "candleFinalizer").catch((err) => { reportFault({ code: "PIPELINE_ASYNC", err, message: "[src/pipeline.js] async task failed" }); });
     }, everyMs);
+  }
+
+  async function stop() {
+    if (stopPromise) return stopPromise;
+
+    stopped = true;
+    stopPromise = (async () => {
+      if (candleFinalizerTimer) {
+        clearInterval(candleFinalizerTimer);
+        candleFinalizerTimer = null;
+      }
+
+      const cleanupStep = async (label, fn) => {
+        try {
+          await fn();
+        } catch (e) {
+          logger.warn(
+            { label, e: e?.message || String(e) },
+            "[pipeline] stop cleanup failed",
+          );
+        }
+      };
+
+      await cleanupStep("tradeManager.stop", async () => {
+        if (typeof trader.stop === "function") {
+          await trader.stop();
+        }
+      });
+
+      await cleanupStep("candleWriter.stop", async () => {
+        if (typeof candleWriter.stop === "function") {
+          await candleWriter.stop();
+          return;
+        }
+        if (typeof candleWriter.flush === "function") {
+          await candleWriter.flush();
+        }
+      });
+
+      tickSignalState.clear();
+      resetSignalLayerState();
+      signalTokensSet.clear();
+      tokensSet.clear();
+      tokensRef = [];
+
+      logger.info("[pipeline] stopped");
+    })();
+
+    return stopPromise;
   }
   return {
     initForTokens,
@@ -579,6 +731,8 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     setKillSwitch,
     status,
     getLiveCandle,
+    stop,
+    destroy: stop,
     trader,
   };
 }

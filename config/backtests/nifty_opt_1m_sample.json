@@ -1,0 +1,84 @@
+{
+  "metadata": {
+    "name": "nifty_opt_jan_2026",
+    "seed": 42,
+    "notes": "Sample single-run config for config-driven NIFTY options backtests",
+    "tags": ["sample", "nifty", "options"]
+  },
+  "data": {
+    "from": "2026-01-01T00:00:00+05:30",
+    "to": "2026-01-31T23:59:59+05:30",
+    "interval": 1,
+    "warmup": 80
+  },
+  "instrument": {
+    "mode": "OPT",
+    "token": 260105,
+    "underlying": "NIFTY 50",
+    "dynamicContracts": true,
+    "optionType": "CE",
+    "strikeStep": 50,
+    "scanSteps": 3,
+    "greeksFilter": false
+  },
+  "execution": {
+    "execRealism": true,
+    "eventBroker": true,
+    "calibrationMode": "fixed",
+    "calibrationDays": 5,
+    "slippageBps": 3,
+    "spreadBps": 0,
+    "partialFillProbability": 0.15,
+    "minPartialFillRatio": 0.35,
+    "delayMs": 0
+  },
+  "capital": {
+    "initialCapital": 50000,
+    "capitalPerTrade": 20000,
+    "marginMultiplier": 1,
+    "reserveBufferPct": 0
+  },
+  "risk": {
+    "riskPerTradeInr": 500,
+    "maxDailyLossInr": 1500,
+    "maxConcurrentPositions": 1,
+    "maxTradesPerDay": 3,
+    "maxConsecutiveLosses": 3,
+    "maxOpenRiskInr": 1000,
+    "cooldownCandles": 5,
+    "staleSignalBars": 5,
+    "entryCutoffTime": "15:00"
+  },
+  "strategies": {
+    "qtyMode": "risk_based",
+    "defaultQty": 50,
+    "confidenceThreshold": 60,
+    "allowed": []
+  },
+  "exits": {
+    "rrTarget": 1.4,
+    "slPctFallback": 0.7,
+    "targetEnabled": true
+  },
+  "reports": {
+    "outputDir": "reports/backtests",
+    "writeCsv": true,
+    "writeJson": true,
+    "writeMarkdown": true,
+    "persistMongo": false
+  },
+  "acceptance": {
+    "minTrades": 10,
+    "minNetPnl": 0,
+    "minProfitFactor": 1.0,
+    "minExpectancy": 0,
+    "maxDrawdownPct": 20,
+    "maxSingleMonthContributionPct": 75,
+    "maxRejectedByDataIssuesPct": 10,
+    "maxForcedExitPct": 35
+  },
+  "validation": {
+    "dataQualityMode": "strict",
+    "lookAheadGuard": true
+  }
+}

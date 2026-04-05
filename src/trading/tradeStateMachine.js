@@ -79,7 +79,11 @@ const ALLOWED_TRANSITIONS = {
   [STATUS.EXITED_SL]: new Set([STATUS.CLOSED]),
   [STATUS.ENTRY_FAILED]: new Set([STATUS.CLOSED]),
   [STATUS.ENTRY_CANCELLED]: new Set([STATUS.CLOSED]),
-  [STATUS.GUARD_FAILED]: new Set([STATUS.CLOSED]),
+  [STATUS.GUARD_FAILED]: new Set([
+    STATUS.PANIC_EXIT_PLACED,
+    STATUS.PANIC_EXIT_CONFIRMED,
+    STATUS.CLOSED,
+  ]),
   [STATUS.CLOSED]: new Set([STATUS.CLOSED]),
 };
 
@@ -93,6 +97,8 @@ const TERMINAL = new Set([
   STATUS.ENTRY_CANCELLED,
 ]);
 
+const KNOWN_STATUSES = new Set(Object.values(STATUS));
+
 function normalizeTradeStatus(status) {
   const s = String(status || "").trim().toUpperCase();
   return STATUS[s] || s;
@@ -101,19 +107,23 @@ function normalizeTradeStatus(status) {
 function canTransition(fromStatus, toStatus) {
   const from = normalizeTradeStatus(fromStatus);
   const to = normalizeTradeStatus(toStatus);
-  if (!from) return { ok: true, reason: "FROM_EMPTY" };
+  if (!to) return { ok: false, reason: "TO_EMPTY" };
+  if (!KNOWN_STATUSES.has(to)) return { ok: false, reason: "UNKNOWN_TO" };
+  if (!from) return { ok: false, reason: "FROM_EMPTY" };
+  if (!KNOWN_STATUSES.has(from)) return { ok: false, reason: "UNKNOWN_FROM" };
   if (from === to) return { ok: true, reason: "NOOP" };
   if (TERMINAL.has(from) && to !== STATUS.CLOSED) {
     return { ok: false, reason: "FROM_TERMINAL" };
   }
   const allowed = ALLOWED_TRANSITIONS[from];
-  if (!allowed) return { ok: true, reason: "UNKNOWN_FROM" };
+  if (!allowed) return { ok: false, reason: "UNKNOWN_FROM" };
   if (allowed.has(to)) return { ok: true, reason: "ALLOWED" };
   return { ok: false, reason: "INVALID_TRANSITION" };
 }
 
 module.exports = {
   STATUS,
+  KNOWN_STATUSES,
   normalizeTradeStatus,
   canTransition,
 };

@@ -212,6 +212,7 @@ async function buildFnoUniverse({ kite, nowMs = Date.now() }) {
 
   const contracts = {};
   const tokens = [];
+  const signalTokens = [];
   const symbols = [];
 
   for (const u of underlyings) {
@@ -266,6 +267,9 @@ async function buildFnoUniverse({ kite, nowMs = Date.now() }) {
     if (!tokens.includes(Number(picked.instrument_token))) {
       tokens.push(Number(picked.instrument_token));
     }
+    if (!signalTokens.includes(Number(picked.instrument_token))) {
+      signalTokens.push(Number(picked.instrument_token));
+    }
     if (
       Number.isFinite(Number(picked.strike_ref_token)) &&
       Number(picked.strike_ref_token) > 0
@@ -286,6 +290,7 @@ async function buildFnoUniverse({ kite, nowMs = Date.now() }) {
       underlyings,
       contracts,
       tokens,
+      signalTokens,
       symbols,
       builtAt: new Date().toISOString(),
     },

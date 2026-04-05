@@ -13,6 +13,7 @@ function getArg(name, fb = null) {
 }
 
 function n(v, d = null) {
+  if (v === null || v === undefined || v === '') return d;
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }

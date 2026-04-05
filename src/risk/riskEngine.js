@@ -5,6 +5,7 @@ const {
   buildBoundsForToday,
 } = require("../market/marketCalendar");
 const { isHalted } = require("../runtime/halt");
+const { evaluateMinTradableRiskFit } = require("./evaluateMinTradableRiskFit");
 
 class RiskEngine {
   constructor({ limits, onStateChange, clock } = {}) {
@@ -266,19 +267,38 @@ class RiskEngine {
     this._emitStateChange();
   }
 
-  calcQty({ entryPrice, stopLoss, riskInr: riskInrOverride, lotSize, expectedSlippagePts, feePerLotInr }) {
-    const riskInr = Number(
-      Number.isFinite(Number(riskInrOverride))
-        ? riskInrOverride
-        : env.RISK_PER_TRADE_INR ?? 250,
-    );
-    const lot = Math.max(1, Number(lotSize ?? 1));
-    const slPts = Math.max(0.05, Math.abs(Number(entryPrice) - Number(stopLoss)));
-    const slipPts = Math.max(0, Number(expectedSlippagePts ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0));
-    const feesPerLot = Math.max(0, Number(feePerLotInr ?? env.EXPECTED_FEES_PER_LOT_INR ?? 0));
-    const effRiskPerLot = (slPts + slipPts) * lot + feesPerLot;
-    const perLot = Math.max(0.05, effRiskPerLot);
-    return Math.max(1, Math.floor(riskInr / perLot) * lot);
+  evaluateMinTradableRiskFit(args = {}) {
+    return evaluateMinTradableRiskFit({
+      ...args,
+      riskBudgetInr:
+        args.riskBudgetInr ??
+        args.riskInr ??
+        env.RISK_PER_TRADE_INR ??
+        250,
+      expectedSlippagePts:
+        args.expectedSlippagePts ?? env.EXPECTED_SLIPPAGE_POINTS ?? 0,
+      feePerLotInr:
+        args.feePerLotInr ?? env.EXPECTED_FEES_PER_LOT_INR ?? 0,
+    });
+  }
+
+  calcQty({
+    entryPrice,
+    stopLoss,
+    riskInr: riskInrOverride,
+    lotSize,
+    expectedSlippagePts,
+    feePerLotInr,
+  }) {
+    const fit = this.evaluateMinTradableRiskFit({
+      entryPrice,
+      strategyStopLoss: stopLoss,
+      lotSize,
+      riskBudgetInr: riskInrOverride,
+      expectedSlippagePts,
+      feePerLotInr,
+    });
+    return fit?.maxQtyByRisk ?? 0;
   }
 }
 

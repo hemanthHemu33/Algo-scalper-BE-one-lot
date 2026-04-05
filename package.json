@@ -10,10 +10,22 @@
     "sync:instruments": "node scripts/sync-instruments.js",
     "replay:signals": "node scripts/replay-signals.js",
     "health:critical": "node scripts/health-critical.js",
+    "bt:backfill": "node scripts/bt_backfill_token_range.js",
     "bt:run": "node scripts/bt_run.js",
+    "bt:report": "node scripts/bt_report.js",
+    "bt:validate-data": "node scripts/bt_validate_data.js",
+    "bt:matrix": "node scripts/bt_matrix.js",
+    "bt:wfa": "node scripts/bt_walkforward.js",
     "bt:prepare-options": "node scripts/bt_prepare_option_universe.js",
     "test:dynexit": "node scripts/dyn_exit_scenarios.js",
-    "test": "node --check src/index.js"
+    "test:entryexec": "node tests/trading/entryExecutionPolicy.test.js",
+    "test:optimizer": "node tests/optimizer/adaptiveOptimizer.test.js && node tests/trading/optimizerIntegration.test.js",
+    "test:stoprisk": "node tests/risk/evaluateMinTradableRiskFit.test.js && node tests/trading/stopRiskSemantics.test.js",
+    "test:proexit": "node tests/trading/greenLock.test.js && node tests/trading/mfeLockLadder.test.js && node tests/trading/givebackCap.test.js && node tests/trading/dynamicExitManager.test.js && node tests/trading/winnerProtectionState.test.js && node scripts/test_dynamic_shadow_fallback.js",
+    "test:runtime": "node tests/trading/tradeManagerRuntime.test.js",
+    "test:acceptance": "node tests/backtest/acceptance.test.js",
+    "test:backtest": "node tests/backtest/configLoader.test.js && node tests/backtest/reasonCodes.test.js && node tests/backtest/dataValidation.test.js && node tests/backtest/riskGovernor.test.js && npm run test:acceptance && node tests/backtest/acceptanceEvaluator.test.js && node tests/backtest/matrixRunner.test.js && node tests/backtest/walkForward.test.js && node tests/backtest/reportWriter.test.js",
+    "test": "node --check src/index.js && node tests/strategy/signalLayer.test.js && npm run test:backtest"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

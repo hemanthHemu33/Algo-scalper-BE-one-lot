@@ -91,6 +91,10 @@ function _shouldControlTrading() {
   return _bool(env.MARKET_GATE_CONTROL_TRADING, true);
 }
 
+function _isLifecycleEnabled() {
+  return _bool(env.ENGINE_LIFECYCLE_ENABLED, false);
+}
+
 function _marketGatePollMs() {
   return _num(env.MARKET_GATE_POLL_MS, 5000);
 }
@@ -130,6 +134,10 @@ function startMarketGate() {
 
   marketGate.on("open", () => {
     logger.info("[market] OPEN -> enabling signals/trading");
+    if (_isLifecycleEnabled()) {
+      logger.info("[market] OPEN -> lifecycle owns trading state");
+      return;
+    }
     if (_shouldControlTrading()) {
       setTradingEnabled(null);
     }
@@ -137,6 +145,10 @@ function startMarketGate() {
 
   marketGate.on("close", () => {
     logger.info("[market] CLOSE -> disabling new entries");
+    if (_isLifecycleEnabled()) {
+      logger.info("[market] CLOSE -> lifecycle owns trading state");
+      return;
+    }
     if (_shouldControlTrading()) {
       setTradingEnabled(false);
     }
@@ -183,12 +195,73 @@ function startTickTapLogger() {
   }, 10000);
 }
 
+function stopTickWatchdog() {
+  if (tickWatchdogTimer) {
+    clearInterval(tickWatchdogTimer);
+    tickWatchdogTimer = null;
+  }
+}
+
+function stopTickTapLogger() {
+  if (tickTapTimer) {
+    clearInterval(tickTapTimer);
+    tickTapTimer = null;
+  }
+  tickTapCount = 0;
+}
+
+function stopMarketGate() {
+  if (!marketGate) return;
+  try {
+    if (typeof marketGate.stop === "function") {
+      marketGate.stop();
+    }
+  } catch (err) {
+    logger.warn(
+      { step: "marketGate.stop", e: err?.message || String(err) },
+      "[kite] cleanup step failed",
+    );
+  }
+  try {
+    if (typeof marketGate.removeAllListeners === "function") {
+      marketGate.removeAllListeners();
+    }
+  } catch (err) {
+    logger.warn(
+      { step: "marketGate.removeAllListeners", e: err?.message || String(err) },
+      "[kite] cleanup step failed",
+    );
+  }
+  marketGate = null;
+}
+
+async function safeCleanupStep(step, fn) {
+  try {
+    await fn();
+  } catch (err) {
+    logger.warn(
+      { step, e: err?.message || String(err) },
+      "[kite] cleanup step failed",
+    );
+  }
+}
+
 function _modeConst(modeStr) {
   const m = _modeStrSafe(modeStr, "full");
   if (!ticker) return null;
   if (m === "ltp") return ticker.modeLTP;
   if (m === "quote") return ticker.modeQuote;
   return ticker.modeFull;
+}
+
+function _uniqNumeric(arr) {
+  return Array.from(
+    new Set(
+      (arr || [])
+        .map((x) => Number(x))
+        .filter((n) => Number.isFinite(n) && n > 0),
+    ),
+  );
 }
 
 function _applyMode(tokens, modeStr) {
@@ -485,20 +558,57 @@ async function drainTicks() {
   }
 }
 
+async function cleanupSessionRuntime({
+  reason = "session_refresh",
+  stopGate = false,
+} = {}) {
+  const prevPipeline = pipeline;
+  const prevTicker = ticker;
+
+  stopReconcileLoop();
+  stopTickWatchdog();
+  stopTickTapLogger();
+  tickQueue = [];
+  lastTickAt = 0;
+  recentOrderUpdateKeys = new Map();
+
+  await safeCleanupStep("pipeline.stop", async () => {
+    if (prevPipeline && typeof prevPipeline.stop === "function") {
+      await prevPipeline.stop();
+    }
+  });
+
+  await safeCleanupStep("ticker.removeAllListeners", async () => {
+    if (prevTicker && typeof prevTicker.removeAllListeners === "function") {
+      prevTicker.removeAllListeners();
+    }
+  });
+
+  await safeCleanupStep("ticker.disconnect", async () => {
+    if (prevTicker && typeof prevTicker.disconnect === "function") {
+      prevTicker.disconnect();
+    }
+  });
+
+  if (stopGate) {
+    stopMarketGate();
+  }
+
+  pipeline = null;
+  ticker = null;
+  kite = null;
+  tickerConnected = false;
+  subscribedTokens = new Set();
+  tokenModeByToken = new Map();
+  _lastPosResubAt = 0;
+  _lastUniverseRebuildAt = 0;
+}
+
 async function setSession(accessToken) {
   if (accessToken === currentToken) return;
 
   logger.info("[kite] session update detected");
-
-  stopReconcileLoop();
-
-  if (ticker) {
-    try {
-      ticker.disconnect();
-    } catch (err) { reportFault({ code: "KITE_TICKERMANAGER_CATCH", err, message: "[src/kite/tickerManager.js] caught and continued" }); }
-    ticker = null;
-    tickerConnected = false;
-  }
+  await cleanupSessionRuntime({ reason: "session_refresh", stopGate: false });
 
   kite = createKiteConnect({ apiKey: env.KITE_API_KEY, accessToken });
   ticker = createTicker({ apiKey: env.KITE_API_KEY, accessToken });
@@ -523,6 +633,15 @@ async function setSession(accessToken) {
   currentToken = accessToken;
 }
 
+async function stopSession(reason = "manual") {
+  await cleanupSessionRuntime({ reason, stopGate: true });
+  lastDisconnect = new Date().toISOString();
+  currentToken = null;
+
+  logger.warn({ reason }, "[kite] session stopped");
+  return { ok: true, reason };
+}
+
 function wireEvents() {
   ticker.on("connect", async () => {
     tickerConnected = true;
@@ -533,6 +652,9 @@ function wireEvents() {
     try {
       let tokensIn = subscribeTokens;
       let symbolsIn = subscribeSymbols;
+      let signalTokensIn = null;
+      let fnoUniverseTokens = [];
+      let mergeCashUniverse = false;
 
       // F&O mode: dynamically build derivative universe (futures or underlying tokens for options)
       if (_bool(env.FNO_ENABLED, false)) {
@@ -540,16 +662,21 @@ function wireEvents() {
           const uni = await buildFnoUniverse({ kite });
           const u = uni?.universe;
           if (u?.tokens?.length) {
-            const merge = _bool(env.FNO_MERGE_CASH_UNIVERSE, false);
-            tokensIn = merge
+            mergeCashUniverse = _bool(env.FNO_MERGE_CASH_UNIVERSE, false);
+            fnoUniverseTokens = _uniqNumeric(u.tokens);
+            signalTokensIn = _uniqNumeric(
+              Array.isArray(u.signalTokens) ? u.signalTokens : u.tokens,
+            );
+            tokensIn = mergeCashUniverse
               ? Array.from(new Set([...(tokensIn || []), ...u.tokens]))
               : u.tokens;
-            symbolsIn = merge ? symbolsIn : [];
+            symbolsIn = mergeCashUniverse ? symbolsIn : [];
             logger.info(
               {
                 mode: u.mode,
                 underlyings: u.underlyings,
                 tokens: u.tokens,
+                signalTokens: signalTokensIn,
                 symbols: u.symbols,
               },
               "[fno] universe active",
@@ -579,6 +706,18 @@ function wireEvents() {
         tokens: tokensIn,
         symbols: symbolsIn,
       });
+      const resolvedSignalTokens = signalTokensIn?.length
+        ? _uniqNumeric(
+            mergeCashUniverse
+              ? [
+                  ...resolved.filter(
+                    (token) => !fnoUniverseTokens.includes(Number(token)),
+                  ),
+                  ...signalTokensIn,
+                ]
+              : signalTokensIn,
+          )
+        : _uniqNumeric(resolved);
 
       // PATCH-3: Recovery safety — also subscribe any broker-side open positions (option tokens etc.)
       const posTokens = await _positionSubscriptionTokens().catch(() => []);
@@ -613,7 +752,9 @@ function wireEvents() {
           },
         );
 
-        await pipeline.initForTokens(allTokens);
+        await pipeline.initForTokens(allTokens, {
+          signalTokens: resolvedSignalTokens,
+        });
         await pipeline.reconcile();
 
         // One more pass to catch any late-reported positions right after connect
@@ -782,9 +923,15 @@ function getSubscribedTokens() {
   return Array.from(subscribedTokens || []);
 }
 
+function getKiteClient() {
+  return kite;
+}
+
 module.exports = {
   setSession,
+  stopSession,
   getPipeline,
+  getKiteClient,
   getTickerStatus,
   getSubscribedTokens,
   ensureActivePositionSubscriptions,

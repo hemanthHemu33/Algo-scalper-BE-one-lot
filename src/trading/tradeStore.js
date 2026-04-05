@@ -1,6 +1,9 @@
 const { getDb } = require("../db");
 const { logger } = require("../logger");
 const { canTransition, normalizeTradeStatus } = require("./tradeStateMachine");
+const { normalizeStopRiskSemantics } = require("./stopRiskSemantics");
+const { buildMissingTradeLifecyclePatch } = require("./tradeLifecycleState");
+const { buildMissingWinnerProtectionPatch } = require("./winnerProtectionState");
 
 const TRADES = "trades";
 const ORDER_LINKS = "order_links";
@@ -13,6 +16,68 @@ const LIVE_ORDER_SNAPSHOTS = "live_order_snapshots";
 // Patch-6: cost calibration & reconciliations (post-trade cost model tuning)
 const COST_CALIBRATION = "cost_calibration";
 const COST_RECONCILIATIONS = "cost_reconciliations";
+const STALE_TRANSITION_LOG_DEDUP_WINDOW_MS = 60 * 1000;
+const staleTransitionLogCache = new Map();
+let staleTransitionLogCacheSweepAt = 0;
+
+function normalizeTradeVersionValue(value) {
+  const version = Number(value);
+  return Number.isInteger(version) && version >= 0 ? version : 0;
+}
+
+function withNormalizedTradeVersion(trade) {
+  if (!trade || typeof trade !== "object") return trade;
+  return {
+    ...trade,
+    version: normalizeTradeVersionValue(trade.version),
+  };
+}
+
+function buildTradeVersionFilter(tradeId, expectedVersion) {
+  const filter = { tradeId };
+  const version = Number(expectedVersion);
+  if (!Number.isInteger(version) || version < 0) {
+    return filter;
+  }
+  if (version === 0) {
+    filter.$or = [{ version: 0 }, { version: { $exists: false } }];
+    return filter;
+  }
+  filter.version = version;
+  return filter;
+}
+
+function shouldLogStaleTransition({ tradeId, fromStatus, toStatus, role }) {
+  const now = Date.now();
+  if (
+    staleTransitionLogCache.size > 0 &&
+    now - staleTransitionLogCacheSweepAt >= STALE_TRANSITION_LOG_DEDUP_WINDOW_MS
+  ) {
+    for (const [key, lastLoggedAt] of staleTransitionLogCache.entries()) {
+      if (now - lastLoggedAt >= STALE_TRANSITION_LOG_DEDUP_WINDOW_MS) {
+        staleTransitionLogCache.delete(key);
+      }
+    }
+    staleTransitionLogCacheSweepAt = now;
+  }
+
+  const key = [
+    String(tradeId || ""),
+    String(fromStatus || ""),
+    String(toStatus || ""),
+    String(role || "UNKNOWN").toUpperCase(),
+  ].join("|");
+  const lastLoggedAt = staleTransitionLogCache.get(key);
+  if (
+    Number.isFinite(lastLoggedAt) &&
+    now - lastLoggedAt < STALE_TRANSITION_LOG_DEDUP_WINDOW_MS
+  ) {
+    return false;
+  }
+
+  staleTransitionLogCache.set(key, now);
+  return true;
+}
 
 async function ensureTradeIndexes() {
   const db = getDb();
@@ -56,18 +121,80 @@ async function ensureTradeIndexes() {
 
 async function insertTrade(trade) {
   const db = getDb();
+  const stopRisk = normalizeStopRiskSemantics(trade || {});
+  const lifecycle = buildMissingTradeLifecyclePatch({
+    ...(trade || {}),
+    ...stopRisk,
+  });
+  const winnerProtection = buildMissingWinnerProtectionPatch({
+    ...(trade || {}),
+    ...stopRisk,
+  });
   await db
     .collection(TRADES)
-    .insertOne({ ...trade, createdAt: new Date(), updatedAt: new Date() });
+    .insertOne({
+      ...trade,
+      ...stopRisk,
+      ...lifecycle,
+      ...winnerProtection,
+      version: Math.max(1, normalizeTradeVersionValue(trade?.version) || 1),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
 }
 
-async function updateTrade(tradeId, patch) {
+async function updateTrade(tradeId, patch, options = {}) {
   const db = getDb();
   const update = { ...(patch || {}) };
+  const suppliedVersion = Number(options?.expectedVersion);
+  const current = withNormalizedTradeVersion(
+    options?.currentTrade || (await db.collection(TRADES).findOne({ tradeId })),
+  );
+
+  if (!current) {
+    return {
+      ok: false,
+      status: "MISSING",
+      tradeId,
+      expectedVersion: Number.isInteger(suppliedVersion) ? suppliedVersion : null,
+      trade: null,
+      validation: null,
+    };
+  }
+
+  const expectedVersion =
+    Number.isInteger(suppliedVersion) && suppliedVersion >= 0
+      ? suppliedVersion
+      : normalizeTradeVersionValue(current?.version);
+  let validation = null;
+
+  if (
+    Object.prototype.hasOwnProperty.call(update, "stopLoss") &&
+    !Object.prototype.hasOwnProperty.call(update, "brokerStopLoss")
+  ) {
+    update.brokerStopLoss = update.stopLoss;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(update, "brokerStopLoss") &&
+    !Object.prototype.hasOwnProperty.call(update, "stopLoss")
+  ) {
+    update.stopLoss = update.brokerStopLoss;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(update, "strategyStopLoss") &&
+    !Object.prototype.hasOwnProperty.call(update, "initialStopLoss")
+  ) {
+    update.initialStopLoss = update.strategyStopLoss;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(update, "slTrigger") === false &&
+    Object.prototype.hasOwnProperty.call(update, "brokerStopLoss")
+  ) {
+    update.slTrigger = update.brokerStopLoss;
+  }
 
   if (Object.prototype.hasOwnProperty.call(update, "status")) {
     try {
-      const current = await db.collection(TRADES).findOne({ tradeId });
       const fromStatus = current?.status || null;
       const toStatus = normalizeTradeStatus(update.status);
 
@@ -79,42 +206,119 @@ async function updateTrade(tradeId, patch) {
           normalizeTradeStatus(fromStatus),
         );
       if (staleEntryFill) {
-        logger.info(
-          { tradeId, fromStatus, toStatus },
-          "[trade] stale ENTRY_FILLED transition ignored",
-        );
+        const role =
+          update?.lastEventMeta?.role ?? update?.role ?? current?.lastEventMeta?.role ?? null;
+        const staleTransitionMeta = { tradeId, fromStatus, toStatus };
+        if (role) staleTransitionMeta.role = role;
+        if (shouldLogStaleTransition({ ...staleTransitionMeta, role })) {
+          logger.info(
+            staleTransitionMeta,
+            "[trade] stale ENTRY_FILLED transition ignored",
+          );
+        }
         delete update.status;
+        validation = {
+          ok: true,
+          reason: "STALE_ENTRY_FILLED_IGNORED",
+          fromStatus,
+          toStatus,
+        };
       }
 
-      const validation = canTransition(fromStatus, toStatus);
+      const transition = canTransition(fromStatus, toStatus);
 
-      if (!staleEntryFill && !validation.ok) {
+      if (!staleEntryFill && !transition.ok) {
         logger.error(
-          { tradeId, fromStatus, toStatus, reason: validation.reason },
+          { tradeId, fromStatus, toStatus, reason: transition.reason },
           "[trade] invalid status transition blocked",
         );
         delete update.status;
         update.statusTransitionError = {
           from: fromStatus,
           to: toStatus,
-          reason: validation.reason,
+          reason: transition.reason,
           ts: new Date(),
+        };
+        validation = {
+          ok: false,
+          reason: transition.reason,
+          fromStatus,
+          toStatus,
         };
       } else if (!staleEntryFill) {
         update.status = toStatus;
+        validation = {
+          ok: true,
+          reason: transition.reason,
+          fromStatus,
+          toStatus,
+        };
+      }
+
+      if (Object.prototype.hasOwnProperty.call(update, "strategyStopLoss")) {
+        const currentStrategyStop = current?.strategyStopLoss ?? current?.initialStopLoss ?? current?.stopLoss ?? null;
+        const nextStrategyStop = update.strategyStopLoss;
+        if (
+          currentStrategyStop != null &&
+          nextStrategyStop != null &&
+          Number(currentStrategyStop) !== Number(nextStrategyStop)
+        ) {
+          logger.warn(
+            { tradeId, currentStrategyStop, nextStrategyStop },
+            "[trade] strategyStopLoss mutation blocked",
+          );
+          delete update.strategyStopLoss;
+          delete update.initialStopLoss;
+        }
       }
     } catch (e) {
       logger.warn(
         { tradeId, e: e?.message || String(e) },
         "[trade] status transition validation skipped",
       );
+      validation = {
+        ok: false,
+        reason: "VALIDATION_ERROR",
+        fromStatus: current?.status || null,
+        toStatus: normalizeTradeStatus(update.status),
+      };
+    }
+  } else if (Object.prototype.hasOwnProperty.call(update, "strategyStopLoss")) {
+    try {
+      const current = await db.collection(TRADES).findOne({ tradeId });
+      const currentStrategyStop = current?.strategyStopLoss ?? current?.initialStopLoss ?? current?.stopLoss ?? null;
+      const nextStrategyStop = update.strategyStopLoss;
+      if (
+        currentStrategyStop != null &&
+        nextStrategyStop != null &&
+        Number(currentStrategyStop) !== Number(nextStrategyStop)
+      ) {
+        logger.warn(
+          { tradeId, currentStrategyStop, nextStrategyStop },
+          "[trade] strategyStopLoss mutation blocked",
+        );
+        delete update.strategyStopLoss;
+        delete update.initialStopLoss;
+      }
+    } catch (e) {
+      logger.warn(
+        { tradeId, e: e?.message || String(e) },
+        "[trade] strategyStopLoss immutability check skipped",
+      );
     }
   }
 
+  delete update.version;
+
   const runUpdate = () =>
-    db
-      .collection(TRADES)
-      .updateOne({ tradeId }, { $set: { ...update, updatedAt: new Date() } });
+    db.collection(TRADES).findOneAndUpdate(
+      buildTradeVersionFilter(tradeId, expectedVersion),
+      {
+        $set: { ...update, updatedAt: new Date() },
+        $inc: { version: 1 },
+      },
+      { returnDocument: "after" },
+    );
 
   let result;
   try {
@@ -136,30 +340,71 @@ async function updateTrade(tradeId, patch) {
     result = await runUpdate();
   }
 
-  if (!result?.acknowledged) {
-    throw new Error(`[trade] updateTrade not acknowledged for tradeId=${tradeId}`);
-  }
-
-  if (Number(result?.matchedCount ?? 0) === 0) {
-    const err = new Error(`[trade] updateTrade found no trade row: tradeId=${tradeId}`);
-    logger.error(
-      { tradeId, patchKeys: Object.keys(update) },
-      "[trade] updateTrade dropped because trade was not found",
+  const appliedTrade = withNormalizedTradeVersion(
+    result?.value ??
+      result?.lastErrorObject?.value ??
+      (result?.tradeId ? result : null),
+  );
+  if (!appliedTrade) {
+    const latest = withNormalizedTradeVersion(
+      await db.collection(TRADES).findOne({ tradeId }),
     );
-    throw err;
+    if (!latest) {
+      logger.error(
+        { tradeId, patchKeys: Object.keys(update) },
+        "[trade] updateTrade dropped because trade was not found",
+      );
+      return {
+        ok: false,
+        status: "MISSING",
+        tradeId,
+        expectedVersion,
+        trade: null,
+        validation,
+      };
+    }
+
+    logger.warn(
+      {
+        tradeId,
+        expectedVersion,
+        actualVersion: latest.version,
+        patchKeys: Object.keys(update),
+      },
+      "[trade] updateTrade version conflict",
+    );
+    return {
+      ok: false,
+      status: "CONFLICT",
+      tradeId,
+      expectedVersion,
+      actualVersion: latest.version,
+      trade: latest,
+      validation,
+    };
   }
 
-  return result;
+  return {
+    ok: true,
+    status: "APPLIED",
+    tradeId,
+    expectedVersion,
+    version: appliedTrade.version,
+    trade: appliedTrade,
+    validation,
+  };
 }
 
 async function getTrade(tradeId) {
   const db = getDb();
-  return db.collection(TRADES).findOne({ tradeId });
+  return withNormalizedTradeVersion(
+    await db.collection(TRADES).findOne({ tradeId }),
+  );
 }
 
 async function getActiveTrades() {
   const db = getDb();
-  return db
+  const rows = await db
     .collection(TRADES)
     .find({
       status: {
@@ -169,6 +414,7 @@ async function getActiveTrades() {
           "ENTRY_REPLACED",
           "ENTRY_FILLED",
           "SL_PLACED",
+          "SL_OPEN",
           "SL_CONFIRMED",
           "LIVE",
           "EXIT_PLACED",
@@ -181,6 +427,7 @@ async function getActiveTrades() {
       },
     })
     .toArray();
+  return rows.map((row) => withNormalizedTradeVersion(row));
 }
 
 async function linkOrder({ order_id, tradeId, role }) {

@@ -36,6 +36,15 @@ function inc(obj, key, n = 1) {
   obj[k] = (obj[k] || 0) + Number(n ?? 0);
 }
 
+function safeMeta(meta) {
+  if (!meta || typeof meta !== "object") return null;
+  try {
+    return JSON.parse(JSON.stringify(meta));
+  } catch {
+    return { note: "UNSERIALIZABLE_META" };
+  }
+}
+
 function bucketFeeMultiple(x) {
   if (!Number.isFinite(x)) return "NA";
   if (x < 0) return "<0";
@@ -81,6 +90,11 @@ class TradeTelemetry {
       sumEstCostsInr: 0,
 
       lastTrades: [], // ring buffer
+      decisionsTotal: 0,
+      decisionsByOutcome: {},
+      decisionsByStage: {},
+      decisionsByReason: {},
+      lastDecisions: [], // ring buffer
     };
   }
 
@@ -107,6 +121,55 @@ class TradeTelemetry {
   stop() {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
+  }
+
+  recordDecision({
+    tradeId,
+    signalId,
+    strategyId,
+    side,
+    token,
+    outcome,
+    stage,
+    reason,
+    meta,
+  }) {
+    if (!this._enabled) return;
+    this._rotateIfNeeded(new Date());
+
+    const sid = safeKey(strategyId || "UNKNOWN", 80);
+    const out = safeKey(outcome || "UNKNOWN", 40);
+    const stg = safeKey(stage || "unknown", 40);
+    const rsn = safeKey(reason || out, 140);
+    const key = safeKey(`${stg}|${rsn}`, 220);
+
+    this._state.updatedAt = new Date();
+    this._state.decisionsTotal += 1;
+    inc(this._state.decisionsByOutcome, out, 1);
+    inc(this._state.decisionsByStage, stg, 1);
+    inc(this._state.decisionsByReason, key, 1);
+
+    const item = {
+      ts: Date.now(),
+      dayKey: this._state.dayKey,
+      tradeId: String(tradeId || ""),
+      signalId: signalId ? String(signalId) : null,
+      strategyId: sid,
+      side: side || null,
+      token: Number.isFinite(Number(token)) ? Number(token) : null,
+      outcome: out,
+      stage: stg,
+      reason: rsn,
+      meta: safeMeta(meta),
+    };
+
+    this._state.lastDecisions.push(item);
+    if (this._state.lastDecisions.length > this._ringSize) {
+      this._state.lastDecisions.splice(
+        0,
+        this._state.lastDecisions.length - this._ringSize,
+      );
+    }
   }
 
   recordTradeClose({
@@ -187,6 +250,11 @@ class TradeTelemetry {
       sumEstCostsInr: s.sumEstCostsInr,
       sumNetAfterEstCostsInr: s.sumNetAfterEstCostsInr,
       lastTrades: s.lastTrades.slice(-50),
+      decisionsTotal: s.decisionsTotal,
+      decisionsByOutcome: s.decisionsByOutcome,
+      decisionsByStage: s.decisionsByStage,
+      decisionsByReason: s.decisionsByReason,
+      lastDecisions: s.lastDecisions.slice(-50),
     };
   }
 
@@ -210,6 +278,7 @@ class TradeTelemetry {
       ...this._state,
       avgFeeMultiple,
       lastTrades: this._state.lastTrades.slice(-200),
+      lastDecisions: this._state.lastDecisions.slice(-200),
       updatedAt: new Date(),
     };
 

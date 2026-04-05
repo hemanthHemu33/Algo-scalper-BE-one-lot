@@ -34,12 +34,24 @@ try {
             )}`,
           );
         }
-      } catch (err) { reportFault({ code: "CONFIG_CATCH", err, message: "[src/config.js] caught and continued" }); }
+      } catch (err) {
+        reportFault({
+          code: "CONFIG_CATCH",
+          err,
+          message: "[src/config.js] caught and continued",
+        });
+      }
       // eslint-disable-next-line global-require
       require("dotenv").config({ path: dotenvPath });
     }
   }
-} catch (err) { reportFault({ code: "CONFIG_CATCH", err, message: "[src/config.js] caught and continued" }); }
+} catch (err) {
+  reportFault({
+    code: "CONFIG_CATCH",
+    err,
+    message: "[src/config.js] caught and continued",
+  });
+}
 
 const defaultTimezone = "Asia/Kolkata";
 const resolvedTimezone =
@@ -84,6 +96,8 @@ const schema = z.object({
   DOTENV_ENABLED: z.string().optional(),
   DOTENV_PATH: z.string().optional(),
   PROFILE_PRESET: z.string().optional(),
+  // First-live convenience flag: applies a conservative exit-management preset unless overridden explicitly.
+  LIVE_CONSERVATIVE_PROFILE: boolFromEnv.default(false),
   PROFILE_VALIDATE: z.string().default("true"),
 
   // Observability / telemetry (pro tuning support)
@@ -126,10 +140,16 @@ const schema = z.object({
   OPT_DEWEIGHT_CONF_MIN: z.coerce.number().default(0.5),
   OPT_DEWEIGHT_QTY_MIN: z.coerce.number().default(0.5),
   OPT_DEWEIGHT_APPLY_TO_QTY: z.string().default("false"),
+  OPT_DEWEIGHT_HARD_VETO_ENABLED: z.string().default("false"),
+  OPT_RECHECK_CONF_AFTER_DEWEIGHT: z.string().default("false"),
   OPT_SPREAD_PENALTY_BPS: z.coerce.number().default(15),
   OPT_SPREAD_BLOCK_BPS: z.coerce.number().default(30),
   OPT_SPREAD_PENALTY_CONF_MULT: z.coerce.number().default(0.85),
+  OPT_SPREAD_SOFT_ACTION: z.string().default("RR_ONLY"),
   OPT_SPREAD_BLOCK_ENABLED: z.string().default("false"),
+  OPT_KEY_MODE: z.string().default("NORMALIZED_V2"),
+  OPT_STRATEGY_KEY_INCLUDE_OPT_TYPE: z.string().default("true"),
+  OPT_STRATEGY_KEY_INCLUDE_STYLE: z.string().default("true"),
   OPTIMIZER_BOOTSTRAP_FROM_DB: z.string().default("true"),
   OPT_BOOTSTRAP_DAYS: z.coerce.number().default(7),
 
@@ -139,6 +159,7 @@ const schema = z.object({
   OPT_STATE_ID: z.string().default("active"),
   OPT_STATE_FLUSH_SEC: z.coerce.number().default(15),
   OPT_STATE_MAX_KEYS: z.coerce.number().default(1500),
+  OPT_STATE_VERSION: z.coerce.number().default(2),
 
   // Regime-aware RR floors
   RR_TREND_MIN: z.coerce.number().default(1.5),
@@ -248,6 +269,9 @@ const schema = z.object({
   OPT_PICK_REQUIRE_OK: boolFromEnv.default(true),
   // Debug: attach the top-N option candidates to last pick metadata (0 disables). Max 10.
   OPT_PICK_DEBUG_TOP_N: z.coerce.number().default(0),
+  OPT_ALTERNATE_CONTRACT_TOP_N: z.coerce.number().default(3),
+  // Conservative confidence allowance used only for the pre-route fast reject.
+  OPT_PRE_ROUTE_MAX_CONF_BOOST: z.coerce.number().default(14),
 
   // Strike step sizes (override if exchange changes lot/steps)
   OPT_STRIKE_STEP_NIFTY: z.coerce.number().default(50),
@@ -347,9 +371,19 @@ const schema = z.object({
   // Option SL fitter (to make 1-lot risk fit RISK_PER_TRADE_INR caps when lot sizes are large)
   // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
   OPT_SL_FIT_ENABLED: boolFromEnv.default(false),
-  // When FORCE_ONE_LOT + LOT_RISK_CAP_ENFORCE would otherwise BLOCK, auto-tighten SL to fit 1 lot within cap.
-  // Safe default: it never increases INR risk; it either tightens SL or blocks if it cannot fit within MIN ticks.
-  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(true),
+  // Current scope: only attempt pre-entry SL compression after the original strategy stop fails
+  // the min-tradable risk-fit gate. Keep this opt-in so the engine blocks instead of over-
+  // compressing strategy stops by default.
+  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(false),
+  OPT_SL_FIT_MIN_DISTANCE_KEEP_PCT: z.coerce.number().default(80),
+  PRE_ENTRY_SL_COMPRESSION_ENABLED: boolFromEnv.default(false),
+  PRE_ENTRY_SL_COMPRESSION_MAX_PCT: z.coerce.number().default(0.10),
+  PRE_ENTRY_SL_COMPRESSION_MAX_TICKS: z.coerce.number().default(6),
+  PRE_ENTRY_SL_COMPRESSION_MAX_POINTS: z.coerce.number().optional(),
+  PRE_ENTRY_SL_COMPRESSION_ALLOW_OPEN: boolFromEnv.default(false),
+  PRE_ENTRY_SL_COMPRESSION_REQUIRE_RR_FLOOR: boolFromEnv.default(true),
+  PRE_ENTRY_SL_COMPRESSION_MIN_RR: z.coerce.number().default(1.8),
+  PRE_ENTRY_SL_COMPRESSION_MIN_KEEP_PCT: z.coerce.number().default(80),
   // Minimum SL distance enforced by fitter (in ticks). Helps avoid ultra-tight “0.05 SL” fitting.
   OPT_SL_FIT_MIN_TICKS: z.coerce.number().default(10),
 
@@ -414,6 +448,15 @@ const schema = z.object({
   MARKET_CLOSE: z.string().default("15:30"),
   MARKET_GATE_POLL_MS: z.coerce.number().default(5000),
   MARKET_GATE_CONTROL_TRADING: z.string().default("true"),
+  ENGINE_LIFECYCLE_ENABLED: z.string().default("false"),
+  ENGINE_LIFECYCLE_NOTIFY_ENABLED: z.string().default("true"),
+  ENGINE_WARMUP_HHMM: z.string().default("09:10"),
+  ENGINE_LIVE_HHMM: z.string().default("09:15"),
+  ENGINE_CLOSE_HHMM: z.string().default("15:30"),
+  ENGINE_IDLE_AFTER_MIN: z.coerce.number().default(5),
+  ENGINE_COOLDOWN_POLL_SEC: z.coerce.number().default(15),
+  ENGINE_REQUIRE_FLAT_BEFORE_IDLE: z.string().default("true"),
+  ENGINE_TEST_NOW_ISO: z.string().optional(),
   TICK_WATCHDOG_ENABLED: z.string().default("true"),
   TICK_WATCHDOG_INTERVAL_MS: z.coerce.number().default(5000),
   TICK_WATCHDOG_MAX_AGE_MS: z.coerce.number().default(15000),
@@ -554,8 +597,51 @@ const schema = z.object({
   BE_LOCK_AT_PROFIT_INR: z.coerce.number().default(200),
   BE_ARM_R: z.coerce.number().default(0.6),
   TRAIL_ARM_R: z.coerce.number().default(1.0),
+  GREEN_LOCK_ENABLED: z.string().default("true"),
+  GREEN_LOCK_ARM_R: z.coerce.number().default(0.8),
+  GREEN_LOCK_PEAK_R: z.coerce.number().default(1.0),
+  GREEN_LOCK_MIN_R: z.coerce.number().default(0.12),
+  GREEN_LOCK_COST_MULT: z.coerce.number().default(1.0),
+  MFE_LOCK_LADDER_ENABLED: z.string().default("true"),
+  EXIT_TIGHTEN_AT_R: z.coerce.number().default(1.0),
+  // Optional weak-regime governor: keep post-1R tighten inactive in choppy/range regimes.
+  EXIT_TIGHTEN_WEAK_REGIME_GOVERNOR_ENABLED: boolFromEnv.default(true),
+  EXIT_TIGHTEN_WEAK_REGIMES: z.string().default("RANGE,CHOP,WEAK"),
+  EXIT_POST_1R_TRAIL_GAP_R: z.coerce.number().default(0.25),
+  EXIT_MFE_LOCK_T1_R: z.coerce.number().default(0.8),
+  EXIT_MFE_LOCK_T1_KEEP_R: z.coerce.number().default(0.2),
+  EXIT_MFE_LOCK_T2_R: z.coerce.number().default(1.0),
+  EXIT_MFE_LOCK_T2_KEEP_R: z.coerce.number().default(0.6),
+  EXIT_MFE_LOCK_T3_R: z.coerce.number().default(1.25),
+  EXIT_MFE_LOCK_T3_KEEP_R: z.coerce.number().default(0.8),
+  EXIT_MFE_LOCK_T4_R: z.coerce.number().default(1.5),
+  EXIT_MFE_LOCK_T4_KEEP_R: z.coerce.number().default(1.0),
+  EXIT_MFE_LOCK_T5_R: z.coerce.number().default(2.0),
+  EXIT_MFE_LOCK_T5_GIVEBACK_R: z.coerce.number().default(0.4),
+  EXIT_MFE_LOCK_T5_MIN_KEEP_R: z.coerce.number().default(1.2),
+  MFE_LOCK_1_AT_R: z.coerce.number().default(1.0),
+  MFE_LOCK_1_KEEP_R: z.coerce.number().default(0.2),
+  MFE_LOCK_2_AT_R: z.coerce.number().default(1.4),
+  MFE_LOCK_2_KEEP_R: z.coerce.number().default(0.45),
+  MFE_LOCK_3_AT_R: z.coerce.number().default(1.8),
+  MFE_LOCK_3_KEEP_R: z.coerce.number().default(0.75),
+  MFE_LOCK_4_AT_R: z.coerce.number().default(2.4),
+  MFE_LOCK_4_KEEP_R: z.coerce.number().default(1.1),
+  MFE_LOCK_5_AT_R: z.coerce.number().default(3.0),
+  MFE_LOCK_5_KEEP_R: z.coerce.number().default(1.5),
+  EXIT_HARD_GIVEBACK_T1_PEAK_R: z.coerce.number().default(1.0),
+  EXIT_HARD_GIVEBACK_T1_R: z.coerce.number().default(0.3),
+  EXIT_HARD_GIVEBACK_T2_PEAK_R: z.coerce.number().default(1.25),
+  EXIT_HARD_GIVEBACK_T2_R: z.coerce.number().default(0.35),
+  EXIT_HARD_GIVEBACK_T3_PEAK_R: z.coerce.number().default(1.5),
+  EXIT_HARD_GIVEBACK_T3_PCT: z.coerce.number().default(0.3),
+  EXIT_HARD_GIVEBACK_CONFIRM_MS: z.coerce.number().default(800),
+  EXIT_HARD_GIVEBACK_CONFIRM_TICKS: z.coerce.number().default(2),
   BE_BUFFER_TICKS: z.coerce.number().default(1),
   TRIGGER_BUFFER_TICKS: z.coerce.number().default(1),
+  DYNAMIC_EXIT_REQUIRE_WINNER_GATE_FOR_STRUCTURE_TRAIL:
+    boolFromEnv.default(true),
+  // Deprecated: retained for env compatibility; live trailing uses TRAIL_GAP_*_PCT/MIN/MAX knobs.
   TRAIL_GAP_PREMIUM_POINTS: z.coerce.number().default(8),
   TRAIL_GAP_PRE_BE_PCT: z.coerce.number().default(0.08),
   TRAIL_GAP_POST_BE_PCT: z.coerce.number().default(0.04),
@@ -595,15 +681,15 @@ const schema = z.object({
   // Disable TP orders (SL-only mode)
   OPT_TP_ENABLED: z.string().default("false"),
 
-  // PATCH-10: Post-fill risk recheck (fills can drift; re-fit SL or exit)
+  // Post-fill risk recheck (fills can drift; classify/tag/exit without rewriting strategy stop)
   POST_FILL_RISK_RECHECK_ENABLED: boolFromEnv.default(true),
   // extra tolerance over the cap (e.g., 0.01 = +1%)
   POST_FILL_RISK_EPS_PCT: z.coerce.number().default(0.01),
-  // If risk still > cap after re-fit: EXIT (panic close) | KEEP (leave as-is)
+  // Legacy fallback key. Hard breach policy now prefers POST_FILL_RISK_HARD_ACTION.
   POST_FILL_RISK_FAIL_ACTION: z.string().default("EXIT"),
-  // If SL is re-fitted, recompute target from RR_TARGET using the new (tighter) risk.
+  // Legacy compatibility only; post-fill SL refit is no longer used by default.
   POST_FILL_RISK_REFIT_TARGET: boolFromEnv.default(true),
-  // Minimum SL distance when re-fitting (in ticks)
+  // Legacy compatibility only; post-fill SL refit is no longer used by default.
   POST_FILL_RISK_MIN_TICKS: z.coerce.number().default(2),
 
   // PATCH-5: Lot risk cap enforcement (post lot-normalization)
@@ -713,6 +799,10 @@ const schema = z.object({
       "ema_pullback,vwap_reclaim,orb,bb_squeeze,breakout,volume_spike,fakeout,rsi_fade,wick_reversal",
     ),
   SIGNAL_INTERVALS: z.string().default("1"),
+  SIGNAL_STATE_PERSIST: z.string().default("false"),
+  SIGNAL_STATE_PERSIST_PATH: z.string().optional(),
+  SIGNAL_STATE_PERSIST_TTL_MIN: z.coerce.number().default(180),
+  SIGNAL_STATE_PERSIST_MAX_SETUPS: z.coerce.number().default(2500),
 
   STRATEGY_SELECTOR_ENABLED: z.string().default("false"),
   STRATEGIES_TREND: z.string().optional(),
@@ -771,6 +861,7 @@ const schema = z.object({
   MOM_BODY_FRAC: z.coerce.number().default(0.6),
 
   FAKEOUT_LOOKBACK: z.coerce.number().default(20),
+  FAKEOUT_VOL_LOOKBACK: z.coerce.number().default(20),
   FAKEOUT_VOL_MULT: z.coerce.number().default(1.0),
 
   FAKEOUT_WICK_FRAC: z.coerce.number().default(0.6),
@@ -786,6 +877,7 @@ const schema = z.object({
 
   USE_MARGIN_SIZING: z.string().default("true"),
   MARGIN_BUFFER_PCT: z.coerce.number().default(5),
+  MARGIN_ALLOW_ESTIMATED_ORDER_MARGIN: boolFromEnv.default(false),
 
   // Position sizing mode:
   // - RISK_THEN_MARGIN (default): size by RISK_PER_TRADE_INR then downsize if margin is insufficient
@@ -849,6 +941,12 @@ const schema = z.object({
   // Signal quality gating (reduces overtrading)
   // Skip signals below this confidence score (0-100). Set to 0 to disable.
   MIN_SIGNAL_CONFIDENCE: z.coerce.number().default(75),
+  SIGNAL_PREEMIT_GLOBAL_MIN_NORMALIZED_CONFIDENCE: z.coerce.number().default(67),
+  SIGNAL_PREEMIT_GLOBAL_MIN_QUALITY_SCORE: z.coerce.number().default(60),
+  SIGNAL_PREEMIT_GLOBAL_MIN_CONTEXT_SCORE: z.coerce.number().default(58),
+  SIGNAL_PREEMIT_GLOBAL_MIN_FINAL_SCORE: z.coerce.number().default(71),
+  SIGNAL_PREEMIT_GLOBAL_MIN_MTF_SCORE: z.coerce.number().default(50),
+  SIGNAL_PREEMIT_GLOBAL_MIN_FRESHNESS: z.coerce.number().default(58),
 
   // Cost/edge gating (prevents tiny targets that cannot beat costs)
   ENABLE_COST_GATE: z.string().default("true"),
@@ -918,11 +1016,39 @@ const schema = z.object({
   ENTRY_LIMIT_FALLBACK_CANCEL_WAIT_MS: z.coerce.number().default(400),
   // Safety: do NOT auto-convert LIMIT -> MARKET. If you accept slippage, set ENTRY_ORDER_TYPE_OPT=MARKET explicitly.
   ENTRY_LIMIT_FALLBACK_TO_MARKET: boolFromEnv.default(false),
+  MAX_EXECUTION_AGE_MS: z.coerce.number().default(20000),
+  MAX_LATENCY_GRACE_MS: z.coerce.number().default(5000),
+  MAX_SIGNAL_LATENCY_GRACE_MS: z.coerce.number().default(5000),
+  EXEC_SIGNAL_MAX_AGE_MS: z.coerce.number().default(5000),
+  EXEC_MAX_PREMIUM_DRIFT_PCT: z.coerce.number().default(1.0),
+  EXEC_MAX_SPREAD_BPS: z.coerce.number().default(45),
+  EXEC_MAX_CHASE_STEPS: z.coerce.number().default(3),
+  EXEC_MAX_ENTRY_DEVIATION_PCT: z.coerce.number().default(1.2),
   // Smart limit laddering (micro-improve fills without blind chasing)
   ENTRY_LADDER_ENABLED: boolFromEnv.default(true),
   ENTRY_LADDER_TICKS: z.coerce.number().default(2),
   ENTRY_LADDER_STEP_DELAY_MS: z.coerce.number().default(350),
   ENTRY_LADDER_MAX_CHASE_BPS: z.coerce.number().default(35),
+  ENTRY_LADDER_STYLE_ENABLED: boolFromEnv.default(true),
+  ENTRY_LADDER_USE_LIVE_QUOTE: boolFromEnv.default(true),
+  ENTRY_LADDER_URGENCY_BREAKOUT_MULT: z.coerce.number().default(2.4),
+  ENTRY_LADDER_URGENCY_OPEN_MULT: z.coerce.number().default(2.0),
+  ENTRY_LADDER_URGENCY_TREND_MULT: z.coerce.number().default(1.6),
+  ENTRY_LADDER_URGENCY_RANGE_MULT: z.coerce.number().default(0.9),
+  ENTRY_PENDING_EDGE_REVALIDATE_ENABLED: boolFromEnv.default(true),
+  ENTRY_PENDING_CANCEL_ON_EDGE_DECAY: boolFromEnv.default(true),
+  ENTRY_PENDING_REVALIDATE_AFTER_MS: z.coerce.number().default(1500),
+  ENTRY_PENDING_MAX_SPREAD_BPS: z.coerce.number().default(45),
+  ENTRY_PENDING_MAX_ADVERSE_UL_BPS: z.coerce.number().default(12),
+  ENTRY_PENDING_MAX_MS_BREAKOUT: z.coerce.number().default(7000),
+  ENTRY_PENDING_MAX_MS_OPEN: z.coerce.number().default(9000),
+  ENTRY_PENDING_MAX_MS_TREND: z.coerce.number().default(12000),
+  ENTRY_PENDING_MAX_MS_RANGE: z.coerce.number().default(20000),
+  ALLOW_ONE_LOT_RISK_BUFFER_PCT: z.coerce.number().default(25),
+  ENABLE_SL_COMPRESSION_WHEN_BLOCKED: boolFromEnv.default(true),
+  MAX_SL_COMPRESSION_PCT: z.coerce.number().default(20),
+  FNO_FORCE_ONE_LOT_MAX_BREACH_PCT: z.coerce.number().default(8),
+  FNO_FORCE_ONE_LOT_REQUIRE_TAG: boolFromEnv.default(true),
 
   // Optional simple caps (highly recommended)
   MAX_QTY: z.coerce.number().optional(),
@@ -930,8 +1056,47 @@ const schema = z.object({
 
   // Dynamic exit management (trail SL / adjust target)
   DYNAMIC_EXITS_ENABLED: z.string().default("false"),
-  DYNAMIC_EXIT_MIN_INTERVAL_MS: z.coerce.number().default(5000),
-  DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: z.coerce.number().default(1200),
+  DYNAMIC_EXIT_MIN_INTERVAL_MS: z.coerce.number().default(2000),
+  DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: z.coerce.number().default(800),
+  DYNAMIC_EXIT_MIN_HOLD_MS: z.coerce.number().default(15000),
+  DYNAMIC_EXIT_EARLY_TIGHTEN_MIN_R: z.coerce.number().default(0.6),
+  DYNAMIC_EXIT_REQUIRE_SAFE_EXECUTION: z.string().default("true"),
+  DYNAMIC_EXIT_ALLOW_SAFE_PRE_BE_STOP_COMPRESSION:
+    boolFromEnv.default(false),
+  DYNAMIC_EXIT_MIN_EXECUTABLE_DISTANCE_TICKS: z.coerce.number().default(2),
+  DYNAMIC_EXIT_MAX_EXECUTABLE_SPREAD_BPS: z.coerce.number().default(120),
+  DYNAMIC_EXIT_DISABLE_ON_FAIL: z.string().default("false"),
+  DYNAMIC_EXIT_CANCEL_REPLACE_ON_FAIL: z.string().default("true"),
+  DYNAMIC_EXIT_SHADOW_MODE_ON_FAIL: z.string().default("true"),
+  DYNAMIC_EXIT_PANIC_ON_SHADOW_BREACH: z.string().default("true"),
+  EARLY_FAIL_ENABLED: z.string().default("true"),
+  EARLY_FAIL_WINDOW_MS: z.coerce.number().default(90000),
+  EARLY_FAIL_MIN_PEAK_R: z.coerce.number().default(0.25),
+  EARLY_FAIL_MAX_STALL_MS: z.coerce.number().default(45000),
+  EARLY_FAIL_STRUCTURE_BREAK_ENABLED: z.string().default("true"),
+  // Early stall calibration: require time, bars, weakness, and confirmation before panic-exit.
+  EARLY_STALL_MIN_TRADE_AGE_MS: z.coerce.number().default(20000),
+  EARLY_STALL_MIN_BARS_SINCE_ENTRY: z.coerce.number().default(1),
+  EARLY_STALL_CONFIRM_TICKS: z.coerce.number().default(3),
+  EARLY_STALL_CONFIRM_MS: z.coerce.number().default(10000),
+  EARLY_STALL_MIN_MFE_R: z.coerce.number().default(0.20),
+  EARLY_STALL_MAX_ADVERSE_R: z.coerce.number().default(-0.08),
+  EARLY_STALL_BREAKOUT_GRACE_MS: z.coerce.number().default(15000),
+  EARLY_STALL_ORB_GRACE_MS: z.coerce.number().default(20000),
+  // Early structure failure calibration: prefer underlying structure when available and
+  // require a meaningful, confirmed breach before loss-containment panic-exit.
+  EARLY_STRUCTURE_FAIL_CONFIRM_TICKS: z.coerce.number().default(2),
+  EARLY_STRUCTURE_FAIL_CONFIRM_MS: z.coerce.number().default(4000),
+  EARLY_STRUCTURE_FAIL_BUFFER_POINTS: z.coerce.number().default(0),
+  EARLY_STRUCTURE_FAIL_BUFFER_TICKS: z.coerce.number().default(6),
+  EARLY_STRUCTURE_FAIL_BUFFER_ATR_FRACTION: z.coerce.number().default(0.15),
+  EARLY_STRUCTURE_FAIL_USE_UNDERLYING: boolFromEnv.default(true),
+  EARLY_FAIL_LOG_VERBOSE: boolFromEnv.default(true),
+  POST_FILL_RISK_SOFT_BREACH_PCT: z.coerce.number().default(5),
+  POST_FILL_RISK_HARD_BREACH_PCT: z.coerce.number().default(12),
+  POST_FILL_RISK_SOFT_ACTION: z.string().default("TAG_ONLY"),
+  POST_FILL_RISK_HARD_ACTION: z.string().default("EXIT"),
+  POST_FILL_RISK_REDUCE_IF_POSSIBLE: boolFromEnv.default(true),
 
   // Executable vs idea signal split (keep logging ideas, route only executable)
   EXECUTABLE_SIGNAL_GATE_ENABLED: boolFromEnv.default(true),
@@ -943,6 +1108,7 @@ const schema = z.object({
   CB_MAX_STALE_TICKS_5M: z.coerce.number().default(12),
   CB_MAX_QUOTE_GUARD_HITS_5M: z.coerce.number().default(4),
   CB_COOLDOWN_SEC: z.coerce.number().default(180),
+  CIRCUIT_BREAKER_COOLDOWN_MINUTES: z.coerce.number().default(5),
 
   DYN_ATR_PERIOD: z.coerce.number().default(14),
   DYN_TRAIL_ATR_MULT: z.coerce.number().default(1.2),
@@ -955,9 +1121,14 @@ const schema = z.object({
   DYN_TRAIL_START_R: z.coerce.number().default(1.0),
 
   DYN_TRAIL_STEP_TICKS: z.coerce.number().default(20),
-  DYN_STEP_TICKS_PRE_BE: z.coerce.number().default(20),
-  DYN_STEP_TICKS_POST_BE: z.coerce.number().default(10),
+  DYN_STEP_TICKS_PRE_BE: z.coerce.number().default(10),
+  DYN_STEP_TICKS_POST_BE: z.coerce.number().default(5),
   DYN_TRAIL_START_PROFIT_INR: z.coerce.number().default(0),
+  OPTION_TRAIL_USE_UNDERLYING_CONFIRM: z.string().default("true"),
+  OPTION_TRAIL_REQUIRE_EXECUTABLE_MFE: z.string().default("true"),
+  OPTION_EXECUTABLE_PRICE_MODE: z.string().default("BID_SIDE"),
+  OPTION_PREMIUM_TRAIL_WEIGHT: z.coerce.number().default(0.35),
+  OPTION_UNDERLYING_TRAIL_WEIGHT: z.coerce.number().default(0.65),
 
   // STATIC | FOLLOW_RR | TIGHTEN_VWAP
   DYN_TARGET_MODE: z.string().default("STATIC"),
@@ -1058,6 +1229,19 @@ if (!hasRawEnv("OPT_ATM_SCAN_STEPS") && hasRawEnv("OPT_STRIKE_SCAN_STEPS")) {
 }
 
 const PROFILE_PRESETS = {
+  // Conservative first-live profile: later BE/trailing, wider post-BE gap, slower modify cadence.
+  LIVE_CONSERVATIVE: {
+    BE_ARM_R: 0.8,
+    TRAIL_ARM_R: 1.35,
+    TRAIL_GAP_POST_BE_PCT: 0.06,
+    TRAIL_GAP_POST_BE_PCT_TIGHT: 0.05,
+    TRAIL_TIGHTEN_R: 2.2,
+    EXIT_TIGHTEN_AT_R: 2.0,
+    DYN_STEP_TICKS_POST_BE: 8,
+    DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: 1500,
+    EXIT_TIGHTEN_WEAK_REGIME_GOVERNOR_ENABLED: true,
+    EXIT_TIGHTEN_WEAK_REGIMES: "RANGE,CHOP,WEAK",
+  },
   NIFTY_OPT_SCALP_SAFE: {
     STOPLOSS_ORDER_TYPE_FO: "SL",
     SL_LIMIT_BUFFER_BPS: 50,
@@ -1071,7 +1255,10 @@ const PROFILE_PRESETS = {
   },
 };
 
-const presetKey = String(env.PROFILE_PRESET || "")
+const presetKey = String(
+  env.PROFILE_PRESET ||
+    (env.LIVE_CONSERVATIVE_PROFILE ? "LIVE_CONSERVATIVE" : ""),
+)
   .trim()
   .toUpperCase();
 if (presetKey && PROFILE_PRESETS[presetKey]) {
@@ -1184,6 +1371,7 @@ validateProfileCombos();
   const crypto = require("crypto");
   const safeConfig = {
     tz: env.CANDLE_TZ,
+    liveConservativeProfile: env.LIVE_CONSERVATIVE_PROFILE,
     fnoMode: env.FNO_MODE,
     optExpiryPolicy: env.OPT_EXPIRY_POLICY,
     optAllowZeroDte: env.OPT_ALLOW_ZERO_DTE,
@@ -1195,7 +1383,19 @@ validateProfileCombos();
     deltaBandMin: env.OPT_DELTA_BAND_MIN,
     deltaBandMax: env.OPT_DELTA_BAND_MAX,
     minSignalConfidence: env.MIN_SIGNAL_CONFIDENCE,
+    signalStatePersist: env.SIGNAL_STATE_PERSIST,
+    signalPreEmitMinNormalized: env.SIGNAL_PREEMIT_GLOBAL_MIN_NORMALIZED_CONFIDENCE,
+    signalPreEmitMinQuality: env.SIGNAL_PREEMIT_GLOBAL_MIN_QUALITY_SCORE,
+    signalPreEmitMinContext: env.SIGNAL_PREEMIT_GLOBAL_MIN_CONTEXT_SCORE,
+    signalPreEmitMinFinal: env.SIGNAL_PREEMIT_GLOBAL_MIN_FINAL_SCORE,
     riskPerTradeInr: env.RISK_PER_TRADE_INR,
+    beArmR: env.BE_ARM_R,
+    trailArmR: env.TRAIL_ARM_R,
+    trailGapPostBePct: env.TRAIL_GAP_POST_BE_PCT,
+    trailTightenR: env.TRAIL_TIGHTEN_R,
+    exitTightenAtR: env.EXIT_TIGHTEN_AT_R,
+    dynStepTicksPostBe: env.DYN_STEP_TICKS_POST_BE,
+    dynExitMinModifyIntervalMs: env.DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS,
     stopTypeFo: env.STOPLOSS_ORDER_TYPE_FO,
     slBufferBps: env.SL_LIMIT_BUFFER_BPS,
     slSlaMs: env.SL_SAFETY_SLA_MS,

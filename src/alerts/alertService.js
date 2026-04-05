@@ -56,6 +56,11 @@ function n(v) {
   return Number.isFinite(x) ? x : null;
 }
 
+function sourceText(v) {
+  const s = String(v || "").trim().toUpperCase();
+  return s || null;
+}
+
 function buildTradeMathLines(message, meta) {
   if (!meta || typeof meta !== "object") return [];
   const text = String(message || "").toLowerCase();
@@ -85,21 +90,38 @@ function buildTradeMathLines(message, meta) {
     }
   }
 
-  if (text.includes("be lock active")) {
+  if (text.includes("be armed") || text.includes("be lock active")) {
     const be = n(meta.beLockedAtPrice);
     const mg = n(meta.minGreenPts);
     const entry = n(meta.entryPrice);
-    if (be != null && mg != null && entry != null) {
-      lines.push(`BE lock = Entry ${entry} ± MinGreen ${mg} = ${be}`);
+    const side = String(meta.side || "").toUpperCase();
+    const beSource = sourceText(meta.beFloorSource);
+    if (beSource) {
+      lines.push(`BE floor source = ${beSource}`);
+    }
+    if (beSource === "MIN_GREEN" && be != null && mg != null && entry != null) {
+      const op = side === "SELL" ? "-" : "+";
+      lines.push(`Min-green floor = Entry ${entry} ${op} ${mg} = ${be}`);
     }
   }
 
-  if (text.includes("sl trailed") || text.includes("sl moved to be")) {
+  if (
+    text.includes("sl trailed") ||
+    text.includes("sl moved to be") ||
+    text.includes("sl moved to profit lock") ||
+    text.includes("sl updated")
+  ) {
     const prev = n(meta.prevStopLoss);
     const next = n(meta.stopLoss);
     if (prev != null && next != null) {
       const delta = next - prev;
       lines.push(`Trail move = New SL ${next} - Old SL ${prev} = ${delta.toFixed(2)}`);
+    }
+    const protectionSource = sourceText(
+      meta.protectedStopSource || meta.beFloorSource,
+    );
+    if (protectionSource) {
+      lines.push(`Protection source = ${protectionSource}`);
     }
     const beFloor = n(meta.beFloor);
     if (next != null && beFloor != null) {

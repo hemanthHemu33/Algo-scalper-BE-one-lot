@@ -1,0 +1,79 @@
+{
+  "metadata": {
+    "name": "nifty_opt_walkforward_q1_2026",
+    "seed": 42,
+    "tags": ["sample", "walkforward"]
+  },
+  "data": {
+    "from": "2026-01-01T00:00:00+05:30",
+    "to": "2026-03-31T23:59:59+05:30",
+    "interval": 1,
+    "warmup": 80
+  },
+  "instrument": {
+    "mode": "OPT",
+    "token": 260105,
+    "underlying": "NIFTY 50",
+    "dynamicContracts": true,
+    "optionType": "CE",
+    "strikeStep": 50,
+    "scanSteps": 3
+  },
+  "execution": {
+    "execRealism": true,
+    "eventBroker": true,
+    "calibrationMode": "fixed",
+    "slippageBps": 3,
+    "partialFillProbability": 0.15,
+    "minPartialFillRatio": 0.35
+  },
+  "capital": {
+    "initialCapital": 50000,
+    "capitalPerTrade": 20000
+  },
+  "risk": {
+    "riskPerTradeInr": 500,
+    "maxDailyLossInr": 1500,
+    "maxConcurrentPositions": 1,
+    "maxTradesPerDay": 3,
+    "maxConsecutiveLosses": 3
+  },
+  "strategies": {
+    "qtyMode": "risk_based",
+    "defaultQty": 50,
+    "confidenceThreshold": 60
+  },
+  "exits": {
+    "rrTarget": 1.4,
+    "slPctFallback": 0.7
+  },
+  "reports": {
+    "outputDir": "reports/backtests",
+    "writeCsv": true,
+    "writeJson": true,
+    "writeMarkdown": true,
+    "persistMongo": false
+  },
+  "acceptance": {
+    "minTrades": 20,
+    "minProfitFactor": 1.0,
+    "minOOSProfitFactor": 1.0,
+    "minOOSNetPnl": 0
+  },
+  "validation": {
+    "dataQualityMode": "warn",
+    "lookAheadGuard": true
+  },
+  "walkForward": {
+    "trainWindowDays": 20,
+    "testWindowDays": 5,
+    "stepDays": 5,
+    "anchorMode": "rolling",
+    "selectionMetric": "netPnl",
+    "candidateParamGrid": {
+      "strategies.confidenceThreshold": [55, 60, 65],
+      "execution.slippageBps": [2, 3],
+      "risk.riskPerTradeInr": [400, 500]
+    }
+  }
+}

@@ -9,13 +9,21 @@ const { connectMongo } = require("./db");
 const { ensureRetentionIndexes } = require("./market/retention");
 const { buildApp } = require("./app");
 const { watchLatestToken } = require("./tokenWatcher");
-const { setSession } = require("./kite/tickerManager");
+const {
+  setSession,
+  stopSession: stopKiteSession,
+  getTickerStatus,
+  getPipeline,
+  getKiteClient,
+} = require("./kite/tickerManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
 const http = require("http");
 const { attachSocketServer } = require("./socket/socketServer");
 const { reportFault } = require("./runtime/errorBus");
+const { setTradingEnabled } = require("./runtime/tradingEnabled");
+const { createEngineLifecycle } = require("./runtime/engineLifecycle");
 
 function applyWindowsSrvDnsWorkaround() {
   // Workaround for Node.js Windows SRV DNS regressions that can manifest as:
@@ -103,6 +111,63 @@ async function main() {
     await optimizer.start();
   } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
 
+  const lifecycleEnabled =
+    String(env.ENGINE_LIFECYCLE_ENABLED || "false") === "true";
+  const engineLifecycle = lifecycleEnabled
+    ? createEngineLifecycle({
+        startSession: async (accessToken, reason) => {
+          await setSession(accessToken);
+          return { ok: true, reason };
+        },
+        stopSession: async (reason) => stopKiteSession(reason),
+        setTradingEnabled: async (enabled, reason) => ({
+          ...setTradingEnabled(enabled),
+          reason,
+        }),
+        getSessionStatus: async () => {
+          const ticker = getTickerStatus();
+          let pipelineReady = false;
+          try {
+            pipelineReady = !!getPipeline();
+          } catch {
+            pipelineReady = false;
+          }
+          return {
+            tickerConnected: !!ticker?.connected,
+            pipelineReady,
+          };
+        },
+        getOpenPositionsSummary: async () => {
+          const kite = getKiteClient();
+          if (!kite || typeof kite.getPositions !== "function") {
+            return {
+              openCount: -1,
+              source: "ticker_manager",
+              error: "kite_unavailable",
+            };
+          }
+
+          try {
+            const positions = await kite.getPositions();
+            const net = Array.isArray(positions?.net || positions?.day)
+              ? positions?.net || positions?.day
+              : [];
+            const openCount = net.filter((p) => {
+              const qty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+              return Number.isFinite(qty) && qty !== 0;
+            }).length;
+            return { openCount, source: "kite" };
+          } catch (err) {
+            return {
+              openCount: -1,
+              source: "kite",
+              error: err?.message || String(err),
+            };
+          }
+        },
+      })
+    : null;
+
   await watchLatestToken({
     onToken: async (accessToken, doc, reason) => {
       const updatedAt = doc?.updatedAt || doc?.createdAt || null;
@@ -128,7 +193,11 @@ async function main() {
       }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
 
       try {
-        await setSession(accessToken);
+        if (engineLifecycle) {
+          await engineLifecycle.setToken(accessToken);
+        } else {
+          await setSession(accessToken);
+        }
       } catch (e) {
         const err = describeErr(e);
         logger.error(
@@ -161,6 +230,9 @@ async function main() {
     logger.warn({ signal }, "shutdown");
     alert("warn", `🧯 Shutdown signal: ${signal}`, { signal }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
     try {
+      try {
+        engineLifecycle?.stop?.();
+      } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
       try {
         if (io) io.close();
       } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }

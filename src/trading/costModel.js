@@ -198,6 +198,177 @@ function estimateRoundTripCostInr({
   };
 }
 
+function pnlInrToR(pnlInr, riskInr) {
+  const pnl = n(pnlInr, NaN);
+  const risk = n(riskInr, NaN);
+  if (!(Number.isFinite(pnl) && Number.isFinite(risk) && risk > 0)) return null;
+  return pnl / risk;
+}
+
+function rToInr(rMultiple, riskInr) {
+  const r = n(rMultiple, NaN);
+  const risk = n(riskInr, NaN);
+  if (!(Number.isFinite(r) && Number.isFinite(risk) && risk > 0)) return null;
+  return r * risk;
+}
+
+function priceFromNetPnl({
+  entryPrice,
+  qty,
+  side,
+  pnlInr,
+  tick,
+  roundMode,
+} = {}) {
+  const entry = n(entryPrice, NaN);
+  const q = n(qty, NaN);
+  const pnl = n(pnlInr, NaN);
+  if (!(entry > 0) || !(q > 0) || !Number.isFinite(pnl)) return null;
+
+  const pts = pnl / q;
+  const raw =
+    up(side) === "SELL"
+      ? entry - pts
+      : entry + pts;
+
+  const px = Number(raw);
+  if (!Number.isFinite(px) || px <= 0) return null;
+
+  const tk = n(tick, 0);
+  if (!(tk > 0)) return px;
+
+  const steps = px / tk;
+  if (!Number.isFinite(steps)) return null;
+
+  if (roundMode === "up") return Math.ceil(steps) * tk;
+  if (roundMode === "down") return Math.floor(steps) * tk;
+  return Math.round(steps) * tk;
+}
+
+function retainedRToPrice({
+  entryPrice,
+  qty,
+  side,
+  retainedR,
+  riskInr,
+  tick,
+  roundMode,
+} = {}) {
+  const pnlInr = rToInr(retainedR, riskInr);
+  if (!Number.isFinite(pnlInr)) return null;
+  return priceFromNetPnl({
+    entryPrice,
+    qty,
+    side,
+    pnlInr,
+    tick,
+    roundMode,
+  });
+}
+
+function estimateTrueBreakEven({
+  entryPrice,
+  qty,
+  side,
+  tick,
+  spreadBps,
+  env,
+  instrument,
+  segmentKey,
+  product,
+  costMultiplier = 1,
+  keepProfitInr = 0,
+  extraBufferPts = 0,
+} = {}) {
+  const entry = n(entryPrice, NaN);
+  const q = n(qty, NaN);
+  const mult = Math.max(0, n(costMultiplier, 1));
+  const keepInr = Math.max(0, n(keepProfitInr, 0));
+  const bufferPts = Math.max(0, n(extraBufferPts, 0));
+
+  if (!(entry > 0) || !(q > 0)) {
+    return {
+      price: Number.isFinite(entry) ? entry : null,
+      estCostInr: 0,
+      floorInr: keepInr,
+      floorPts: 0,
+      meta: { note: "invalid_inputs" },
+    };
+  }
+
+  const { estCostInr, meta } = estimateRoundTripCostInr({
+    entryPrice: entry,
+    qty: q,
+    spreadBps,
+    env,
+    instrument,
+    segmentKey,
+    product,
+  });
+
+  const floorInr = Math.max(0, n(estCostInr, 0) * mult + keepInr + bufferPts * q);
+  const floorPts = q > 0 ? floorInr / q : 0;
+  const price = priceFromNetPnl({
+    entryPrice: entry,
+    qty: q,
+    side,
+    pnlInr: floorInr,
+    tick,
+    roundMode: up(side) === "SELL" ? "down" : "up",
+  });
+
+  return {
+    price,
+    estCostInr: n(estCostInr, 0),
+    floorInr,
+    floorPts,
+    meta: {
+      ...(meta || {}),
+      costMultiplier: mult,
+      keepProfitInr: keepInr,
+      extraBufferPts: bufferPts,
+    },
+  };
+}
+
+function estimateCostGreenFloor({
+  entryPrice,
+  qty,
+  side,
+  tick,
+  spreadBps,
+  env,
+  instrument,
+  segmentKey,
+  product,
+  costMultiplier = 1,
+  minNetProfitInr = 0,
+  extraBufferPts = 0,
+} = {}) {
+  const out = estimateTrueBreakEven({
+    entryPrice,
+    qty,
+    side,
+    tick,
+    spreadBps,
+    env,
+    instrument,
+    segmentKey,
+    product,
+    costMultiplier,
+    keepProfitInr: minNetProfitInr,
+    extraBufferPts,
+  });
+
+  return {
+    price: out.price,
+    estCostInr: out.estCostInr,
+    floorInr: out.floorInr,
+    floorPts: out.floorPts,
+    meta: out.meta,
+  };
+}
+
 function costGate({
   entryPrice,
   stopLoss,
@@ -379,29 +550,32 @@ function estimateMinGreen({
     };
   }
 
-  const { estCostInr, meta: costMeta } = estimateRoundTripCostInr({
+  const bufferPts =
+    segKey === "OPT" ? n(env?.MIN_GREEN_SLIPPAGE_PTS_OPT, 2) : 0;
+  const floor = estimateCostGreenFloor({
     entryPrice: price,
     qty: q,
+    side: "BUY",
+    tick: instrument?.tick_size,
     spreadBps,
     env,
     instrument,
     segmentKey,
     product,
+    costMultiplier: 1,
+    extraBufferPts: bufferPts,
   });
-
-  const bufferPts =
-    segKey === "OPT" ? n(env?.MIN_GREEN_SLIPPAGE_PTS_OPT, 2) : 0;
   const slippageBufferInr = bufferPts * q;
-  const minGreenInr = Math.max(0, n(estCostInr, 0) + slippageBufferInr);
-  const minGreenPts = q > 0 ? minGreenInr / q : 0;
+  const minGreenInr = n(floor.floorInr, 0);
+  const minGreenPts = n(floor.floorPts, 0);
 
   return {
-    estChargesInr: n(estCostInr, 0),
+    estChargesInr: n(floor.estCostInr, 0),
     slippageBufferInr,
     minGreenInr,
     minGreenPts,
     meta: {
-      ...(costMeta || {}),
+      ...(floor.meta || {}),
       segmentKey: segKey,
       bufferPts,
     },
@@ -413,4 +587,9 @@ module.exports = {
   costGate,
   segmentKeyFromContext,
   estimateMinGreen,
+  estimateTrueBreakEven,
+  estimateCostGreenFloor,
+  pnlInrToR,
+  rToInr,
+  retainedRToPrice,
 };

@@ -1,3 +1,7 @@
+const { normalizeStopRiskSemantics } = require("./stopRiskSemantics");
+const { normalizeTradeLifecycleState } = require("./tradeLifecycleState");
+const { normalizeWinnerProtectionState } = require("./winnerProtectionState");
+
 function normalizeActiveTrade(activeTrade) {
   if (!activeTrade) return null;
   const instrument = activeTrade.instrument || {};
@@ -18,6 +22,8 @@ function normalizeActiveTrade(activeTrade) {
     activeTrade.timeStopAtIso ??
     activeTrade.timeStopMs ??
     null;
+  const stopRisk = normalizeStopRiskSemantics(activeTrade);
+  const lifecycle = normalizeTradeLifecycleState(activeTrade);
 
   return {
     ...activeTrade,
@@ -27,19 +33,80 @@ function normalizeActiveTrade(activeTrade) {
       tradingsymbol,
     },
     side: activeTrade.side ?? activeTrade.transaction_type ?? null,
+    version: activeTrade.version ?? activeTrade.trade_version ?? 0,
     entryPrice: activeTrade.entryPrice ?? activeTrade.entry_price ?? null,
-    stopLoss: activeTrade.stopLoss ?? activeTrade.stop_loss ?? null,
+    ...stopRisk,
     targetPrice: activeTrade.targetPrice ?? activeTrade.target_price ?? null,
-    slTrigger: activeTrade.slTrigger ?? activeTrade.sl_trigger ?? null,
     minGreenInr: activeTrade.minGreenInr ?? activeTrade.min_green_inr ?? null,
     minGreenPts: activeTrade.minGreenPts ?? activeTrade.min_green_pts ?? null,
     beLocked: activeTrade.beLocked ?? activeTrade.be_locked ?? null,
+    trueBePrice: activeTrade.trueBePrice ?? activeTrade.true_be_price ?? null,
+    costGreenFloorInr:
+      activeTrade.costGreenFloorInr ?? activeTrade.cost_green_floor_inr ?? null,
+    costGreenFloorPrice:
+      activeTrade.costGreenFloorPrice ?? activeTrade.cost_green_floor_price ?? null,
+    greenLockActive:
+      activeTrade.greenLockActive ?? activeTrade.green_lock_active ?? null,
+    greenLockFloorPrice:
+      activeTrade.greenLockFloorPrice ?? activeTrade.green_lock_floor_price ?? null,
     beAppliedAt: activeTrade.beAppliedAt ?? activeTrade.be_applied_at ?? null,
     beAppliedStopLoss:
       activeTrade.beAppliedStopLoss ?? activeTrade.be_applied_stop_loss ?? null,
     beApplyFails: activeTrade.beApplyFails ?? activeTrade.be_apply_fails ?? null,
+    executionRiskPts:
+      activeTrade.executionRiskPts ?? activeTrade.execution_risk_pts ?? null,
+    executionRiskQty:
+      activeTrade.executionRiskQty ?? activeTrade.execution_risk_qty ?? null,
+    executionRiskInr:
+      activeTrade.executionRiskInr ?? activeTrade.execution_risk_inr ?? null,
     peakLtp: activeTrade.peakLtp ?? activeTrade.peak_ltp ?? null,
+    peakPnlInr: activeTrade.peakPnlInr ?? activeTrade.peak_pnl_inr ?? null,
+    peakPnlR: activeTrade.peakPnlR ?? activeTrade.peak_pnl_r ?? null,
+    peakExecutablePnlInr:
+      activeTrade.peakExecutablePnlInr ?? activeTrade.peak_executable_pnl_inr ?? null,
+    ...normalizeWinnerProtectionState(activeTrade),
+    shadowExitActive:
+      activeTrade.shadowExitActive ?? activeTrade.shadow_exit_active ?? null,
+    protectionUpgradePending:
+      activeTrade.protectionUpgradePending ??
+      activeTrade.protection_upgrade_pending ??
+      null,
+    protectionUpgradeSoftFailed:
+      activeTrade.protectionUpgradeSoftFailed ??
+      activeTrade.protection_upgrade_soft_failed ??
+      null,
+    protectionUpgradeFallbackMode:
+      activeTrade.protectionUpgradeFallbackMode ??
+      activeTrade.protection_upgrade_fallback_mode ??
+      null,
+    protectionUpgradeUnconfirmedSince:
+      activeTrade.protectionUpgradeUnconfirmedSince ??
+      activeTrade.protection_upgrade_unconfirmed_since ??
+      null,
+    shadowProtectionActiveReason:
+      activeTrade.shadowProtectionActiveReason ??
+      activeTrade.shadow_protection_active_reason ??
+      null,
+    runnerRebasedAt:
+      activeTrade.runnerRebasedAt ?? activeTrade.runner_rebased_at ?? null,
+    runnerRebaseSource:
+      activeTrade.runnerRebaseSource ?? activeTrade.runner_rebase_source ?? null,
+    ...lifecycle,
+    lastProtectedR:
+      activeTrade.lastProtectedR ?? activeTrade.last_protected_r ?? null,
+    lastProtectedInr:
+      activeTrade.lastProtectedInr ?? activeTrade.last_protected_inr ?? null,
+    lastExitPlanReason:
+      activeTrade.lastExitPlanReason ?? activeTrade.last_exit_plan_reason ?? null,
     trailSl: activeTrade.trailSl ?? activeTrade.trail_sl ?? null,
+    entryUrgencyKey:
+      activeTrade.entryUrgencyKey ?? activeTrade.entry_urgency_key ?? null,
+    entryRepriceCount:
+      activeTrade.entryRepriceCount ?? activeTrade.entry_reprice_count ?? null,
+    entryPendingLastReason:
+      activeTrade.entryPendingLastReason ?? activeTrade.entry_pending_last_reason ?? null,
+    entryPendingLastCheckAt:
+      activeTrade.entryPendingLastCheckAt ?? activeTrade.entry_pending_last_check_at ?? null,
     timeStopAt,
     exitReason: activeTrade.exitReason ?? activeTrade.exit_reason ?? null,
   };
@@ -94,6 +161,8 @@ function normalizeTradeRow(row) {
   const brokerageCost = row.brokerage ?? costPayload?.brokerage ?? null;
   const taxesCost = row.taxes ?? costPayload?.taxes ?? null;
   const feesTotalCost = row.feesTotal ?? costPayload?.feesTotal ?? null;
+  const stopRisk = normalizeStopRiskSemantics(row);
+  const lifecycle = normalizeTradeLifecycleState(row);
 
   return {
     ...row,
@@ -108,20 +177,74 @@ function normalizeTradeRow(row) {
     },
     side: row.side ?? row.transaction_type ?? null,
     qty: row.qty ?? row.quantity ?? null,
+    version: row.version ?? row.trade_version ?? 0,
     entryPrice: row.entryPrice ?? row.entry_price ?? null,
     exitPrice: row.exitPrice ?? row.exit_price ?? null,
-    stopLoss: row.stopLoss ?? row.stop_loss ?? null,
+    ...stopRisk,
     targetPrice: row.targetPrice ?? row.target_price ?? null,
     tp1Price: row.tp1Price ?? row.tp1_price ?? null,
-    slTrigger: row.slTrigger ?? row.sl_trigger ?? null,
     minGreenInr: row.minGreenInr ?? row.min_green_inr ?? null,
     minGreenPts: row.minGreenPts ?? row.min_green_pts ?? null,
     beLocked: row.beLocked ?? row.be_locked ?? null,
+    trueBePrice: row.trueBePrice ?? row.true_be_price ?? null,
+    costGreenFloorInr: row.costGreenFloorInr ?? row.cost_green_floor_inr ?? null,
+    costGreenFloorPrice:
+      row.costGreenFloorPrice ?? row.cost_green_floor_price ?? null,
+    greenLockActive: row.greenLockActive ?? row.green_lock_active ?? null,
+    greenLockFloorPrice:
+      row.greenLockFloorPrice ?? row.green_lock_floor_price ?? null,
     beAppliedAt: row.beAppliedAt ?? row.be_applied_at ?? null,
     beAppliedStopLoss: row.beAppliedStopLoss ?? row.be_applied_stop_loss ?? null,
     beApplyFails: row.beApplyFails ?? row.be_apply_fails ?? null,
+    executionRiskPts:
+      row.executionRiskPts ?? row.execution_risk_pts ?? null,
+    executionRiskQty:
+      row.executionRiskQty ?? row.execution_risk_qty ?? null,
+    executionRiskInr:
+      row.executionRiskInr ?? row.execution_risk_inr ?? null,
     peakLtp: row.peakLtp ?? row.peak_ltp ?? null,
+    peakPnlInr: row.peakPnlInr ?? row.peak_pnl_inr ?? null,
+    peakPnlR: row.peakPnlR ?? row.peak_pnl_r ?? null,
+    peakExecutablePnlInr:
+      row.peakExecutablePnlInr ?? row.peak_executable_pnl_inr ?? null,
+    ...normalizeWinnerProtectionState(row),
+    shadowExitActive: row.shadowExitActive ?? row.shadow_exit_active ?? null,
+    protectionUpgradePending:
+      row.protectionUpgradePending ??
+      row.protection_upgrade_pending ??
+      null,
+    protectionUpgradeSoftFailed:
+      row.protectionUpgradeSoftFailed ??
+      row.protection_upgrade_soft_failed ??
+      null,
+    protectionUpgradeFallbackMode:
+      row.protectionUpgradeFallbackMode ??
+      row.protection_upgrade_fallback_mode ??
+      null,
+    protectionUpgradeUnconfirmedSince:
+      row.protectionUpgradeUnconfirmedSince ??
+      row.protection_upgrade_unconfirmed_since ??
+      null,
+    shadowProtectionActiveReason:
+      row.shadowProtectionActiveReason ??
+      row.shadow_protection_active_reason ??
+      null,
+    runnerRebasedAt:
+      row.runnerRebasedAt ?? row.runner_rebased_at ?? null,
+    runnerRebaseSource:
+      row.runnerRebaseSource ?? row.runner_rebase_source ?? null,
+    ...lifecycle,
+    lastProtectedR: row.lastProtectedR ?? row.last_protected_r ?? null,
+    lastProtectedInr: row.lastProtectedInr ?? row.last_protected_inr ?? null,
+    lastExitPlanReason:
+      row.lastExitPlanReason ?? row.last_exit_plan_reason ?? null,
     trailSl: row.trailSl ?? row.trail_sl ?? null,
+    entryUrgencyKey: row.entryUrgencyKey ?? row.entry_urgency_key ?? null,
+    entryRepriceCount: row.entryRepriceCount ?? row.entry_reprice_count ?? null,
+    entryPendingLastReason:
+      row.entryPendingLastReason ?? row.entry_pending_last_reason ?? null,
+    entryPendingLastCheckAt:
+      row.entryPendingLastCheckAt ?? row.entry_pending_last_check_at ?? null,
     timeStopAt,
     status: row.status ?? null,
     closeReason: row.closeReason ?? row.close_reason ?? null,

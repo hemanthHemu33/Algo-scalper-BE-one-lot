@@ -247,6 +247,7 @@ const scenarios = [
       const plan = computeDynamicExitPlan({
         trade,
         ltp: 106,
+        marketQuote: { bid: 105.8, ask: 106.2, ltp: 106 },
         underlyingLtp: 20004,
         nowTs: BASE_NOW + 3 * 60_000,
         env,
@@ -271,6 +272,7 @@ const scenarios = [
       const plan = computeDynamicExitPlan({
         trade,
         ltp,
+        marketQuote: { bid: 109.8, ask: 110.2, ltp },
         underlyingLtp: 20010,
         nowTs: BASE_NOW + 2 * 60_000,
         env,

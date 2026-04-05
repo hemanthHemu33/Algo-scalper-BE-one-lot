@@ -3,6 +3,7 @@ const { env } = require("../config");
 const { roundToTick } = require("./priceUtils");
 const { rollingVWAP, atr, maxHigh, minLow } = require("../strategy/utils");
 const { normalizeTickSize } = require("../utils/tickSize");
+const { resolveStrategyStopLoss } = require("./stopRiskSemantics");
 
 function safeNum(x) {
   const n = Number(x);
@@ -107,7 +108,7 @@ function computeBps(entry, target) {
 function planRunnerTarget({ trade, candles }) {
   const side = String(trade?.side || "").toUpperCase();
   const entry = safeNum(trade?.entryPrice || trade?.candle?.close);
-  const baseSL = safeNum(trade?.initialStopLoss || trade?.stopLoss);
+  const baseSL = safeNum(resolveStrategyStopLoss(trade));
   const tick = normalizeTickSize(trade?.instrument?.tick_size);
   if (!Number.isFinite(tick)) {
     return {

@@ -1,0 +1,127 @@
+const BASE_NOW = Date.parse("2026-01-01T09:15:00.000Z");
+
+function makeTrade(overrides = {}) {
+  return {
+    tradeId: "T-1",
+    side: "BUY",
+    qty: 10,
+    initialQty: 10,
+    entryPrice: 100,
+    strategyStopLoss: 90,
+    sizingStopLoss: 90,
+    brokerStopLoss: 90,
+    stopLoss: 90,
+    initialStopLoss: 90,
+    riskInr: 100,
+    rr: 1,
+    minGreenInr: 0,
+    minGreenPts: 0,
+    beLocked: false,
+    beLockedAtPrice: null,
+    beAppliedAt: null,
+    beAppliedStopLoss: null,
+    trailLocked: false,
+    trailSl: null,
+    tp1Done: false,
+    createdAt: new Date(BASE_NOW).toISOString(),
+    updatedAt: new Date(BASE_NOW).toISOString(),
+    entryFilledAt: new Date(BASE_NOW).toISOString(),
+    underlying_ltp: 20000,
+    instrument: {
+      tick_size: 0.05,
+      segment: "NSE",
+      tradingsymbol: "RELIANCE",
+      exchange: "NSE",
+    },
+    ...overrides,
+  };
+}
+
+function makeEnv(overrides = {}) {
+  return {
+    MIN_GREEN_ENABLED: "false",
+    TIME_STOP_MIN: 0,
+    TIME_STOP_NO_PROGRESS_MIN: 0,
+    TIME_STOP_MAX_HOLD_MIN: 0,
+    BE_ARM_R: 0.6,
+    BE_ARM_COST_MULT: 2,
+    BE_LOCK_AT_PROFIT_INR: 0,
+    TRAIL_ARM_R: 99,
+    PROFIT_LOCK_ENABLED: "false",
+    DYN_STEP_TICKS_PRE_BE: 1,
+    DYN_STEP_TICKS_POST_BE: 1,
+    TRIGGER_BUFFER_TICKS: 1,
+    GREEN_LOCK_ENABLED: "true",
+    GREEN_LOCK_ARM_R: 0.8,
+    GREEN_LOCK_PEAK_R: 1.0,
+    GREEN_LOCK_MIN_R: 0.12,
+    GREEN_LOCK_COST_MULT: 1.0,
+    MFE_LOCK_LADDER_ENABLED: "true",
+    EXIT_TIGHTEN_AT_R: 1.0,
+    EXIT_POST_1R_TRAIL_GAP_R: 0.25,
+    EXIT_MFE_LOCK_T1_R: 0.8,
+    EXIT_MFE_LOCK_T1_KEEP_R: 0.2,
+    EXIT_MFE_LOCK_T2_R: 1.0,
+    EXIT_MFE_LOCK_T2_KEEP_R: 0.6,
+    EXIT_MFE_LOCK_T3_R: 1.25,
+    EXIT_MFE_LOCK_T3_KEEP_R: 0.8,
+    EXIT_MFE_LOCK_T4_R: 1.5,
+    EXIT_MFE_LOCK_T4_KEEP_R: 1.0,
+    EXIT_MFE_LOCK_T5_R: 2.0,
+    EXIT_MFE_LOCK_T5_GIVEBACK_R: 0.4,
+    EXIT_MFE_LOCK_T5_MIN_KEEP_R: 1.2,
+    MFE_LOCK_1_AT_R: 1.0,
+    MFE_LOCK_1_KEEP_R: 0.2,
+    MFE_LOCK_2_AT_R: 1.4,
+    MFE_LOCK_2_KEEP_R: 0.45,
+    MFE_LOCK_3_AT_R: 1.8,
+    MFE_LOCK_3_KEEP_R: 0.75,
+    MFE_LOCK_4_AT_R: 2.4,
+    MFE_LOCK_4_KEEP_R: 1.1,
+    MFE_LOCK_5_AT_R: 3.0,
+    MFE_LOCK_5_KEEP_R: 1.5,
+    EXIT_HARD_GIVEBACK_T1_PEAK_R: 1.0,
+    EXIT_HARD_GIVEBACK_T1_R: 0.3,
+    EXIT_HARD_GIVEBACK_T2_PEAK_R: 1.25,
+    EXIT_HARD_GIVEBACK_T2_R: 0.35,
+    EXIT_HARD_GIVEBACK_T3_PEAK_R: 1.5,
+    EXIT_HARD_GIVEBACK_T3_PCT: 0.3,
+    EXIT_HARD_GIVEBACK_CONFIRM_MS: 800,
+    EXIT_HARD_GIVEBACK_CONFIRM_TICKS: 2,
+    DYN_ATR_PERIOD: 14,
+    DYN_TRAIL_ATR_MULT: 1.2,
+    DYN_TRAIL_START_R: 1.0,
+    DYN_MOVE_SL_TO_BE_AT_R: 0.8,
+    DYN_TRAIL_STEP_TICKS: 1,
+    DYN_TARGET_MODE: "STATIC",
+    DYN_BE_COST_MULT: 1.0,
+    DYN_BE_BUFFER_TICKS: 1,
+    OPTION_TRAIL_USE_UNDERLYING_CONFIRM: "true",
+    OPTION_TRAIL_REQUIRE_EXECUTABLE_MFE: "true",
+    OPTION_EXECUTABLE_PRICE_MODE: "BID_SIDE",
+    OPTION_PREMIUM_TRAIL_WEIGHT: 0.35,
+    OPTION_UNDERLYING_TRAIL_WEIGHT: 0.65,
+    ...overrides,
+  };
+}
+
+function flatCandles(count = 30, price = 100) {
+  return Array.from({ length: count }, (_, i) => ({
+    date: new Date(BASE_NOW - (count - i) * 60_000).toISOString(),
+    open: price,
+    high: price + 0.5,
+    low: price - 0.5,
+    close: price,
+    volume: 1000,
+  }));
+}
+
+function applyPlanPatch(trade, plan) {
+  return {
+    ...trade,
+    ...(plan?.tradePatch || {}),
+    ...(plan?.sl?.stopLoss ? { stopLoss: Number(plan.sl.stopLoss), slTrigger: Number(plan.sl.stopLoss) } : {}),
+  };
+}
+
+module.exports = { BASE_NOW, makeTrade, makeEnv, flatCandles, applyPlanPatch };

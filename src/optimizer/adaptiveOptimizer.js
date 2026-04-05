@@ -4,7 +4,6 @@ const { logger } = require("../logger");
 const { getDb } = require("../db");
 const { reportFault } = require("../runtime/errorBus");
 const {
-  enabled: optimizerStateEnabled,
   readState: readOptimizerState,
   writeState: writeOptimizerState,
 } = require("./optimizerStateStore");
@@ -12,8 +11,21 @@ const {
 // Trades collection name is defined in tradeStore.js, but we keep a local constant here to avoid circular deps.
 const TRADES_COLLECTION = "trades";
 
-function tz() {
-  return env.CANDLE_TZ || "Asia/Kolkata";
+const ACTION = Object.freeze({
+  HARD_BLOCK: "HARD_BLOCK",
+  SOFT_DEWEIGHT: "SOFT_DEWEIGHT",
+  RR_TUNE_ONLY: "RR_TUNE_ONLY",
+  PASS: "PASS",
+});
+
+const SPREAD_SOFT_ACTIONS = new Set(["NONE", "CONF", "QTY", "RR_ONLY"]);
+const DEFAULT_KEY_MODE = "NORMALIZED_V2";
+const DEFAULT_SCHEMA_VERSION = 2;
+const DEFAULT_KEY_SCHEMA_VERSION = DEFAULT_KEY_MODE;
+const NON_OPTION_TYPE = "NONOPT";
+
+function tz(runtimeEnv = env) {
+  return runtimeEnv.CANDLE_TZ || "Asia/Kolkata";
 }
 
 function n(x, d = NaN) {
@@ -26,16 +38,28 @@ function clamp(x, lo, hi) {
   return Math.max(lo, Math.min(hi, x));
 }
 
-function safeKey(s, maxLen = 64) {
+function toBool(value, fallback = false) {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const s = String(value).trim().toLowerCase();
+  if (!s) return fallback;
+  return ["1", "true", "yes", "on"].includes(s);
+}
+
+function safeKey(s, maxLen = 64, fallback = "UNKNOWN") {
   const v = String(s || "")
     .replace(/\s+/g, " ")
     .trim();
-  if (!v) return "UNKNOWN";
+  if (!v) return fallback;
   return v.length > maxLen ? v.slice(0, maxLen) : v;
 }
 
-function scopeSet() {
-  const s = String(env.OPT_BLOCK_SCOPE || "BOTH").toUpperCase();
+function safeUpper(s, maxLen = 64, fallback = "UNKNOWN") {
+  return safeKey(s, maxLen, fallback).toUpperCase();
+}
+
+function scopeSet(runtimeEnv = env) {
+  const s = safeUpper(runtimeEnv.OPT_BLOCK_SCOPE || "BOTH", 24, "BOTH");
   if (s === "KEY") return { key: true, strategy: false };
   if (s === "STRATEGY") return { key: false, strategy: true };
   return { key: true, strategy: true };
@@ -52,14 +76,183 @@ function hhmmToMinutes(hhmm) {
   return h * 60 + mi;
 }
 
-function minutesOfDay(nowTs) {
+function minutesOfDay(nowTs, runtimeEnv = env) {
   try {
-    const dt = DateTime.fromMillis(nowTs, { zone: tz() });
+    const dt = DateTime.fromMillis(Number(nowTs) || Date.now(), {
+      zone: tz(runtimeEnv),
+    });
     return dt.hour * 60 + dt.minute;
   } catch {
     const d = new Date(nowTs);
     return d.getHours() * 60 + d.getMinutes();
   }
+}
+
+function bucketForTs(nowTs, runtimeEnv = env, bucketOpenEnd, bucketCloseStart) {
+  const openEnd = hhmmToMinutes(
+    bucketOpenEnd ?? runtimeEnv.OPT_BUCKET_OPEN_END ?? "10:00",
+  );
+  const closeStart = hhmmToMinutes(
+    bucketCloseStart ?? runtimeEnv.OPT_BUCKET_CLOSE_START ?? "15:00",
+  );
+  const m = minutesOfDay(nowTs, runtimeEnv);
+  if (openEnd != null && m < openEnd) return "OPEN";
+  if (closeStart != null && m >= closeStart) return "CLOSE";
+  return "MID";
+}
+
+function normalizeUnderlying(underlying, symbol) {
+  const raw = underlying || symbol || "UNKNOWN";
+  return safeUpper(raw, 32, "UNKNOWN");
+}
+
+function normalizeOptType(optType, symbol) {
+  const t = safeUpper(optType, 16, "");
+  if (t === "CE" || t === "PE") return t;
+  const sym = safeUpper(symbol, 64, "");
+  if (sym.endsWith("CE")) return "CE";
+  if (sym.endsWith("PE")) return "PE";
+  return NON_OPTION_TYPE;
+}
+
+function normalizeDteBand(dte, expiry, nowTs = Date.now()) {
+  let days = n(dte, NaN);
+  if (!Number.isFinite(days) && expiry) {
+    const ms = new Date(expiry).getTime();
+    if (Number.isFinite(ms)) {
+      days = (ms - Number(nowTs || Date.now())) / (1000 * 60 * 60 * 24);
+    }
+  }
+  if (!Number.isFinite(days)) return "D1_3";
+  if (days < 1) return "D0";
+  if (days < 4) return "D1_3";
+  if (days < 8) return "D4_7";
+  return "D8P";
+}
+
+function estimateAbsDelta(delta, moneyness, runtimeEnv = env) {
+  const d = n(delta, NaN);
+  if (Number.isFinite(d)) return Math.abs(d);
+  const m = safeUpper(moneyness, 16, "ATM");
+  if (m === "ITM") return n(runtimeEnv.OPT_DELTA_ITM, 0.65);
+  if (m === "OTM") return n(runtimeEnv.OPT_DELTA_OTM, 0.4);
+  return n(runtimeEnv.OPT_DELTA_ATM, 0.5);
+}
+
+function normalizeDeltaBand(delta, moneyness, runtimeEnv = env) {
+  const absDelta = estimateAbsDelta(delta, moneyness, runtimeEnv);
+  if (!Number.isFinite(absDelta)) return "DELTA_45_55";
+  if (absDelta < 0.35) return "DELTA_20_35";
+  if (absDelta < 0.45) return "DELTA_35_45";
+  if (absDelta < 0.55) return "DELTA_45_55";
+  if (absDelta < 0.7) return "DELTA_55_70";
+  return "DELTA_70P";
+}
+
+function normalizeStyleBand(strategyStyle, signalRegime, bucket) {
+  const style = safeUpper(strategyStyle, 64, "");
+  const regime = safeUpper(signalRegime, 64, "");
+  if (style.includes("OPEN") || regime.includes("OPEN")) return "OPEN";
+  if (style.includes("TREND") || regime.includes("TREND")) return "TREND";
+  if (style.includes("RANGE") || regime.includes("RANGE")) return "RANGE";
+  if (String(bucket || "").toUpperCase() === "OPEN") return "OPEN";
+  return "DEFAULT";
+}
+
+function normalizeSpreadSoftAction(action) {
+  const upper = safeUpper(action || "RR_ONLY", 16, "RR_ONLY");
+  return SPREAD_SOFT_ACTIONS.has(upper) ? upper : "RR_ONLY";
+}
+
+function spreadRegime(spreadBps, spreadPenaltyBps, spreadBlockBps) {
+  const bps = n(spreadBps, NaN);
+  if (!Number.isFinite(bps) || bps <= 0) {
+    return { regime: "UNKNOWN", bps: null };
+  }
+  if (bps >= Number(spreadBlockBps)) return { regime: "EXTREME", bps };
+  if (bps >= Number(spreadPenaltyBps)) return { regime: "WIDE", bps };
+  return { regime: "OK", bps };
+}
+
+function buildOptimizerKeyContext(input = {}, options = {}) {
+  const runtimeEnv = options.env || env;
+  const bucket = safeUpper(
+    input.bucket ||
+      bucketForTs(
+        input.bucketTs ?? input.nowTs ?? Date.now(),
+        runtimeEnv,
+        options.bucketOpenEnd,
+        options.bucketCloseStart,
+      ),
+    16,
+    "MID",
+  );
+  const strategyId = safeKey(input.strategyId, 64);
+  const symbol = safeUpper(input.symbol || input.tradingsymbol, 64, "UNKNOWN");
+  const optType = normalizeOptType(
+    input.optType ?? input.optionMeta?.optType,
+    symbol,
+  );
+  const isOption = optType === "CE" || optType === "PE";
+  const underlying = normalizeUnderlying(
+    input.underlying ?? input.optionMeta?.underlying,
+    symbol,
+  );
+  const styleBand = normalizeStyleBand(
+    input.strategyStyle ?? input.optionMeta?.strategyStyle,
+    input.signalRegime,
+    bucket,
+  );
+  const includeOptType = toBool(
+    options.includeOptType ?? runtimeEnv.OPT_STRATEGY_KEY_INCLUDE_OPT_TYPE,
+    true,
+  );
+  const includeStyle = toBool(
+    options.includeStyle ?? runtimeEnv.OPT_STRATEGY_KEY_INCLUDE_STYLE,
+    true,
+  );
+  let dteBand = null;
+  let deltaBand = null;
+  let keyKey;
+
+  if (isOption) {
+    dteBand = normalizeDteBand(
+      input.dte ??
+        input.optionMeta?.meta?.dteDays ??
+        input.optionMeta?.dteDays,
+      input.expiry ?? input.optionMeta?.expiry,
+      input.nowTs,
+    );
+    deltaBand = normalizeDeltaBand(
+      input.delta ?? input.optionMeta?.delta,
+      input.optionMeta?.moneyness,
+      runtimeEnv,
+    );
+    keyKey = `K2|${underlying}|${optType}|${strategyId}|${bucket}|${dteBand}|${deltaBand}`;
+  } else {
+    keyKey = `K2|${underlying}|${strategyId}|${bucket}`;
+  }
+
+  const stratKey = `S2|${strategyId}|${bucket}|${
+    includeOptType ? optType : "ANY"
+  }|${includeStyle ? styleBand : "DEFAULT"}`;
+
+  return {
+    schemaVersion: DEFAULT_SCHEMA_VERSION,
+    keySchemaVersion: DEFAULT_KEY_SCHEMA_VERSION,
+    keyMode: DEFAULT_KEY_MODE,
+    symbol,
+    underlying,
+    optType,
+    strategyId,
+    bucket,
+    dteBand,
+    deltaBand,
+    styleBand,
+    keyKey,
+    stratKey,
+    isOption,
+  };
 }
 
 class RollingWindow {
@@ -100,79 +293,105 @@ class RollingWindow {
 }
 
 class AdaptiveOptimizer {
-  constructor() {
-    this._enabled = String(env.OPTIMIZER_ENABLED || "true") === "true";
+  constructor(options = {}) {
+    this._env = options.env || env;
+    this._logger = options.logger || logger;
+    this._dbGetter = options.getDb || getDb;
+    this._readState = options.readState || readOptimizerState;
+    this._writeState = options.writeState || writeOptimizerState;
 
-    // Rolling stats
-    this._lookbackN = Number(env.OPT_LOOKBACK_N ?? 60);
+    this._enabled = toBool(this._env.OPTIMIZER_ENABLED, true);
 
-    // Min samples before a key can be auto-blocked
+    this._lookbackN = Number(this._env.OPT_LOOKBACK_N ?? 60);
     this._minSamplesKey = Number(
-      env.OPT_MIN_SAMPLES_KEY ?? env.OPT_MIN_SAMPLES ?? 20,
+      this._env.OPT_MIN_SAMPLES_KEY ?? this._env.OPT_MIN_SAMPLES ?? 20,
     );
     this._minSamplesStrategy = Number(
-      env.OPT_MIN_SAMPLES_STRATEGY ?? env.OPT_MIN_SAMPLES ?? 20,
+      this._env.OPT_MIN_SAMPLES_STRATEGY ?? this._env.OPT_MIN_SAMPLES ?? 20,
+    );
+    this._feeMultipleMin = Number(
+      this._env.OPT_BLOCK_FEE_MULTIPLE_AVG_MIN ?? 3,
+    );
+    this._blockTtlMin = Number(this._env.OPT_BLOCK_TTL_MIN ?? 120);
+
+    this._deweightEnabled = toBool(this._env.OPT_DEWEIGHT_ENABLED, true);
+    this._deMinSamples = Number(this._env.OPT_DEWEIGHT_MIN_SAMPLES ?? 5);
+    this._deConfMin = Number(this._env.OPT_DEWEIGHT_CONF_MIN ?? 0.9);
+    this._deQtyMin = Number(this._env.OPT_DEWEIGHT_QTY_MIN ?? 0.5);
+    this._deweightHardVetoEnabled = toBool(
+      this._env.OPT_DEWEIGHT_HARD_VETO_ENABLED,
+      false,
     );
 
-    // Threshold: avg feeMultiple must be >= this to stay eligible
-    this._feeMultipleMin = Number(env.OPT_BLOCK_FEE_MULTIPLE_AVG_MIN ?? 3);
-
-    // Block duration (minutes)
-    this._blockTtlMin = Number(env.OPT_BLOCK_TTL_MIN ?? 120);
-
-    // De-weighting (soft control)
-    this._deweightEnabled =
-      String(env.OPT_DEWEIGHT_ENABLED || "true") === "true";
-    this._deMinSamples = Number(env.OPT_DEWEIGHT_MIN_SAMPLES ?? 5);
-    this._deConfMin = Number(env.OPT_DEWEIGHT_CONF_MIN ?? 0.5);
-    this._deQtyMin = Number(env.OPT_DEWEIGHT_QTY_MIN ?? 0.5);
-
-    // Spread-aware penalties (entry spreads are already filtered elsewhere if enabled)
-    this._spreadPenaltyBps = Number(env.OPT_SPREAD_PENALTY_BPS ?? 25);
-    this._spreadBlockBps = Number(env.OPT_SPREAD_BLOCK_BPS ?? 60);
+    this._spreadPenaltyBps = Number(this._env.OPT_SPREAD_PENALTY_BPS ?? 25);
+    this._spreadBlockBps = Number(this._env.OPT_SPREAD_BLOCK_BPS ?? 60);
     this._spreadPenaltyConfMult = Number(
-      env.OPT_SPREAD_PENALTY_CONF_MULT ?? 0.9,
+      this._env.OPT_SPREAD_PENALTY_CONF_MULT ?? 0.9,
     );
-    this._spreadBlockEnabled =
-      String(env.OPT_SPREAD_BLOCK_ENABLED || "false") === "true";
+    this._spreadBlockEnabled = toBool(
+      this._env.OPT_SPREAD_BLOCK_ENABLED,
+      false,
+    );
+    this._spreadSoftAction = normalizeSpreadSoftAction(
+      this._env.OPT_SPREAD_SOFT_ACTION,
+    );
 
-    // RR floors
-    this._rrTrendMin = Number(env.RR_TREND_MIN ?? 1.5);
-    this._rrWideSpreadMin = Number(env.RR_WIDE_SPREAD_MIN ?? 1.8);
+    this._rrTrendMin = Number(this._env.RR_TREND_MIN ?? 1.5);
+    this._rrWideSpreadMin = Number(this._env.RR_WIDE_SPREAD_MIN ?? 1.8);
 
-    // Buckets
-    this._bucketOpenEnd = String(env.OPT_BUCKET_OPEN_END || "10:00");
-    this._bucketCloseStart = String(env.OPT_BUCKET_CLOSE_START || "15:00");
+    this._bucketOpenEnd = String(this._env.OPT_BUCKET_OPEN_END || "10:00");
+    this._bucketCloseStart = String(
+      this._env.OPT_BUCKET_CLOSE_START || "15:00",
+    );
 
-    this._logDecisions = String(env.OPT_LOG_DECISIONS || "true") === "true";
+    this._logDecisions = toBool(this._env.OPT_LOG_DECISIONS, true);
+    this._keyMode = safeUpper(this._env.OPT_KEY_MODE, 32, DEFAULT_KEY_MODE);
+    this._keySchemaVersion = DEFAULT_KEY_SCHEMA_VERSION;
+    this._stateVersion = Math.max(
+      1,
+      Number(this._env.OPT_STATE_VERSION ?? 2) || 2,
+    );
+    this._strategyKeyIncludeOptType = toBool(
+      this._env.OPT_STRATEGY_KEY_INCLUDE_OPT_TYPE,
+      true,
+    );
+    this._strategyKeyIncludeStyle = toBool(
+      this._env.OPT_STRATEGY_KEY_INCLUDE_STYLE,
+      true,
+    );
 
-    // Persistent optimizer state (pro: fast restart, stable self-pruning)
-    this._persistEnabled = optimizerStateEnabled();
-    this._stateFlushSec = Number(env.OPT_STATE_FLUSH_SEC ?? 15);
-    this._stateMaxKeys = Number(env.OPT_STATE_MAX_KEYS ?? 1500);
+    this._persistEnabled =
+      options.persistEnabled ?? toBool(this._env.OPT_STATE_PERSIST, false);
+    this._stateFlushSec = Number(this._env.OPT_STATE_FLUSH_SEC ?? 15);
+    this._stateMaxKeys = Number(this._env.OPT_STATE_MAX_KEYS ?? 1500);
     this._stateDirty = false;
     this._stateTimer = null;
     this._stateLoaded = false;
     this._stateLastSavedAt = null;
     this._skipStateLoadOnce = false;
 
-    // state
-    this._windows = new Map(); // key -> RollingWindow
-    this._blocked = new Map(); // key -> { untilTs, reason, setAtTs, snapshot }
+    this._windows = new Map();
+    this._blocked = new Map();
 
     this._bootstrapped = false;
     this._bootstrapInFlight = null;
   }
 
   _scope() {
-    return scopeSet();
+    return scopeSet(this._env);
   }
 
   _log(payload, msg) {
     if (!this._logDecisions) return;
     try {
-      logger.info(payload || {}, msg);
-    } catch (err) { reportFault({ code: "OPTIMIZER_ADAPTIVEOPTIMIZER_CATCH", err, message: "[src/optimizer/adaptiveOptimizer.js] caught and continued" }); }
+      this._logger.info(payload || {}, msg);
+    } catch (err) {
+      reportFault({
+        code: "OPTIMIZER_ADAPTIVEOPTIMIZER_CATCH",
+        err,
+        message: "[src/optimizer/adaptiveOptimizer.js] caught and continued",
+      });
+    }
   }
 
   _markStateDirty() {
@@ -188,7 +407,13 @@ class AdaptiveOptimizer {
     if (!(sec > 0)) return;
 
     this._stateTimer = setInterval(() => {
-      this.flushState().catch((err) => { reportFault({ code: "OPTIMIZER_ADAPTIVEOPTIMIZER_ASYNC", err, message: "[src/optimizer/adaptiveOptimizer.js] async task failed" }); });
+      this.flushState().catch((err) => {
+        reportFault({
+          code: "OPTIMIZER_ADAPTIVEOPTIMIZER_ASYNC",
+          err,
+          message: "[src/optimizer/adaptiveOptimizer.js] async task failed",
+        });
+      });
     }, sec * 1000);
     this._stateTimer.unref?.();
   }
@@ -202,14 +427,10 @@ class AdaptiveOptimizer {
     const windows = {};
     const blocked = {};
 
-    // Persist only a bounded number of keys to keep doc size safe.
     let wCount = 0;
     for (const [k, w] of this._windows.entries()) {
       if (wCount >= this._stateMaxKeys) break;
-      // Compact: store only the numeric items array.
-      windows[k] = Array.isArray(w.items)
-        ? w.items.slice(-this._lookbackN)
-        : [];
+      windows[k] = Array.isArray(w.items) ? w.items.slice(-this._lookbackN) : [];
       wCount += 1;
     }
 
@@ -225,8 +446,10 @@ class AdaptiveOptimizer {
     }
 
     return {
-      version: 1,
-      tz: tz(),
+      version: this._stateVersion,
+      keySchemaVersion: this._keySchemaVersion,
+      keyMode: this._keyMode,
+      tz: tz(this._env),
       lookbackN: this._lookbackN,
       feeMultipleMin: this._feeMultipleMin,
       minSamplesKey: this._minSamplesKey,
@@ -241,7 +464,32 @@ class AdaptiveOptimizer {
   _hydrateState(doc) {
     if (!doc || typeof doc !== "object") return { ok: false, reason: "no_doc" };
 
-    // Respect current config lookbackN; hydrate items into RollingWindow.
+    const docVersion = Number(doc.version ?? doc.stateVersion ?? 1);
+    const docKeySchemaVersion = String(doc.keySchemaVersion || "");
+    if (
+      docVersion !== this._stateVersion ||
+      docKeySchemaVersion !== this._keySchemaVersion
+    ) {
+      this._windows.clear();
+      this._blocked.clear();
+      this._logger.info(
+        {
+          persistedVersion: docVersion,
+          expectedVersion: this._stateVersion,
+          persistedKeySchemaVersion: docKeySchemaVersion,
+          expectedKeySchemaVersion: this._keySchemaVersion,
+        },
+        "[optimizer] ignored persisted state due to schema change",
+      );
+      return {
+        ok: false,
+        reason: "state_version_mismatch",
+        ignored: true,
+        version: docVersion,
+          keySchemaVersion: docKeySchemaVersion,
+      };
+    }
+
     const windows =
       doc.windows && typeof doc.windows === "object" ? doc.windows : {};
     const blocked =
@@ -283,7 +531,7 @@ class AdaptiveOptimizer {
 
   async loadPersistedState() {
     if (!this._persistEnabled) return { ok: false, reason: "disabled" };
-    const doc = await readOptimizerState();
+    const doc = await this._readState();
     if (!doc) return { ok: false, reason: "no_state" };
     const out = this._hydrateState(doc);
     if (out.ok) {
@@ -299,7 +547,7 @@ class AdaptiveOptimizer {
     if (!force && !this._stateDirty) return { ok: true, skipped: true };
 
     const doc = this._serializeState();
-    const out = await writeOptimizerState(doc);
+    const out = await this._writeState(doc);
     if (out.ok) {
       this._stateDirty = false;
       this._stateLastSavedAt = doc.savedAt;
@@ -308,25 +556,23 @@ class AdaptiveOptimizer {
   }
 
   _bucket(nowTs) {
-    const openEnd = hhmmToMinutes(this._bucketOpenEnd);
-    const closeStart = hhmmToMinutes(this._bucketCloseStart);
-    const m = minutesOfDay(nowTs);
-    if (openEnd != null && m < openEnd) return "OPEN";
-    if (closeStart != null && m >= closeStart) return "CLOSE";
-    return "MID";
+    return bucketForTs(
+      nowTs,
+      this._env,
+      this._bucketOpenEnd,
+      this._bucketCloseStart,
+    );
   }
 
-  _keyKey({ symbol, strategyId, bucket }) {
-    const sym = safeKey(symbol, 64).toUpperCase();
-    const sid = safeKey(strategyId, 64);
-    const b = safeKey(bucket, 16);
-    return `K|${sym}|${sid}|${b}`;
-  }
-
-  _strategyKey({ strategyId, bucket }) {
-    const sid = safeKey(strategyId, 64);
-    const b = safeKey(bucket, 16);
-    return `S|${sid}|${b}`;
+  buildOptimizerKeyContext(input = {}) {
+    return buildOptimizerKeyContext(input, {
+      env: this._env,
+      keyMode: this._keyMode,
+      includeOptType: this._strategyKeyIncludeOptType,
+      includeStyle: this._strategyKeyIncludeStyle,
+      bucketOpenEnd: this._bucketOpenEnd,
+      bucketCloseStart: this._bucketCloseStart,
+    });
   }
 
   _getWindow(key) {
@@ -370,8 +616,8 @@ class AdaptiveOptimizer {
       return { regime: "UNKNOWN", atrPct: null };
     }
     const atrPct = (atr / c) * 100;
-    const low = n(env.VOL_LOW_PCT, 0.8);
-    const high = n(env.VOL_HIGH_PCT, 2.0);
+    const low = n(this._env.VOL_LOW_PCT, 0.8);
+    const high = n(this._env.VOL_HIGH_PCT, 2.0);
     if (atrPct < low) return { regime: "LOW", atrPct };
     if (atrPct > high) return { regime: "HIGH", atrPct };
     return { regime: "MED", atrPct };
@@ -379,23 +625,102 @@ class AdaptiveOptimizer {
 
   _rrFromVolRegime(volRegime, rrBase) {
     const base = n(rrBase, 1.0);
-    if (volRegime === "LOW") return Math.max(base, n(env.RR_VOL_LOW, base));
-    if (volRegime === "HIGH") return Math.max(base, n(env.RR_VOL_HIGH, base));
-    if (volRegime === "MED") return Math.max(base, n(env.RR_VOL_MED, base));
+    if (volRegime === "LOW") return Math.max(base, n(this._env.RR_VOL_LOW, base));
+    if (volRegime === "HIGH")
+      return Math.max(base, n(this._env.RR_VOL_HIGH, base));
+    if (volRegime === "MED") return Math.max(base, n(this._env.RR_VOL_MED, base));
     return base;
   }
 
   _spreadRegime(spreadBps) {
-    const bps = n(spreadBps, NaN);
-    if (!Number.isFinite(bps) || bps <= 0)
-      return { regime: "UNKNOWN", bps: null };
-    if (bps >= this._spreadBlockBps) return { regime: "EXTREME", bps };
-    if (bps >= this._spreadPenaltyBps) return { regime: "WIDE", bps };
-    return { regime: "OK", bps };
+    return spreadRegime(spreadBps, this._spreadPenaltyBps, this._spreadBlockBps);
+  }
+
+  _ratioFromStats(avg, samples) {
+    if (
+      !Number.isFinite(avg) ||
+      !Number.isFinite(samples) ||
+      samples < this._deMinSamples ||
+      !(this._feeMultipleMin > 0)
+    ) {
+      return 1;
+    }
+    if (avg <= 0) return 0;
+    return avg / this._feeMultipleMin;
+  }
+
+  _resolveRatioSource(ratioKey, ratioStrategy) {
+    const hasKey = Number.isFinite(ratioKey);
+    const hasStrategy = Number.isFinite(ratioStrategy);
+    if (!hasKey && !hasStrategy) {
+      return { ratioUsed: 1, deweightSource: "NONE" };
+    }
+    if (hasKey && hasStrategy) {
+      const ratioUsed = Math.min(ratioKey, ratioStrategy);
+      if (ratioUsed >= 1) return { ratioUsed, deweightSource: "NONE" };
+      if (Math.abs(ratioKey - ratioStrategy) < 1e-9) {
+        return { ratioUsed, deweightSource: "BOTH" };
+      }
+      return {
+        ratioUsed,
+        deweightSource: ratioUsed === ratioKey ? "KEY" : "STRATEGY",
+      };
+    }
+    const ratioUsed = hasKey ? ratioKey : ratioStrategy;
+    if (ratioUsed >= 1) return { ratioUsed, deweightSource: "NONE" };
+    return {
+      ratioUsed,
+      deweightSource: hasKey ? "KEY" : "STRATEGY",
+    };
+  }
+
+  _applySpreadSoftControl({ spreadRegime, confidenceMult, qtyMult }) {
+    if (spreadRegime !== "WIDE" && spreadRegime !== "EXTREME") {
+      return {
+        confidenceMult,
+        qtyMult,
+        spreadSoftApplied: "NONE",
+      };
+    }
+
+    if (this._spreadSoftAction === "CONF") {
+      return {
+        confidenceMult: clamp(
+          confidenceMult * this._spreadPenaltyConfMult,
+          this._deConfMin,
+          1,
+        ),
+        qtyMult,
+        spreadSoftApplied: "CONF",
+      };
+    }
+
+    if (this._spreadSoftAction === "QTY") {
+      return {
+        confidenceMult,
+        qtyMult: clamp(
+          qtyMult * this._spreadPenaltyConfMult,
+          this._deQtyMin,
+          1,
+        ),
+        spreadSoftApplied: "QTY",
+      };
+    }
+
+    return {
+      confidenceMult,
+      qtyMult,
+      spreadSoftApplied: this._spreadSoftAction,
+    };
   }
 
   evaluateSignal({
     symbol,
+    underlying,
+    optType,
+    delta,
+    expiry,
+    dte,
     strategyId,
     nowTs,
     atrBase,
@@ -405,143 +730,261 @@ class AdaptiveOptimizer {
     signalRegime,
     strategyStyle,
     confidence,
+    optionMeta,
   }) {
-    if (!this._enabled)
-      return { ok: true, meta: { note: "optimizer_disabled" } };
+    if (!this._enabled) {
+      return {
+        ok: true,
+        action: ACTION.PASS,
+        reason: null,
+        meta: { note: "optimizer_disabled" },
+      };
+    }
 
     const ts = Number(nowTs) || Date.now();
-    const bucket = this._bucket(ts);
+    const context = this.buildOptimizerKeyContext({
+      symbol,
+      underlying,
+      optType,
+      delta,
+      expiry,
+      dte,
+      strategyId,
+      strategyStyle,
+      signalRegime,
+      nowTs: ts,
+      optionMeta,
+    });
+    const rrBaseNum = n(rrBase, 1.0);
+    const sp = this._spreadRegime(spreadBps);
+    const baseMeta = {
+      keySchemaVersion: this._keySchemaVersion,
+      keyMode: this._keyMode,
+      keyKey: context.keyKey,
+      stratKey: context.stratKey,
+      bucket: context.bucket,
+      underlying: context.underlying,
+      optType: context.optType,
+      strategyId: context.strategyId,
+      dteBand: context.dteBand,
+      deltaBand: context.deltaBand,
+      styleBand: context.styleBand,
+      rrBase: rrBaseNum,
+      spreadRegime: sp.regime,
+      spreadBps: sp.bps,
+      confidenceRaw: Number.isFinite(Number(confidence))
+        ? Number(confidence)
+        : null,
+    };
 
-    const keyKey = this._keyKey({ symbol, strategyId, bucket });
-    const stratKey = this._strategyKey({ strategyId, bucket });
-
-    // Hard blocks
     const scope = this._scope();
-    const bKey = scope.key ? this._getBlocked(keyKey, ts) : null;
+    const bKey = scope.key ? this._getBlocked(context.keyKey, ts) : null;
     if (bKey) {
       const meta = {
-        key: keyKey,
-        bucket,
+        ...baseMeta,
         scope: "KEY",
         blockedUntilTs: bKey.untilTs,
         snapshot: bKey.snapshot,
       };
-      this._log({ ...meta, reason: bKey.reason }, "[optimizer] blocked key");
-      return { ok: false, reason: `OPT_BLOCK_KEY: ${bKey.reason}`, meta };
+      this._log(
+        { ...meta, reason: bKey.reason },
+        "[optimizer] blocked key context",
+      );
+      return {
+        ok: false,
+        action: ACTION.HARD_BLOCK,
+        reason: "OPT_BLOCK_KEY",
+        meta,
+      };
     }
 
-    const bStrat = scope.strategy ? this._getBlocked(stratKey, ts) : null;
+    const bStrat = scope.strategy ? this._getBlocked(context.stratKey, ts) : null;
     if (bStrat) {
       const meta = {
-        key: stratKey,
-        bucket,
+        ...baseMeta,
         scope: "STRATEGY",
         blockedUntilTs: bStrat.untilTs,
         snapshot: bStrat.snapshot,
       };
       this._log(
         { ...meta, reason: bStrat.reason },
-        "[optimizer] blocked strategy",
+        "[optimizer] blocked strategy context",
       );
       return {
         ok: false,
-        reason: `OPT_BLOCK_STRATEGY: ${bStrat.reason}`,
+        action: ACTION.HARD_BLOCK,
+        reason: "OPT_BLOCK_STRATEGY",
         meta,
       };
     }
 
-    // Spread regime & optional hard-block
-    const sp = this._spreadRegime(spreadBps);
     if (this._spreadBlockEnabled && sp.regime === "EXTREME") {
-      const meta = {
-        key: keyKey,
-        bucket,
-        spreadBps: sp.bps,
-        spreadRegime: sp.regime,
-      };
+      const meta = { ...baseMeta, spreadSoftAction: this._spreadSoftAction };
       this._log(meta, "[optimizer] blocked extreme spread");
       return {
         ok: false,
-        reason: `OPT_BLOCK_SPREAD (${sp.bps.toFixed(1)}bps)`,
+        action: ACTION.HARD_BLOCK,
+        reason: "OPT_BLOCK_SPREAD_EXTREME",
         meta,
       };
     }
 
-    // RR tuning: volatility + trend/spread floors
     const vr = this._volRegime({ atrBase, close });
-    let rrUsed = this._rrFromVolRegime(vr.regime, rrBase);
+    let rrUsed = this._rrFromVolRegime(vr.regime, rrBaseNum);
 
-    const signalReg = String(signalRegime || "").toUpperCase();
-    const style = String(strategyStyle || "").toUpperCase();
-    if (signalReg === "TREND" || style === "TREND") {
+    const signalReg = safeUpper(signalRegime, 32, "");
+    const style = safeUpper(strategyStyle, 64, "");
+    if (signalReg === "TREND" || style.includes("TREND")) {
       rrUsed = Math.max(rrUsed, this._rrTrendMin);
     }
-    if (sp.regime === "WIDE") {
+    if (sp.regime === "WIDE" || sp.regime === "EXTREME") {
       rrUsed = Math.max(rrUsed, this._rrWideSpreadMin);
     }
 
-    // Soft de-weighting (confidence + optional qty)
+    const keyWindow = this._windows.get(context.keyKey);
+    const strategyWindow = this._windows.get(context.stratKey);
+    const keyAvg = keyWindow ? keyWindow.avg() : null;
+    const keySamples = keyWindow ? keyWindow.n : 0;
+    const strategyAvg = strategyWindow ? strategyWindow.avg() : null;
+    const strategySamples = strategyWindow ? strategyWindow.n : 0;
+
+    let ratioKey = 1;
+    let ratioStrategy = 1;
+    let ratioUsed = 1;
+    let deweightSource = "NONE";
     let confidenceMult = 1;
     let qtyMult = 1;
 
     if (this._deweightEnabled) {
-      const wKey = this._windows.get(keyKey);
-      const wStrat = this._windows.get(stratKey);
+      ratioKey = this._ratioFromStats(keyAvg, keySamples);
+      ratioStrategy = this._ratioFromStats(strategyAvg, strategySamples);
+      const ratioMeta = this._resolveRatioSource(ratioKey, ratioStrategy);
+      ratioUsed = ratioMeta.ratioUsed;
+      deweightSource = ratioMeta.deweightSource;
 
-      const aKey = wKey ? wKey.avg() : null;
-      const nKey = wKey ? wKey.n : 0;
-      const aStr = wStrat ? wStrat.avg() : null;
-      const nStr = wStrat ? wStrat.n : 0;
-
-      const thr = this._feeMultipleMin;
-
-      let ratioKey = 1;
-      if (Number.isFinite(aKey) && nKey >= this._deMinSamples && thr > 0) {
-        ratioKey = aKey / thr;
-      }
-
-      let ratioStr = 1;
-      if (Number.isFinite(aStr) && nStr >= this._deMinSamples && thr > 0) {
-        ratioStr = aStr / thr;
-      }
-
-      const ratio = Math.min(ratioKey, ratioStr);
-
-      confidenceMult = clamp(ratio, this._deConfMin, 1);
-      qtyMult = clamp(ratio, this._deQtyMin, 1);
-
-      // Additional spread penalty
-      if (sp.regime === "WIDE") {
-        confidenceMult *= this._spreadPenaltyConfMult;
-        confidenceMult = clamp(confidenceMult, this._deConfMin, 1);
+      if (ratioUsed < 1) {
+        confidenceMult = clamp(ratioUsed, this._deConfMin, 1);
+        qtyMult = clamp(ratioUsed, this._deQtyMin, 1);
       }
     }
 
-    const meta = {
-      keyKey,
-      stratKey,
-      bucket,
-      rrUsed,
-      rrBase: n(rrBase, 1.0),
-      volRegime: vr.regime,
-      atrPct: vr.atrPct,
+    const spreadSoft = this._applySpreadSoftControl({
       spreadRegime: sp.regime,
-      spreadBps: sp.bps,
-      confidence: Number.isFinite(Number(confidence))
-        ? Number(confidence)
-        : null,
       confidenceMult,
       qtyMult,
+    });
+    confidenceMult = spreadSoft.confidenceMult;
+    qtyMult = spreadSoft.qtyMult;
+
+    const confidenceUsedForTelemetry =
+      Number.isFinite(baseMeta.confidenceRaw) && Number.isFinite(confidenceMult)
+        ? baseMeta.confidenceRaw * confidenceMult
+        : baseMeta.confidenceRaw;
+
+    const meta = {
+      ...baseMeta,
+      rrUsed,
+      volRegime: vr.regime,
+      atrPct: vr.atrPct,
+      spreadSoftAction: this._spreadSoftAction,
+      spreadSoftApplied: spreadSoft.spreadSoftApplied,
+      confidenceMult,
+      confidenceUsedForTelemetry,
+      qtyMult,
+      keySamples,
+      keyAvg: Number.isFinite(keyAvg) ? keyAvg : null,
+      strategySamples,
+      strategyAvg: Number.isFinite(strategyAvg) ? strategyAvg : null,
+      ratioKey,
+      ratioStrategy,
+      ratioUsed,
+      deweightSource,
     };
 
-    if (confidenceMult < 1 || qtyMult < 1) {
-      this._log(meta, "[optimizer] deweight applied");
+    if (this._deweightHardVetoEnabled && ratioUsed < 1) {
+      this._log(meta, "[optimizer] hard veto enabled");
+      return {
+        ok: false,
+        action: ACTION.HARD_BLOCK,
+        reason: "OPT_DEWEIGHT_HARD_VETO",
+        meta,
+      };
     }
 
-    return { ok: true, meta };
+    let action = ACTION.PASS;
+    if (confidenceMult < 1 || qtyMult < 1) {
+      action = ACTION.SOFT_DEWEIGHT;
+      this._log(meta, "[optimizer] soft deweight applied");
+    } else if (rrUsed > rrBaseNum) {
+      action = ACTION.RR_TUNE_ONLY;
+      this._log(meta, "[optimizer] rr tune applied");
+    }
+
+    return { ok: true, action, reason: null, meta };
   }
 
-  recordTradeClose({ symbol, strategyId, feeMultiple, startedAtTs, nowTs }) {
+  _resolveCloseContext(params = {}) {
+    const ts = Number(params.startedAtTs) || Number(params.nowTs) || Date.now();
+    const frozen = params.optimizerContext;
+    if (frozen && typeof frozen === "object" && frozen.keyKey && frozen.stratKey) {
+      return {
+        context: {
+          schemaVersion: Number(
+            frozen.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
+          ),
+          keySchemaVersion:
+            frozen.keySchemaVersion || this._keySchemaVersion,
+          keyMode: frozen.keyMode || this._keyMode,
+          underlying: frozen.underlying || null,
+          optType: frozen.optType || NON_OPTION_TYPE,
+          strategyId: frozen.strategyId || safeKey(params.strategyId, 64),
+          bucket: frozen.bucket || this._bucket(ts),
+          dteBand: frozen.dteBand || null,
+          deltaBand: frozen.deltaBand || null,
+          styleBand: frozen.styleBand || "DEFAULT",
+          keyKey: frozen.keyKey,
+          stratKey: frozen.stratKey,
+        },
+        optimizerContextFallback: false,
+      };
+    }
+
+    return {
+      context: this.buildOptimizerKeyContext({
+        symbol: params.symbol,
+        underlying: params.underlying,
+        optType: params.optType,
+        delta: params.delta,
+        expiry: params.expiry,
+        dte: params.dte,
+        strategyId: params.strategyId,
+        strategyStyle: params.strategyStyle,
+        signalRegime: params.signalRegime,
+        bucketTs: ts,
+        nowTs: ts,
+        optionMeta: params.optionMeta,
+      }),
+      optimizerContextFallback: true,
+    };
+  }
+
+  recordTradeClose({
+    symbol,
+    underlying,
+    optType,
+    delta,
+    expiry,
+    dte,
+    optionMeta,
+    strategyId,
+    strategyStyle,
+    signalRegime,
+    feeMultiple,
+    startedAtTs,
+    nowTs,
+    optimizerContext,
+    logFallback = true,
+  }) {
     if (!this._enabled) return { ok: false, reason: "optimizer_disabled" };
 
     const fm = Number(feeMultiple);
@@ -549,12 +992,38 @@ class AdaptiveOptimizer {
 
     const started = Number(startedAtTs) || Number(nowTs) || Date.now();
     const ts = Number(nowTs) || Date.now();
-    const bucket = this._bucket(started);
+    const resolved = this._resolveCloseContext({
+      symbol,
+      underlying,
+      optType,
+      delta,
+      expiry,
+      dte,
+      optionMeta,
+      strategyId,
+      strategyStyle,
+      signalRegime,
+      startedAtTs: started,
+      nowTs: ts,
+      optimizerContext,
+    });
+    const context = resolved.context;
 
-    const keyKey = this._keyKey({ symbol, strategyId, bucket });
-    const stratKey = this._strategyKey({ strategyId, bucket });
+    if (resolved.optimizerContextFallback && logFallback) {
+      this._log(
+        {
+          symbol: symbol || null,
+          strategyId: strategyId || null,
+          optimizerContextFallback: true,
+        },
+        "[optimizer] close learning used fallback context",
+      );
+    }
 
-    // Update rolling windows
+    const keyKey = context.keyKey;
+    const stratKey = context.stratKey;
+    const bucket = context.bucket;
+
     const wKey = this._getWindow(keyKey);
     const wStr = this._getWindow(stratKey);
 
@@ -568,7 +1037,6 @@ class AdaptiveOptimizer {
     const thr = this._feeMultipleMin;
     const scope = this._scope();
 
-    // Auto-block weak keys
     if (
       scope.key &&
       snapKey.n >= this._minSamplesKey &&
@@ -582,19 +1050,18 @@ class AdaptiveOptimizer {
           `avgFeeMultiple ${snapKey.avg.toFixed(2)} < ${thr}`,
           {
             ...snapKey,
-            symbol: safeKey(symbol, 64),
-            strategyId: safeKey(strategyId, 64),
+            underlying: context.underlying,
+            optType: context.optType,
+            strategyId: context.strategyId,
             bucket,
+            dteBand: context.dteBand,
+            deltaBand: context.deltaBand,
           },
         );
         this._log({ keyKey, bucket, ...snapKey }, "[optimizer] auto-block key");
-      } else {
-        // If it recovered, unblock early
-        const b = this._blocked.get(keyKey);
-        if (b) {
-          this._blocked.delete(keyKey);
-          this._markStateDirty();
-        }
+      } else if (this._blocked.has(keyKey)) {
+        this._blocked.delete(keyKey);
+        this._markStateDirty();
       }
     }
 
@@ -611,20 +1078,19 @@ class AdaptiveOptimizer {
           `avgFeeMultiple ${snapStr.avg.toFixed(2)} < ${thr}`,
           {
             ...snapStr,
-            strategyId: safeKey(strategyId, 64),
+            strategyId: context.strategyId,
             bucket,
+            optType: context.optType,
+            styleBand: context.styleBand,
           },
         );
         this._log(
           { stratKey, bucket, ...snapStr },
           "[optimizer] auto-block strategy",
         );
-      } else {
-        const b = this._blocked.get(stratKey);
-        if (b) {
-          this._blocked.delete(stratKey);
-          this._markStateDirty();
-        }
+      } else if (this._blocked.has(stratKey)) {
+        this._blocked.delete(stratKey);
+        this._markStateDirty();
       }
     }
 
@@ -635,6 +1101,7 @@ class AdaptiveOptimizer {
       bucket,
       key: snapKey,
       strategy: snapStr,
+      optimizerContextFallback: resolved.optimizerContextFallback,
     };
   }
 
@@ -643,7 +1110,6 @@ class AdaptiveOptimizer {
     const blocked = {};
 
     for (const [k, w] of this._windows.entries()) {
-      // Avoid huge snapshots
       if (Object.keys(windows).length > 200) break;
       windows[k] = w.snapshot();
     }
@@ -659,12 +1125,17 @@ class AdaptiveOptimizer {
 
     return {
       enabled: this._enabled,
+      stateVersion: this._stateVersion,
+      keySchemaVersion: this._keySchemaVersion,
+      keyMode: this._keyMode,
       persist: {
         enabled: this._persistEnabled,
         loaded: this._stateLoaded,
         dirty: this._stateDirty,
         lastSavedAt: this._stateLastSavedAt,
       },
+      totalWindowCount: this._windows.size,
+      totalBlockedCount: this._blocked.size,
       lookbackN: this._lookbackN,
       feeMultipleMin: this._feeMultipleMin,
       minSamplesKey: this._minSamplesKey,
@@ -672,11 +1143,13 @@ class AdaptiveOptimizer {
       blockTtlMin: this._blockTtlMin,
       deweightEnabled: this._deweightEnabled,
       deweightMinSamples: this._deMinSamples,
+      deweightHardVetoEnabled: this._deweightHardVetoEnabled,
       rrTrendMin: this._rrTrendMin,
       rrWideSpreadMin: this._rrWideSpreadMin,
       spreadPenaltyBps: this._spreadPenaltyBps,
       spreadBlockBps: this._spreadBlockBps,
       spreadBlockEnabled: this._spreadBlockEnabled,
+      spreadSoftAction: this._spreadSoftAction,
       buckets: {
         openEnd: this._bucketOpenEnd,
         closeStart: this._bucketCloseStart,
@@ -698,25 +1171,28 @@ class AdaptiveOptimizer {
   async start() {
     if (!this._enabled) return { ok: false, reason: "disabled" };
 
-    // Begin periodic persistence (no-op if disabled)
     this._startStateTimer();
 
-    // Try loading persisted optimizer state once per process.
     let loadedFromState = false;
     const skipPersistLoad = !!this._skipStateLoadOnce;
     this._skipStateLoadOnce = false;
     if (this._persistEnabled && !this._stateLoaded && !skipPersistLoad) {
       try {
         const r = await this.loadPersistedState();
-        loadedFromState = !!(r && r.ok && r.windows > 0);
+        loadedFromState = !!(r && r.ok);
         if (loadedFromState) {
-          logger.info(r, "[optimizer] loaded persisted state");
+          this._logger.info(r, "[optimizer] loaded persisted state");
         }
-      } catch (err) { reportFault({ code: "OPTIMIZER_ADAPTIVEOPTIMIZER_CATCH", err, message: "[src/optimizer/adaptiveOptimizer.js] caught and continued" }); }
+      } catch (err) {
+        reportFault({
+          code: "OPTIMIZER_ADAPTIVEOPTIMIZER_CATCH",
+          err,
+          message: "[src/optimizer/adaptiveOptimizer.js] caught and continued",
+        });
+      }
     }
 
-    const wantBootstrap =
-      String(env.OPTIMIZER_BOOTSTRAP_FROM_DB || "true") === "true";
+    const wantBootstrap = toBool(this._env.OPTIMIZER_BOOTSTRAP_FROM_DB, true);
     if (!wantBootstrap) {
       this._bootstrapped = true;
       return { ok: true, bootstrapped: false, loadedFromState };
@@ -724,7 +1200,6 @@ class AdaptiveOptimizer {
 
     if (this._bootstrapped) return { ok: true, bootstrapped: true };
 
-    // If state was loaded, treat as bootstrapped (skip DB scan)
     if (loadedFromState) {
       this._bootstrapped = true;
       return { ok: true, bootstrapped: true, loadedFromState };
@@ -740,7 +1215,7 @@ class AdaptiveOptimizer {
       })
       .catch((e) => {
         this._bootstrapInFlight = null;
-        logger.warn(
+        this._logger.warn(
           { e: e?.message },
           "[optimizer] bootstrap failed; continuing without",
         );
@@ -751,7 +1226,6 @@ class AdaptiveOptimizer {
   }
 
   async reloadFromDb() {
-    // Force a DB re-bootstrap even if persistence is enabled.
     this._skipStateLoadOnce = true;
     this.reset();
     return this.start();
@@ -760,19 +1234,18 @@ class AdaptiveOptimizer {
   async _bootstrapFromDb() {
     let db;
     try {
-      db = getDb();
+      db = this._dbGetter();
     } catch {
       return { ok: false, reason: "db_not_ready" };
     }
 
-    const days = Number(env.OPT_BOOTSTRAP_DAYS ?? 7);
+    const days = Number(this._env.OPT_BOOTSTRAP_DAYS ?? 7);
     const since = DateTime.now()
-      .setZone(tz())
+      .setZone(tz(this._env))
       .minus({ days: Math.max(1, days) })
       .toJSDate();
 
     const col = db.collection(TRADES_COLLECTION);
-
     const cursor = col
       .find(
         {
@@ -787,7 +1260,12 @@ class AdaptiveOptimizer {
             updatedAt: 1,
             feeMultiple: 1,
             strategyId: 1,
+            strategyStyle: 1,
+            regime: 1,
             instrument: 1,
+            optimizerContext: 1,
+            option_meta: 1,
+            underlying_symbol: 1,
           },
         },
       )
@@ -814,21 +1292,39 @@ class AdaptiveOptimizer {
 
       this.recordTradeClose({
         symbol: sym,
+        underlying: t?.underlying_symbol || t?.option_meta?.underlying,
+        optType: t?.option_meta?.optType,
+        delta: t?.option_meta?.delta,
+        expiry: t?.option_meta?.expiry,
+        dte: t?.option_meta?.meta?.dteDays ?? t?.option_meta?.dteDays,
+        optionMeta: t?.option_meta,
         strategyId: t?.strategyId || "UNKNOWN",
+        strategyStyle: t?.strategyStyle || null,
+        signalRegime: t?.regime || null,
+        optimizerContext: t?.optimizerContext || null,
         feeMultiple: t?.feeMultiple,
         startedAtTs: startedAt,
         nowTs: closedAt,
+        logFallback: false,
       });
 
       count += 1;
       if (count > this._lookbackN * 40) break;
     }
 
-    logger.info({ count, days }, "[optimizer] bootstrapped from DB");
+    this._logger.info({ count, days }, "[optimizer] bootstrapped from DB");
     return { ok: true, count, days };
   }
 }
 
 const optimizer = new AdaptiveOptimizer();
 
-module.exports = { optimizer };
+module.exports = {
+  ACTION,
+  AdaptiveOptimizer,
+  buildOptimizerKeyContext,
+  normalizeDeltaBand,
+  normalizeDteBand,
+  normalizeStyleBand,
+  optimizer,
+};
