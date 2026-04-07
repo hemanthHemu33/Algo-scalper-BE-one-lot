@@ -822,6 +822,22 @@ function buildRouteConfidenceAssessment({
       liqMeta?.depth ??
       (bookDepth > 0 ? bookDepth : pick?.depth),
   );
+  const fallbackReason =
+    pick?.meta?.selectionObservability?.fallbackReason ||
+    pick?.meta?.selectionPath?.fallbackReason ||
+    null;
+  const eligibilityPassed =
+    pick?.meta?.selectionObservability?.eligibilityPassed ??
+    pick?.meta?.selectionPath?.eligibilityPassed ??
+    null;
+  const minEligibilityChecksPassed =
+    pick?.meta?.selectionObservability?.minEligibilityChecksPassed ??
+    pick?.meta?.selectionPath?.minEligibilityChecksPassed ??
+    null;
+  const selectedReason =
+    pick?.meta?.selectionObservability?.selectedReason ||
+    pick?.meta?.selectionPath?.selectedReason ||
+    null;
   const selectedByFallback =
     pick?.meta?.selectionObservability?.selectedByFallback === true ||
     pick?.meta?.selectionPath?.selectedByFallback === true;
@@ -852,13 +868,19 @@ function buildRouteConfidenceAssessment({
   const healthScore = actualHealth ?? estimatedHealth;
   const spreadBps = actualSpreadBps ?? estimatedSpreadBps;
   const depth = actualDepth ?? estimatedDepth;
+  const healthAdjustment =
+    healthScore != null ? clamp((healthScore - 55) / 4, -6, 12) : 0;
+  const maxSpreadPenalty = Math.max(
+    0,
+    Number(env?.OPT_ROUTE_MAX_SPREAD_PENALTY ?? 6),
+  );
+  const spreadPenalty =
+    spreadBps != null ? -clamp(spreadBps / 20, 0, maxSpreadPenalty) : 0;
+  const depthAdjustment =
+    depth != null && depth > 0 ? clamp(Math.log(depth + 1) - 2, 0, 6) : 0;
 
   const liquidityAdjustment =
-    (healthScore != null
-      ? clamp((healthScore - 55) / 4, -6, 12)
-      : 0) +
-    (spreadBps != null ? -clamp(spreadBps / 20, 0, 14) : 0) +
-    (depth != null && depth > 0 ? clamp(Math.log(depth + 1) - 2, 0, 6) : 0);
+    healthAdjustment + spreadPenalty + depthAdjustment;
 
   const premiumPenalty =
     band.enforced && premiumZone != null ? -clamp(premiumZone * 3.5, 0, 3.5) : 0;
@@ -879,12 +901,19 @@ function buildRouteConfidenceAssessment({
     deltaPenalty +
     selectorPenalty +
     estimatePenalty;
-  const cappedAdjustment =
+  let cappedAdjustment =
     Number.isFinite(Number(positiveAdjustmentCap)) &&
     Number(positiveAdjustmentCap) > 0 &&
     rawAdjustment > 0
       ? Math.min(rawAdjustment, Number(positiveAdjustmentCap))
       : rawAdjustment;
+  const maxNegativeAdjustment = Math.max(
+    0,
+    Number(env?.OPT_ROUTE_MAX_NEG_ADJUSTMENT ?? 8),
+  );
+  if (cappedAdjustment < 0) {
+    cappedAdjustment = Math.max(cappedAdjustment, -maxNegativeAdjustment);
+  }
   const routedScore = clamp(preRouteScore + cappedAdjustment, 0, 100);
 
   return {
@@ -929,6 +958,14 @@ function buildRouteConfidenceAssessment({
       deltaTarget: roundMetric(deltaTarget),
       deltaUsed: roundMetric(deltaUsed),
       selectedByFallback,
+      fallbackReason,
+      eligibilityPassed:
+        typeof eligibilityPassed === "boolean" ? eligibilityPassed : null,
+      minEligibilityChecksPassed:
+        typeof minEligibilityChecksPassed === "boolean"
+          ? minEligibilityChecksPassed
+          : null,
+      selectedReason,
       selectorParticipation: roundMetric(selectorParticipation),
       liquidityQualityEstimate: roundMetric(estimatedLiquidityQuality),
     },

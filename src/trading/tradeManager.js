@@ -6,6 +6,11 @@ const {
   getTradingEnabled,
   getTradingEnabledSource,
 } = require("../runtime/tradingEnabled");
+const {
+  refreshLivePreflight,
+  getEffectiveLiveEnabled,
+  updateLivePreflightContext,
+} = require("../runtime/livePreflight");
 const { logger } = require("../logger");
 const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
@@ -154,6 +159,21 @@ function todayKey() {
   return DateTime.now()
     .setZone(env.CANDLE_TZ || "Asia/Kolkata")
     .toFormat("yyyy-LL-dd");
+}
+
+function roleToOrderIdField(role) {
+  const raw = String(role || "")
+    .trim()
+    .toUpperCase();
+  if (!raw) return null;
+  const camel = raw
+    .toLowerCase()
+    .split("_")
+    .map((part, index) =>
+      index === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1),
+    )
+    .join("");
+  return camel ? `${camel}OrderId` : null;
 }
 
 function dayRange() {
@@ -370,6 +390,145 @@ function evaluatePreRouteConfidenceGate({
     actualUsed: false,
     softPenaltyApplied,
     hardRejectScore,
+  };
+}
+
+function resolvePostRouteConfidenceDecision({
+  signal = null,
+  conf,
+  minConf,
+  config = env,
+}) {
+  const confidence = toFiniteOrNull(conf);
+  const minConfidence = toFiniteOrNull(minConf);
+  const routeConfidence = signal?.routeConfidence || null;
+  const contractMetrics = routeConfidence?.contractMetrics || {};
+  const routedScore = toFiniteOrNull(routeConfidence?.routedScore ?? confidence);
+  const expectedRouteAdjustment = toFiniteOrNull(
+    routeConfidence?.expectedRouteAdjustment,
+  );
+  const spreadBps = toFiniteOrNull(
+    contractMetrics?.spreadBps ?? signal?.option_meta?.bps,
+  );
+  const healthScore = toFiniteOrNull(
+    contractMetrics?.healthScore ?? signal?.option_meta?.health_score,
+  );
+  const depth = toFiniteOrNull(contractMetrics?.depth ?? signal?.option_meta?.depth);
+  const selectedByFallback =
+    contractMetrics?.selectedByFallback === true ||
+    signal?.option_meta?.meta?.selectionObservability?.selectedByFallback ===
+      true ||
+    signal?.option_meta?.meta?.selectionPath?.selectedByFallback === true;
+  const fallbackReason =
+    contractMetrics?.fallbackReason ||
+    signal?.option_meta?.meta?.selectionObservability?.fallbackReason ||
+    signal?.option_meta?.meta?.selectionPath?.fallbackReason ||
+    null;
+  const eligibilityPassed =
+    typeof contractMetrics?.eligibilityPassed === "boolean"
+      ? contractMetrics.eligibilityPassed
+      : typeof signal?.option_meta?.meta?.selectionObservability
+            ?.eligibilityPassed === "boolean"
+        ? signal.option_meta.meta.selectionObservability.eligibilityPassed
+        : typeof signal?.option_meta?.meta?.selectionPath?.eligibilityPassed ===
+            "boolean"
+          ? signal.option_meta.meta.selectionPath.eligibilityPassed
+          : null;
+  const minEligibilityChecksPassed =
+    typeof contractMetrics?.minEligibilityChecksPassed === "boolean"
+      ? contractMetrics.minEligibilityChecksPassed
+      : typeof signal?.option_meta?.meta?.selectionObservability
+            ?.minEligibilityChecksPassed === "boolean"
+        ? signal.option_meta.meta.selectionObservability
+            .minEligibilityChecksPassed
+        : typeof signal?.option_meta?.meta?.selectionPath
+              ?.minEligibilityChecksPassed === "boolean"
+          ? signal.option_meta.meta.selectionPath.minEligibilityChecksPassed
+          : null;
+  const selectedReason =
+    contractMetrics?.selectedReason ||
+    signal?.option_meta?.meta?.selectionObservability?.selectedReason ||
+    signal?.option_meta?.meta?.selectionPath?.selectedReason ||
+    null;
+  const confidenceGap =
+    confidence != null && minConfidence != null
+      ? Math.max(0, minConfidence - confidence)
+      : null;
+  const softBand = Math.max(
+    0,
+    Number(config?.POST_ROUTE_CONFIDENCE_SOFT_BAND ?? 4),
+  );
+
+  const meta = {
+    conf: confidence,
+    minConf: minConfidence,
+    confidenceGap,
+    routedScore,
+    expectedRouteAdjustment,
+    spreadBps,
+    healthScore,
+    depth,
+    selectedByFallback,
+    fallbackReason,
+  };
+
+  if (
+    !signal?.option_meta ||
+    confidence == null ||
+    minConfidence == null ||
+    !(minConfidence > 0) ||
+    !(confidence < minConfidence)
+  ) {
+    return {
+      blocked: false,
+      adjusted: false,
+      reasonCode: null,
+      postRouteDecision: null,
+      meta,
+    };
+  }
+
+  const maxSpreadBps = Math.max(1, Number(config?.OPT_MAX_SPREAD_BPS ?? 35));
+  const materialSpreadLimit = Math.max(maxSpreadBps + 5, maxSpreadBps * 1.2);
+  const weakHealthFloor = Math.max(
+    55,
+    Number(config?.OPT_HEALTH_SCORE_MIN ?? 45),
+  );
+  const withinSoftBand =
+    routedScore != null && routedScore >= minConfidence - softBand;
+  const compatibilityPoor =
+    eligibilityPassed === false ||
+    minEligibilityChecksPassed === false ||
+    selectedReason === "FAILED_ELIGIBILITY";
+  const spreadTooWide = spreadBps != null && spreadBps > materialSpreadLimit;
+  const healthTooWeak = healthScore != null && healthScore < weakHealthFloor;
+  const fallbackStillWeak =
+    selectedByFallback &&
+    confidenceGap != null &&
+    confidenceGap > Math.max(1, softBand / 2);
+
+  if (
+    withinSoftBand &&
+    !compatibilityPoor &&
+    !spreadTooWide &&
+    !healthTooWeak &&
+    !fallbackStillWeak
+  ) {
+    return {
+      blocked: false,
+      adjusted: true,
+      reasonCode: "POST_ROUTE_CONFIDENCE_SOFT_PASS",
+      postRouteDecision: "SOFT_PASS",
+      meta,
+    };
+  }
+
+  return {
+    blocked: true,
+    adjusted: false,
+    reasonCode: "POST_ROUTE_LOW_CONFIDENCE",
+    postRouteDecision: "BLOCKED",
+    meta,
   };
 }
 
@@ -1474,18 +1633,27 @@ class TradeManager {
     // Order rate limits + daily count
     this.orderLimiter = new OrderRateLimiter({
       maxPerSec: Number(env.MAX_ORDERS_PER_SEC ?? 10),
-      maxPerMin: Number(env.MAX_ORDERS_PER_MIN ?? 200),
-      maxPerDay: Number(env.MAX_ORDERS_PER_DAY ?? 3000),
+      maxPerMin: Number(env.MAX_ORDERS_PER_MIN ?? 400),
+      maxPerDay: Number(env.MAX_ORDERS_PER_DAY ?? 5000),
     });
     this.brokerOrderLimiter = new OrderRateLimiter({
       maxPerSec: Number(
         env.BROKER_MAX_ORDERS_PER_SEC ?? env.MAX_ORDERS_PER_SEC ?? 10,
       ),
       maxPerMin: Number(
-        env.BROKER_MAX_ORDERS_PER_MIN ?? env.MAX_ORDERS_PER_MIN ?? 200,
+        env.BROKER_MAX_ORDERS_PER_MIN ?? env.MAX_ORDERS_PER_MIN ?? 400,
+      ),
+      maxPerDay: Number(
+        env.BROKER_MAX_ORDERS_PER_DAY ?? env.MAX_ORDERS_PER_DAY ?? 5000,
       ),
     });
     this.ordersPlacedToday = 0;
+    this._modifyCountByOrder = new Map(); // orderId -> modify requests sent
+    this._replacementMetaByOrder = new Map(); // orderId -> replacement lineage
+    this._modifyCapHitsToday = 0;
+    this._cancelReplaceCountToday = 0;
+    this._autosliceUsedToday = 0;
+    this._ttlEntryUsedToday = 0;
 
     // Dynamic exit adjustments (trail SL / adjust target)
     this._dynExitLastAt = new Map(); // tradeId -> last modify ts
@@ -2527,6 +2695,179 @@ class TradeManager {
     }
   }
 
+  _getOrderModifyCount(orderId) {
+    const oid = String(orderId || "");
+    const value = Number(this._modifyCountByOrder.get(oid) ?? 0);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  }
+
+  _setOrderModifyCount(orderId, count) {
+    const oid = String(orderId || "");
+    if (!oid) return;
+    const value = Number(count ?? 0);
+    this._modifyCountByOrder.set(
+      oid,
+      Number.isFinite(value) && value >= 0 ? value : 0,
+    );
+  }
+
+  _getReplacementMeta(orderId) {
+    const oid = String(orderId || "");
+    if (!oid) return {};
+    return this._replacementMetaByOrder.get(oid) || {};
+  }
+
+  _rememberReplacementMeta(orderId, patch = {}) {
+    const oid = String(orderId || "");
+    if (!oid) return;
+    const prev = this._replacementMetaByOrder.get(oid) || {};
+    this._replacementMetaByOrder.set(oid, { ...prev, ...patch });
+  }
+
+  _buildLiveOrderSnapshotMetadata(orderId) {
+    const oid = String(orderId || "");
+    if (!oid) return {};
+    return {
+      modifyCount: this._getOrderModifyCount(oid),
+      ...this._getReplacementMeta(oid),
+    };
+  }
+
+  async _persistOrderSnapshotState({
+    tradeId,
+    orderId,
+    role,
+    order,
+    source = "runtime",
+  } = {}) {
+    const tid = String(tradeId || "");
+    const oid = String(orderId || "");
+    if (!tid || !oid) return;
+    await upsertLiveOrderSnapshot({
+      tradeId: tid,
+      orderId: oid,
+      role: role || "UNKNOWN",
+      order: order || this._lastOrdersById.get(oid) || { order_id: oid },
+      source,
+      metadata: this._buildLiveOrderSnapshotMetadata(oid),
+    });
+  }
+
+  _hydrateLiveOrderSnapshotMetadata(orderId, entry) {
+    const oid = String(orderId || "");
+    if (!oid || !entry || typeof entry !== "object") return;
+
+    if (Number.isFinite(Number(entry.modifyCount))) {
+      this._setOrderModifyCount(oid, Number(entry.modifyCount));
+    }
+
+    const meta = {};
+    for (const key of [
+      "parentOrderId",
+      "replacedOrderId",
+      "replacementOrderId",
+      "replacementDepth",
+      "modifyCapHit",
+      "cancelReplaceTriggered",
+    ]) {
+      if (entry[key] !== undefined) meta[key] = entry[key];
+    }
+    if (Object.keys(meta).length) {
+      this._rememberReplacementMeta(oid, meta);
+    }
+  }
+
+  _isEntryOrderPurpose(purpose) {
+    const raw = String(purpose || "")
+      .trim()
+      .toUpperCase();
+    return raw === "ENTRY" || raw.startsWith("ENTRY_") || raw.startsWith("ENTRY");
+  }
+
+  _buildOrderLimiterSnapshot() {
+    return this.orderLimiter.snapshot({ currentDayCount: this.ordersPlacedToday });
+  }
+
+  _buildBrokerOrderLimiterSnapshot() {
+    return this.brokerOrderLimiter.snapshot({
+      currentDayCount: this.ordersPlacedToday,
+    });
+  }
+
+  _buildBrokerPlacementControls(params, { purpose } = {}) {
+    const nextParams = { ...(params || {}) };
+    const orderType = String(nextParams.order_type || "").toUpperCase();
+    const entryPurpose = this._isEntryOrderPurpose(purpose);
+    let ttlApplied = false;
+    let autosliceApplied = false;
+
+    if (
+      entryPurpose &&
+      String(env.KITE_ENTRY_VALIDITY || "TTL").toUpperCase() === "TTL" &&
+      orderType === "LIMIT"
+    ) {
+      const ttlMin = Math.max(
+        1,
+        Number(env.KITE_ENTRY_VALIDITY_TTL_MIN ?? 1),
+      );
+      nextParams.validity = "TTL";
+      nextParams.validity_ttl = ttlMin;
+      ttlApplied = true;
+    }
+
+    if (entryPurpose && env.KITE_USE_AUTOSLICE === true) {
+      nextParams.autoslice = true;
+      autosliceApplied = true;
+    }
+
+    return {
+      params: nextParams,
+      ttlApplied,
+      autosliceApplied,
+      validity: nextParams.validity || null,
+      validityTtl: nextParams.validity_ttl ?? null,
+    };
+  }
+
+  async _refreshKiteLayerPreflight(source = "trade_manager") {
+    updateLivePreflightContext({
+      rateLimiterSnapshot: this._buildOrderLimiterSnapshot(),
+      brokerRateLimiterSnapshot: this._buildBrokerOrderLimiterSnapshot(),
+      quoteDependenciesHealthy: !isQuoteGuardBreakerOpen(),
+      pipelineReady: true,
+      tickerStatus: {
+        hasSession: !!this.kite,
+        connected: null,
+      },
+    });
+    return refreshLivePreflight({
+      source,
+      requireRuntimeReady: true,
+    });
+  }
+
+  async _assertLiveOrderAllowed(action = "ORDER", purpose = null) {
+    const preflight = await this._refreshKiteLayerPreflight(
+      `trade_manager_${String(action || "ORDER").toLowerCase()}`,
+    );
+    if (preflight?.requestedByEnv && preflight?.ok === false) {
+      throw new Error(
+        `LIVE_PREFLIGHT_BLOCKED(${String(action || "ORDER")}): ${preflight.blockingReasons.join(", ")}`,
+      );
+    }
+    if (preflight?.warnings?.length) {
+      logger.warn(
+        {
+          action,
+          purpose: purpose || null,
+          warnings: preflight.warnings,
+        },
+        "[kite-layer] live preflight warning",
+      );
+    }
+    return preflight;
+  }
+
   async _hydrateLiveOrderSnapshotsFromDb({ force = false } = {}) {
     if (this._liveOrderSnapshotsHydrated && !force) return;
     try {
@@ -2554,6 +2895,7 @@ class TradeManager {
         for (const [orderId, entry] of Object.entries(byOrderId)) {
           if (allowed.size && !allowed.has(String(orderId || ""))) continue;
           if (!orderId) continue;
+          this._hydrateLiveOrderSnapshotMetadata(orderId, entry);
           this._rememberLiveOrder(
             orderId,
             entry?.order || { order_id: orderId, status: entry?.status },
@@ -2617,6 +2959,7 @@ class TradeManager {
           role: ref.role,
           order,
           source,
+          metadata: this._buildLiveOrderSnapshotMetadata(ref.orderId),
         });
       }
     }
@@ -2806,6 +3149,8 @@ class TradeManager {
       this.risk.setKillSwitch(true);
     }
     this.ordersPlacedToday = Number(dr?.ordersPlaced ?? 0);
+    this.orderLimiter.setDayCount(this.ordersPlacedToday);
+    this.brokerOrderLimiter.setDayCount(this.ordersPlacedToday);
   }
 
   async _hydrateRiskStateFromDb() {
@@ -2936,6 +3281,8 @@ class TradeManager {
     const inc = Number(n ?? 0);
     if (!Number.isFinite(inc) || inc <= 0) return;
     this.ordersPlacedToday += inc;
+    this.orderLimiter.setDayCount(this.ordersPlacedToday);
+    this.brokerOrderLimiter.setDayCount(this.ordersPlacedToday);
     await upsertDailyRisk(todayKey(), { ordersPlaced: this.ordersPlacedToday });
   }
 
@@ -7106,7 +7453,12 @@ class TradeManager {
       Number(env.ORDER_PLACE_RETRY_BACKOFF_MS ?? 250),
     );
 
-    const baseParams = { ...params };
+    await this._assertLiveOrderAllowed("PLACE_ORDER", purpose);
+
+    const placeControls = this._buildBrokerPlacementControls(params, {
+      purpose,
+    });
+    const baseParams = { ...placeControls.params };
 
     // Market protection (ENFORCED by default for scalping)
     const enforceMp =
@@ -7132,7 +7484,7 @@ class TradeManager {
           `Broker rate limit hit (${brokerRate.reason}). Refusing to place order.`,
         );
       }
-      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 3000)) {
+      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 5000)) {
         this.risk.setKillSwitch(true);
         await upsertDailyRisk(todayKey(), {
           kill: true,
@@ -7149,9 +7501,20 @@ class TradeManager {
         this.orderLimiter.record({ count: 1 });
         this.brokerOrderLimiter.record({ count: 1 });
         await this._recordOrdersPlaced(1);
+        if (placeControls.autosliceApplied) this._autosliceUsedToday += 1;
+        if (placeControls.ttlApplied) this._ttlEntryUsedToday += 1;
 
         logger.info(
-          { tradeId, purpose, orderId, attempt },
+          {
+            tradeId,
+            purpose,
+            orderId,
+            attempt,
+            autosliceApplied: placeControls.autosliceApplied,
+            ttlApplied: placeControls.ttlApplied,
+            validity: placeControls.validity,
+            validityTtl: placeControls.validityTtl,
+          },
           "[orders] placed successfully",
         );
         return { orderId, resp };
@@ -7177,7 +7540,10 @@ class TradeManager {
                 "[orders] place error but matching order exists; treating as success",
               );
               this.orderLimiter.record({ count: 1 });
+              this.brokerOrderLimiter.record({ count: 1 });
               await this._recordOrdersPlaced(1);
+              if (placeControls.autosliceApplied) this._autosliceUsedToday += 1;
+              if (placeControls.ttlApplied) this._ttlEntryUsedToday += 1;
               return { orderId, resp: { deduped: true, order_id: orderId } };
             }
           }
@@ -7271,6 +7637,8 @@ class TradeManager {
     const oid = String(orderId || "");
     if (!oid) throw new Error("cancelOrder missing orderId");
 
+    await this._assertLiveOrderAllowed("CANCEL_ORDER", purpose);
+
     const terminalStatus = String(
       this._terminalOrderStatusById.get(oid) || "",
     ).toUpperCase();
@@ -7300,7 +7668,7 @@ class TradeManager {
     }
 
     // ✅ enforce daily limit for cancel as well
-    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 3000)) {
+    if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 5000)) {
       this.risk.setKillSwitch(true);
       await upsertDailyRisk(todayKey(), {
         kill: true,
@@ -7332,6 +7700,289 @@ class TradeManager {
     }
   }
 
+  _buildCancelReplaceOrderParams(currentOrder, patch = {}, { tradeId, role } = {}) {
+    const nextPatch = { ...(patch || {}) };
+    const quantity = Number(
+      nextPatch.quantity ??
+        currentOrder?.pending_quantity ??
+        currentOrder?.pendingQty ??
+        currentOrder?.quantity ??
+        currentOrder?.qty ??
+        0,
+    );
+
+    const params = {
+      exchange: currentOrder?.exchange,
+      tradingsymbol: currentOrder?.tradingsymbol,
+      transaction_type:
+        nextPatch.transaction_type || currentOrder?.transaction_type,
+      quantity,
+      product: nextPatch.product || currentOrder?.product || env.DEFAULT_PRODUCT,
+      order_type: String(
+        nextPatch.order_type || currentOrder?.order_type || "LIMIT",
+      ).toUpperCase(),
+      validity:
+        nextPatch.validity ||
+        currentOrder?.validity ||
+        String(env.KITE_ENTRY_VALIDITY || "DAY").toUpperCase(),
+      tag:
+        nextPatch.tag ||
+        currentOrder?.tag ||
+        makeTag(tradeId || "NO_TRADE", role || "REPLACE"),
+    };
+
+    const price = Number(nextPatch.price ?? currentOrder?.price);
+    if (Number.isFinite(price) && price > 0) params.price = price;
+
+    const triggerPrice = Number(
+      nextPatch.trigger_price ?? currentOrder?.trigger_price,
+    );
+    if (Number.isFinite(triggerPrice) && triggerPrice > 0) {
+      params.trigger_price = triggerPrice;
+    }
+
+    if (nextPatch.validity_ttl != null) {
+      params.validity_ttl = nextPatch.validity_ttl;
+    } else if (currentOrder?.validity_ttl != null) {
+      params.validity_ttl = currentOrder.validity_ttl;
+    }
+
+    return params;
+  }
+
+  async _handleModifyCapHit(
+    variety,
+    orderId,
+    patch,
+    { purpose, tradeId } = {},
+  ) {
+    const oid = String(orderId || "");
+    const cap = Math.max(
+      1,
+      Number(env.KITE_MAX_MODIFICATIONS_PER_ORDER ?? 25),
+    );
+    const knownOrder = this._lastOrdersById.get(oid) || null;
+    const latest = knownOrder ? null : await this._getOrderStatus(oid);
+    const order = knownOrder || latest?.order || null;
+    const status = String(
+      latest?.status || order?.status || this._terminalOrderStatusById.get(oid) || "",
+    ).toUpperCase();
+
+    this._modifyCapHitsToday += 1;
+    this._rememberReplacementMeta(oid, {
+      modifyCapHit: true,
+      cancelReplaceTriggered: false,
+    });
+
+    const linkHit = await findTradeByOrder(oid);
+    const linkedTradeId = linkHit?.trade?.tradeId || tradeId || null;
+    const role = linkHit?.link?.role || "UNKNOWN";
+
+    if (!order?.tradingsymbol || !order?.exchange) {
+      logger.error(
+        { tradeId: linkedTradeId, purpose, orderId: oid, status },
+        "[orders] modify cap hit but broker order snapshot is incomplete",
+      );
+      return { skipped: true, reason: "modify_cap_missing_order_snapshot" };
+    }
+
+    if (
+      status &&
+      ["COMPLETE", "CANCELLED", "CANCELED", "REJECTED"].includes(status)
+    ) {
+      logger.warn(
+        { tradeId: linkedTradeId, purpose, orderId: oid, modifyCount: cap, status },
+        "[orders] modify cap hit on terminal order; cancel-replace skipped",
+      );
+      if (linkedTradeId) {
+        await this._persistOrderSnapshotState({
+          tradeId: linkedTradeId,
+          orderId: oid,
+          role,
+          order,
+          source: "modify_cap_terminal",
+        });
+      }
+      return { skipped: true, reason: "modify_cap_terminal_order", status };
+    }
+
+    const replacementParams = this._buildCancelReplaceOrderParams(order, patch, {
+      tradeId: linkedTradeId,
+      role,
+    });
+    if (!(Number(replacementParams.quantity) > 0)) {
+      logger.warn(
+        {
+          tradeId: linkedTradeId,
+          purpose,
+          orderId: oid,
+          modifyCount: cap,
+          quantity: replacementParams.quantity,
+        },
+        "[orders] modify cap hit but no remaining quantity for replacement",
+      );
+      return { skipped: true, reason: "modify_cap_no_remaining_qty" };
+    }
+
+    logger.warn(
+      {
+        tradeId: linkedTradeId,
+        purpose,
+        orderId: oid,
+        modifyCount: cap,
+      },
+      "[orders] modify cap hit; cancelling and replacing order",
+    );
+
+    await appendOrderLog({
+      order_id: oid,
+      tradeId: linkedTradeId,
+      status: "MODIFY_CAP_HIT",
+      payload: {
+        purpose,
+        modify_count: cap,
+        modify_cap_hit: true,
+        cancel_replace_triggered: true,
+      },
+    });
+
+    const cancelResp = await this._safeCancelOrder(variety, oid, {
+      purpose: `${purpose || "MODIFY"}_MODIFY_CAP_CANCEL`,
+      tradeId: linkedTradeId,
+    });
+    if (cancelResp?.skipped && cancelResp?.reason === "broker_processing") {
+      return {
+        skipped: true,
+        reason: "modify_cap_cancel_pending_broker",
+      };
+    }
+
+    const replacementOut = await this._safePlaceOrder(variety, replacementParams, {
+      purpose: `${purpose || "MODIFY"}_CANCEL_REPLACE`,
+      tradeId: linkedTradeId,
+    });
+    const replacementOrderId = String(replacementOut?.orderId || "");
+    if (!replacementOrderId) {
+      throw new Error("MODIFY_CAP_CANCEL_REPLACE_FAILED_NO_ORDER_ID");
+    }
+
+    this._cancelReplaceCountToday += 1;
+    const prevMeta = this._getReplacementMeta(oid);
+    const parentOrderId = prevMeta.parentOrderId || oid;
+    const replacementDepth = Number(prevMeta.replacementDepth ?? 0) + 1;
+    this._rememberReplacementMeta(oid, {
+      parentOrderId,
+      replacementOrderId,
+      replacementDepth,
+      modifyCapHit: true,
+      cancelReplaceTriggered: true,
+    });
+    this._rememberReplacementMeta(replacementOrderId, {
+      parentOrderId,
+      replacedOrderId: oid,
+      replacementDepth,
+      modifyCapHit: false,
+      cancelReplaceTriggered: false,
+    });
+    this._setOrderModifyCount(replacementOrderId, 0);
+    this._rememberLiveOrder(replacementOrderId, {
+      ...(order || {}),
+      ...replacementParams,
+      order_id: replacementOrderId,
+      status: "OPEN",
+    });
+
+    if (linkedTradeId) {
+      const updatePatch = {
+        lastOrderReplacement: {
+          role,
+          parentOrderId,
+          replacedOrderId: oid,
+          replacementOrderId,
+          replaceReason: "MODIFY_CAP_HIT",
+          replacedAt: new Date(),
+        },
+      };
+      const field = roleToOrderIdField(role);
+      if (field) updatePatch[field] = replacementOrderId;
+      await this._updateTrade(linkedTradeId, updatePatch);
+      await linkOrder({
+        order_id: replacementOrderId,
+        tradeId: linkedTradeId,
+        role,
+      });
+      await this._replayOrphanUpdates(replacementOrderId);
+      await this._persistOrderSnapshotState({
+        tradeId: linkedTradeId,
+        orderId: oid,
+        role,
+        order,
+        source: "modify_cap_replaced",
+      });
+      await this._persistOrderSnapshotState({
+        tradeId: linkedTradeId,
+        orderId: replacementOrderId,
+        role,
+        order: {
+          ...(order || {}),
+          ...replacementParams,
+          order_id: replacementOrderId,
+          status: "OPEN",
+        },
+        source: "modify_cap_replacement",
+      });
+      if (role === "ENTRY") {
+        this._watchEntryUntilDone(linkedTradeId, replacementOrderId).catch((err) => {
+          reportFault({
+            code: "TRADING_TRADEMANAGER_ASYNC",
+            err,
+            message: "[src/trading/tradeManager.js] async task failed",
+          });
+        });
+      } else if (["SL", "TARGET", "TP1"].includes(String(role || "").toUpperCase())) {
+        this._watchExitLeg(linkedTradeId, replacementOrderId, role).catch((err) => {
+          reportFault({
+            code: "TRADING_TRADEMANAGER_ASYNC",
+            err,
+            message: "[src/trading/tradeManager.js] async task failed",
+          });
+        });
+      }
+    }
+
+    await appendOrderLog({
+      order_id: replacementOrderId,
+      tradeId: linkedTradeId,
+      status: "CANCEL_REPLACE",
+      payload: {
+        parent_order_id: parentOrderId,
+        replaced_order_id: oid,
+        replacement_order_id: replacementOrderId,
+        modify_cap_hit: true,
+        cancel_replace_triggered: true,
+      },
+    });
+
+    logger.warn(
+      {
+        tradeId: linkedTradeId,
+        purpose,
+        orderId: oid,
+        replacementOrderId,
+        modifyCount: cap,
+      },
+      "[orders] cancel-replace completed after modify cap",
+    );
+
+    return {
+      skipped: false,
+      modifyCapHit: true,
+      cancelReplaceTriggered: true,
+      replacementOrderId,
+      parentOrderId,
+    };
+  }
+
   async _safeModifyOrder(
     variety,
     orderId,
@@ -7340,6 +7991,8 @@ class TradeManager {
   ) {
     const oid = String(orderId || "");
     if (!oid) throw new Error("modifyOrder missing orderId");
+
+    await this._assertLiveOrderAllowed("MODIFY_ORDER", purpose);
 
     const now = Date.now();
     const terminalStatus = String(
@@ -7439,6 +8092,17 @@ class TradeManager {
       };
     }
 
+    const maxModifications = Math.max(
+      1,
+      Number(env.KITE_MAX_MODIFICATIONS_PER_ORDER ?? 25),
+    );
+    if (this._getOrderModifyCount(oid) >= maxModifications) {
+      return this._handleModifyCapHit(variety, oid, nextPatch, {
+        purpose,
+        tradeId,
+      });
+    }
+
     const attemptModify = async (nextPatch, label) => {
       const rate = this.orderLimiter.check({ count: 1 });
       if (!rate.ok) {
@@ -7454,7 +8118,7 @@ class TradeManager {
       }
 
       // ✅ enforce daily limit for modify as well
-      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 3000)) {
+      if (this.ordersPlacedToday + 1 > Number(env.MAX_ORDERS_PER_DAY ?? 5000)) {
         this.risk.setKillSwitch(true);
         await upsertDailyRisk(todayKey(), {
           kill: true,
@@ -7463,6 +8127,8 @@ class TradeManager {
         throw new Error("MAX_ORDERS_PER_DAY reached; kill-switch enabled.");
       }
 
+      const nextModifyCount = this._getOrderModifyCount(oid) + 1;
+      this._setOrderModifyCount(oid, nextModifyCount);
       this._lastModifyAttemptAtByOrder.set(oid, Date.now());
       const resp = await this.kite.modifyOrder(variety, oid, nextPatch);
       if (retry && !retry.appliedPatch) {
@@ -7471,8 +8137,24 @@ class TradeManager {
       this.orderLimiter.record({ count: 1 });
       this.brokerOrderLimiter.record({ count: 1 });
       await this._recordOrdersPlaced(1);
+      const linkHit = await findTradeByOrder(oid);
+      if (linkHit?.trade?.tradeId) {
+        await this._persistOrderSnapshotState({
+          tradeId: linkHit.trade.tradeId,
+          orderId: oid,
+          role: linkHit.link?.role || "UNKNOWN",
+          order: currentOrder,
+          source: "modify",
+        });
+      }
       logger.info(
-        { tradeId, purpose: label || purpose, orderId: oid, patch: nextPatch },
+        {
+          tradeId,
+          purpose: label || purpose,
+          orderId: oid,
+          patch: nextPatch,
+          modifyCount: nextModifyCount,
+        },
         "[orders] modified",
       );
       return resp;
@@ -13011,9 +13693,8 @@ class TradeManager {
         conversion.postRouteDecision =
           reason === "POST_ROUTE_LOW_CONFIDENCE"
             ? "BLOCKED"
-            : s.option_meta
-              ? "PASSED"
-              : s?.conversionSummary?.postRouteDecision ?? null;
+            : s?.conversionSummary?.postRouteDecision ??
+              (s.option_meta ? "PASSED" : null);
         conversion.finalOutcome =
           reason === "POST_ROUTE_LOW_CONFIDENCE"
             ? "BLOCKED_POST_ROUTE_CONFIDENCE"
@@ -13022,21 +13703,31 @@ class TradeManager {
         if (reason === "POST_ROUTE_LOW_CONFIDENCE") {
           conversion.routedConfidence = toFiniteOrNull(meta?.conf ?? s?.confidence);
         }
+      } else if (stage === "admission" && outcome === "ADJUSTED") {
+        if (reason === "POST_ROUTE_CONFIDENCE_SOFT_PASS") {
+          conversion.postRouteDecision = "SOFT_PASS";
+          conversion.routedConfidence = toFiniteOrNull(meta?.routedScore ?? meta?.conf);
+        }
       } else if (
         (stage === "risk_fit" || stage === "affordability") &&
         outcome === "BLOCKED"
       ) {
         conversion.postRouteDecision =
-          s.option_meta ? "PASSED" : s?.conversionSummary?.postRouteDecision ?? null;
+          s?.conversionSummary?.postRouteDecision ??
+          (s.option_meta ? "PASSED" : null);
         conversion.riskFitDecision =
           meta?.riskFitDecision || (stage === "risk_fit" ? "BLOCKED" : null);
         conversion.finalOutcome = "BLOCKED_RISK_FIT";
         conversion.finalReasonCode = reason;
       } else if (stage === "risk_fit" && outcome === "ADJUSTED") {
         conversion.riskFitDecision = meta?.riskFitDecision || reason || "ADJUSTED";
+      } else if (stage === "entry" && outcome === "READY_FOR_EXECUTION") {
+        conversion.finalOutcome = "READY_FOR_EXECUTION";
+        conversion.finalReasonCode = reason;
       } else if (stage === "entry" && outcome === "ENTRY_PLACED") {
         conversion.postRouteDecision =
-          s.option_meta ? "PASSED" : s?.conversionSummary?.postRouteDecision ?? null;
+          s?.conversionSummary?.postRouteDecision ??
+          (s.option_meta ? "PASSED" : null);
         conversion.riskFitDecision =
           s?.conversionSummary?.riskFitDecision || "FIT";
         conversion.finalOutcome = "READY_FOR_EXECUTION";
@@ -13145,28 +13836,74 @@ class TradeManager {
     conf = Number(s.confidence);
     if (Number.isFinite(minConf) && minConf > 0 && Number.isFinite(conf)) {
       if (conf < minConf) {
-        const reasonCode = s.option_meta
-          ? "POST_ROUTE_LOW_CONFIDENCE"
-          : "LOW_CONFIDENCE";
-        trackDecision("BLOCKED", "admission", reasonCode, {
-          conf,
-          minConf,
-          preRouteScore: s?.routeConfidence?.preRouteScore ?? null,
-          expectedRouteAdjustment:
-            s?.routeConfidence?.expectedRouteAdjustment ?? null,
-          routedScore: conf,
-        });
-        logger.info(
-          withSignalLifecycleMeta(s, {
-            token: s.instrument_token,
+        const confidenceGap = Math.max(0, Number(minConf) - Number(conf));
+        const postRouteDecision = s.option_meta
+          ? resolvePostRouteConfidenceDecision({
+              signal: s,
+              conf,
+              minConf,
+              config: env,
+            })
+          : null;
+        if (postRouteDecision?.adjusted) {
+          trackDecision(
+            "ADJUSTED",
+            "admission",
+            postRouteDecision.reasonCode,
+            {
+              ...postRouteDecision.meta,
+              preRouteScore: s?.routeConfidence?.preRouteScore ?? null,
+            },
+          );
+          logger.info(
+            withSignalLifecycleMeta(s, {
+              token: s.instrument_token,
+              ...postRouteDecision.meta,
+              preRouteScore: s?.routeConfidence?.preRouteScore ?? null,
+              conversionSummary: s?.conversionSummary || null,
+            }),
+            "[trade] post-route confidence soft-pass applied",
+          );
+        } else {
+          const reasonCode = s.option_meta
+            ? postRouteDecision?.reasonCode || "POST_ROUTE_LOW_CONFIDENCE"
+            : "LOW_CONFIDENCE";
+          trackDecision("BLOCKED", "admission", reasonCode, {
             conf,
             minConf,
-            postRoute: !!s.option_meta,
-            conversionSummary: s?.conversionSummary || null,
-          }),
-          "[trade] blocked (low confidence post-route)",
-        );
-        return;
+            confidenceGap,
+            preRouteScore: s?.routeConfidence?.preRouteScore ?? null,
+            expectedRouteAdjustment:
+              postRouteDecision?.meta?.expectedRouteAdjustment ??
+              s?.routeConfidence?.expectedRouteAdjustment ??
+              null,
+            routedScore: postRouteDecision?.meta?.routedScore ?? conf,
+            spreadBps: postRouteDecision?.meta?.spreadBps ?? null,
+            healthScore: postRouteDecision?.meta?.healthScore ?? null,
+            depth: postRouteDecision?.meta?.depth ?? null,
+            selectedByFallback:
+              postRouteDecision?.meta?.selectedByFallback ?? null,
+            fallbackReason: postRouteDecision?.meta?.fallbackReason ?? null,
+          });
+          logger.info(
+            withSignalLifecycleMeta(s, {
+              token: s.instrument_token,
+              conf,
+              minConf,
+              confidenceGap,
+              postRoute: !!s.option_meta,
+              spreadBps: postRouteDecision?.meta?.spreadBps ?? null,
+              healthScore: postRouteDecision?.meta?.healthScore ?? null,
+              depth: postRouteDecision?.meta?.depth ?? null,
+              selectedByFallback:
+                postRouteDecision?.meta?.selectedByFallback ?? null,
+              fallbackReason: postRouteDecision?.meta?.fallbackReason ?? null,
+              conversionSummary: s?.conversionSummary || null,
+            }),
+            "[trade] blocked (low confidence post-route)",
+          );
+          return;
+        }
       }
     }
 
@@ -14008,26 +14745,40 @@ class TradeManager {
     riskFitDecision = riskFitResolution.riskFitDecision || riskFitDecision;
     riskBreachState = riskFitResolution.riskBreachState || riskBreachState;
     riskBreachTag = riskFitResolution.riskBreachTag || null;
+    const riskFitDecisionMeta = {
+      riskFitDecision,
+      minLotPolicy,
+      lotSize,
+      strategyStopLoss,
+      sizingStopLoss,
+      riskBudgetInr,
+      oneLotRiskInr,
+      originalRiskInr,
+      adjustedRiskInr,
+      breachPct: riskBreachPct,
+      compressionAppliedPct: slCompressionPct,
+      riskFitMode,
+      riskBreachState,
+      riskBreachTag,
+      bufferPctAllowed: riskFitResolution.bufferPctAllowed,
+    };
 
     if (!(qtyByRisk >= 1)) {
       if (riskFitResolution.allowOneLot) {
         qtyByRisk = lotSize;
+        logger.info(
+          {
+            token,
+            side,
+            reason: "RISK_BREACH_ALLOWED",
+            meta: riskFitDecisionMeta,
+          },
+          "[risk] allowing one lot within bounded breach buffer",
+        );
       } else {
         trackDecision("BLOCKED", "risk_fit", "MIN_LOT_RISK_REJECT", {
+          ...riskFitDecisionMeta,
           riskFitDecision: "REJECT",
-          minLotPolicy,
-          lotSize,
-          strategyStopLoss,
-          sizingStopLoss,
-          riskBudgetInr,
-          oneLotRiskInr,
-          originalRiskInr,
-          adjustedRiskInr,
-          breachPct: riskBreachPct,
-          riskFitMode,
-          compressionAppliedPct: slCompressionPct,
-          riskBreachTag,
-          bufferPctAllowed: riskFitResolution.bufferPctAllowed,
         });
         logger.info(
           {
@@ -14035,20 +14786,8 @@ class TradeManager {
             side,
             reason: "MIN_LOT_RISK_REJECT",
             meta: {
-              minLotPolicy,
-              lotSize,
-              strategyStopLoss,
-              sizingStopLoss,
-              riskBudgetInr,
-              oneLotRiskInr,
-              originalRiskInr,
-              adjustedRiskInr,
-              breachPct: riskBreachPct,
-              riskFitMode,
+              ...riskFitDecisionMeta,
               riskFitDecision: "REJECT",
-              compressionAppliedPct: slCompressionPct,
-              riskBreachTag,
-              bufferPctAllowed: riskFitResolution.bufferPctAllowed,
             },
           },
           "[trade] blocked (1 lot does not fit risk budget at strategy stop)",
@@ -14059,19 +14798,7 @@ class TradeManager {
 
     s = applyConversionSummary(s, { riskFitDecision });
     if (riskFitDecision !== "FIT") {
-      trackDecision("ADJUSTED", "risk_fit", riskFitDecision, {
-        riskFitDecision,
-        minLotPolicy,
-        lotSize,
-        strategyStopLoss,
-        sizingStopLoss,
-        riskBudgetInr,
-        originalRiskInr,
-        adjustedRiskInr,
-        riskBreachPct,
-        compressionAppliedPct: slCompressionPct,
-        riskBreachTag,
-      });
+      trackDecision("ADJUSTED", "risk_fit", riskFitDecision, riskFitDecisionMeta);
     }
 
     let qtyWanted = qtyByRisk;
@@ -14599,6 +15326,20 @@ class TradeManager {
       entryParams.price = roundToTick(px, tick, side === "BUY" ? "up" : "down");
     }
 
+    trackDecision(
+      "READY_FOR_EXECUTION",
+      "entry",
+      "READY_FOR_EXECUTION",
+      {
+        entryOrderType,
+        qty,
+        signalAgeMs: executionGate.signalAgeMs,
+        spreadBpsAtExecution: executionGate.spreadBps,
+        entryDriftPct: executionGate.premiumDriftPct,
+        entryPipelineLatency: trade.entryPipelineLatency,
+      },
+      trade,
+    );
     logger.info(
       withSignalLifecycleMeta(s, {
         tradeId,
@@ -14873,6 +15614,7 @@ class TradeManager {
         role: link?.role || "UNKNOWN",
         order,
         source: "order_update",
+        metadata: this._buildLiveOrderSnapshotMetadata(orderId),
       });
     } catch (err) {
       reportFault({
@@ -18918,9 +19660,12 @@ class TradeManager {
       ? await getTrade(this.activeTradeId)
       : null;
     const risk = await getDailyRisk(todayKey());
+    const livePreflight = await this._refreshKiteLayerPreflight("trade_manager_status");
     return {
       tradingEnabled: getTradingEnabled(),
       tradingEnabledSource: getTradingEnabledSource(),
+      effectiveLiveEnabled: getEffectiveLiveEnabled(),
+      livePreflight,
       killSwitch: this.risk.getKillSwitch(),
       tradesToday: this.risk.tradesToday,
       activeTradeId: this.activeTradeId,
@@ -18930,6 +19675,21 @@ class TradeManager {
       dailyRiskState: risk?.state || "RUNNING",
       dailyRiskReason: risk?.stateReason || null,
       ordersPlacedToday: this.ordersPlacedToday,
+      orderRateLimiter: this._buildOrderLimiterSnapshot(),
+      brokerOrderRateLimiter: this._buildBrokerOrderLimiterSnapshot(),
+      kiteLayer: {
+        currentPublicIp: livePreflight?.details?.publicIp || null,
+        staticIpCheckPassed:
+          livePreflight?.details?.staticIpCheck?.passed ?? null,
+        kiteSessionActive: livePreflight?.details?.session?.active ?? null,
+        tokenLoginTime: livePreflight?.details?.session?.loginTime ?? null,
+        tokenTradingDayFresh:
+          livePreflight?.details?.session?.tokenFresh ?? null,
+        modifyCapHitsToday: this._modifyCapHitsToday,
+        cancelReplaceCountToday: this._cancelReplaceCountToday,
+        autosliceUsedToday: this._autosliceUsedToday,
+        ttlEntryUsedToday: this._ttlEntryUsedToday,
+      },
       dynamicExitCadence: this._dynExitCadenceSnapshot(),
       orphanReplay: { ...this._orphanReplayStats },
       faults: snapshotFaults(),
@@ -19205,6 +19965,7 @@ module.exports = {
   buildCompressionTelemetryMeta,
   evaluatePreRouteTradability,
   evaluatePreRouteConfidenceGate,
+  resolvePostRouteConfidenceDecision,
   resolveMinLotRiskPolicyDecision,
   resolvePreEntrySlFitDecision,
   resolvePreRouteConfidenceAllowance,

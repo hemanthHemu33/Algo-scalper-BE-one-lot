@@ -36,6 +36,40 @@ function inc(obj, key, n = 1) {
   obj[k] = (obj[k] || 0) + Number(n ?? 0);
 }
 
+function addMetric(agg, sumKey, countKey, value) {
+  if (!agg) return;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return;
+  agg[sumKey] = Number(agg[sumKey] || 0) + n;
+  agg[countKey] = Number(agg[countKey] || 0) + 1;
+}
+
+function avgMetric(sum, count) {
+  return count > 0 ? Math.round((sum / count) * 1000) / 1000 : null;
+}
+
+function sortCountsDesc(obj = {}, limit = null) {
+  return Object.fromEntries(
+    Object.entries(obj)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, Number.isFinite(Number(limit)) ? Number(limit) : undefined),
+  );
+}
+
+function makeBlockerFunnel() {
+  return {
+    received: 0,
+    blockedPreRouteConfidence: 0,
+    blockedPostRouteConfidence: 0,
+    softPassedPostRouteConfidence: 0,
+    blockedRiskFit: 0,
+    compressedRiskFit: 0,
+    breachAllowedRiskFit: 0,
+    readyForExecution: 0,
+    entryPlaced: 0,
+  };
+}
+
 function safeMeta(meta) {
   if (!meta || typeof meta !== "object") return null;
   try {
@@ -56,15 +90,20 @@ function bucketFeeMultiple(x) {
 }
 
 class TradeTelemetry {
-  constructor() {
+  constructor(options = {}) {
     this._enabled =
-      String(env.TELEMETRY_ENABLED || "true") === "true" &&
-      String(env.TELEMETRY_TRADES_ENABLED || "true") === "true";
+      options.enabled ??
+      (String(env.TELEMETRY_ENABLED || "true") === "true" &&
+        String(env.TELEMETRY_TRADES_ENABLED || "true") === "true");
 
-    this._ringSize = Number(env.TELEMETRY_TRADES_RING_SIZE ?? 300);
-    this._flushSec = Number(env.TELEMETRY_FLUSH_SEC ?? 60);
+    this._ringSize = Number(
+      options.ringSize ?? env.TELEMETRY_TRADES_RING_SIZE ?? 300,
+    );
+    this._flushSec = Number(options.flushSec ?? env.TELEMETRY_FLUSH_SEC ?? 60);
     this._dailyCollection =
-      env.TELEMETRY_TRADES_DAILY_COLLECTION || "telemetry_trades_daily";
+      options.dailyCollection ||
+      env.TELEMETRY_TRADES_DAILY_COLLECTION ||
+      "telemetry_trades_daily";
 
     this._state = this._freshState(dayKey());
     this._timer = null;
@@ -95,6 +134,29 @@ class TradeTelemetry {
       decisionsByStage: {},
       decisionsByReason: {},
       lastDecisions: [], // ring buffer
+      blockerFunnel: makeBlockerFunnel(),
+      blockerReasonsTop: {},
+      postRouteAgg: {
+        hardBlockedCount: 0,
+        softPassCount: 0,
+        sumConfidenceGap: 0,
+        countConfidenceGap: 0,
+        sumExpectedRouteAdjustment: 0,
+        countExpectedRouteAdjustment: 0,
+        sumRoutedScore: 0,
+        countRoutedScore: 0,
+      },
+      riskFitAgg: {
+        rejectCount: 0,
+        compressedCount: 0,
+        breachAllowedCount: 0,
+        sumOriginalRiskInr: 0,
+        countOriginalRiskInr: 0,
+        sumAdjustedRiskInr: 0,
+        countAdjustedRiskInr: 0,
+        sumBreachPct: 0,
+        countBreachPct: 0,
+      },
     };
   }
 
@@ -121,6 +183,136 @@ class TradeTelemetry {
   stop() {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
+  }
+
+  _buildPostRouteStats() {
+    const agg = this._state.postRouteAgg || {};
+    return {
+      hardBlockedCount: Number(agg.hardBlockedCount || 0),
+      softPassCount: Number(agg.softPassCount || 0),
+      avgConfidenceGap: avgMetric(
+        Number(agg.sumConfidenceGap || 0),
+        Number(agg.countConfidenceGap || 0),
+      ),
+      avgExpectedRouteAdjustment: avgMetric(
+        Number(agg.sumExpectedRouteAdjustment || 0),
+        Number(agg.countExpectedRouteAdjustment || 0),
+      ),
+      avgRoutedScore: avgMetric(
+        Number(agg.sumRoutedScore || 0),
+        Number(agg.countRoutedScore || 0),
+      ),
+    };
+  }
+
+  _buildRiskFitStats() {
+    const agg = this._state.riskFitAgg || {};
+    return {
+      rejectCount: Number(agg.rejectCount || 0),
+      compressedCount: Number(agg.compressedCount || 0),
+      breachAllowedCount: Number(agg.breachAllowedCount || 0),
+      avgOriginalRiskInr: avgMetric(
+        Number(agg.sumOriginalRiskInr || 0),
+        Number(agg.countOriginalRiskInr || 0),
+      ),
+      avgAdjustedRiskInr: avgMetric(
+        Number(agg.sumAdjustedRiskInr || 0),
+        Number(agg.countAdjustedRiskInr || 0),
+      ),
+      avgBreachPct: avgMetric(
+        Number(agg.sumBreachPct || 0),
+        Number(agg.countBreachPct || 0),
+      ),
+    };
+  }
+
+  _applyDecisionAggregates(item = {}) {
+    const out = safeKey(item?.outcome || "UNKNOWN", 40);
+    const stg = safeKey(item?.stage || "unknown", 40);
+    const rsn = safeKey(item?.reason || out, 140);
+    const meta = item?.meta && typeof item.meta === "object" ? item.meta : {};
+
+    if (out === "BLOCKED" || out === "ADJUSTED") {
+      inc(this._state.blockerReasonsTop, rsn, 1);
+    }
+
+    if (stg === "signal" && rsn === "RECEIVED") {
+      this._state.blockerFunnel.received += 1;
+    }
+    if (rsn === "PRE_ROUTE_LOW_CONFIDENCE") {
+      this._state.blockerFunnel.blockedPreRouteConfidence += 1;
+    }
+    if (rsn === "POST_ROUTE_LOW_CONFIDENCE" && out === "BLOCKED") {
+      this._state.blockerFunnel.blockedPostRouteConfidence += 1;
+      this._state.postRouteAgg.hardBlockedCount += 1;
+    }
+    if (rsn === "POST_ROUTE_CONFIDENCE_SOFT_PASS" && out === "ADJUSTED") {
+      this._state.blockerFunnel.softPassedPostRouteConfidence += 1;
+      this._state.postRouteAgg.softPassCount += 1;
+    }
+    if (stg === "risk_fit" && out === "BLOCKED") {
+      this._state.blockerFunnel.blockedRiskFit += 1;
+      this._state.riskFitAgg.rejectCount += 1;
+    }
+    if (stg === "risk_fit" && rsn === "COMPRESSED" && out === "ADJUSTED") {
+      this._state.blockerFunnel.compressedRiskFit += 1;
+      this._state.riskFitAgg.compressedCount += 1;
+    }
+    if (stg === "risk_fit" && rsn === "BREACH_ALLOWED" && out === "ADJUSTED") {
+      this._state.blockerFunnel.breachAllowedRiskFit += 1;
+      this._state.riskFitAgg.breachAllowedCount += 1;
+    }
+    if (stg === "entry" && rsn === "READY_FOR_EXECUTION") {
+      this._state.blockerFunnel.readyForExecution += 1;
+    }
+    if (stg === "entry" && out === "ENTRY_PLACED") {
+      this._state.blockerFunnel.entryPlaced += 1;
+    }
+
+    if (
+      rsn === "POST_ROUTE_LOW_CONFIDENCE" ||
+      rsn === "POST_ROUTE_CONFIDENCE_SOFT_PASS"
+    ) {
+      addMetric(
+        this._state.postRouteAgg,
+        "sumConfidenceGap",
+        "countConfidenceGap",
+        meta?.confidenceGap,
+      );
+      addMetric(
+        this._state.postRouteAgg,
+        "sumExpectedRouteAdjustment",
+        "countExpectedRouteAdjustment",
+        meta?.expectedRouteAdjustment,
+      );
+      addMetric(
+        this._state.postRouteAgg,
+        "sumRoutedScore",
+        "countRoutedScore",
+        meta?.routedScore ?? meta?.conf,
+      );
+    }
+
+    if (stg === "risk_fit") {
+      addMetric(
+        this._state.riskFitAgg,
+        "sumOriginalRiskInr",
+        "countOriginalRiskInr",
+        meta?.originalRiskInr,
+      );
+      addMetric(
+        this._state.riskFitAgg,
+        "sumAdjustedRiskInr",
+        "countAdjustedRiskInr",
+        meta?.adjustedRiskInr,
+      );
+      addMetric(
+        this._state.riskFitAgg,
+        "sumBreachPct",
+        "countBreachPct",
+        meta?.breachPct,
+      );
+    }
   }
 
   recordDecision({
@@ -162,6 +354,7 @@ class TradeTelemetry {
       reason: rsn,
       meta: safeMeta(meta),
     };
+    this._applyDecisionAggregates(item);
 
     this._state.lastDecisions.push(item);
     if (this._state.lastDecisions.length > this._ringSize) {
@@ -254,6 +447,10 @@ class TradeTelemetry {
       decisionsByOutcome: s.decisionsByOutcome,
       decisionsByStage: s.decisionsByStage,
       decisionsByReason: s.decisionsByReason,
+      blockerFunnel: { ...s.blockerFunnel },
+      blockerReasonsTop: sortCountsDesc(s.blockerReasonsTop, 10),
+      postRouteStats: this._buildPostRouteStats(),
+      riskFitStats: this._buildRiskFitStats(),
       lastDecisions: s.lastDecisions.slice(-50),
     };
   }
@@ -269,14 +466,9 @@ class TradeTelemetry {
       return { ok: false, reason: "db_not_ready" };
     }
 
-    const avgFeeMultiple =
-      this._state.countFeeMultiple > 0
-        ? this._state.sumFeeMultiple / this._state.countFeeMultiple
-        : null;
-
+    const snapshot = this.snapshot();
     const doc = {
-      ...this._state,
-      avgFeeMultiple,
+      ...snapshot,
       lastTrades: this._state.lastTrades.slice(-200),
       lastDecisions: this._state.lastDecisions.slice(-200),
       updatedAt: new Date(),
@@ -315,4 +507,4 @@ class TradeTelemetry {
 
 const tradeTelemetry = new TradeTelemetry();
 
-module.exports = { tradeTelemetry };
+module.exports = { TradeTelemetry, tradeTelemetry };

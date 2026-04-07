@@ -186,7 +186,9 @@ const schema = z.object({
   TOKENS_COLLECTION: z.string().default("broker_tokens"),
   TOKEN_FILTER_USER_ID: z.string().optional(),
   TOKEN_FILTER_API_KEY: z.string().optional(),
+  TOKEN_FILTER_ENV: z.string().optional(),
   TOKEN_FIELD: z.string().optional(),
+  APP_ENV: z.enum(["local", "render-prod", "prod"]).default("local"),
 
   // Token polling (tokenWatcher)
   TOKEN_POLL_INTERVAL_MS: z.coerce.number().default(30000),
@@ -195,6 +197,16 @@ const schema = z.object({
   KITE_API_SECRET: z.string().optional(),
   KITE_REDIRECT_SUCCESS_URL: z.string().optional(),
   KITE_ALLOWED_USER_ID: z.string().optional(),
+  KITE_ENFORCE_STATIC_IP: boolFromEnv.default(true),
+  EXPECTED_EGRESS_IPS: z.string().optional(),
+  KITE_ALLOW_LIVE_WITHOUT_STATIC_IP: boolFromEnv.default(false),
+  FORCE_DAILY_KITE_LOGOUT: boolFromEnv.default(true),
+  KITE_LOGOUT_AT: z.string().default("15:25"),
+  KITE_BLOCK_PREV_DAY_TOKEN: boolFromEnv.default(true),
+  KITE_MAX_MODIFICATIONS_PER_ORDER: z.coerce.number().default(25),
+  KITE_USE_AUTOSLICE: boolFromEnv.default(true),
+  KITE_ENTRY_VALIDITY: z.enum(["DAY", "TTL"]).default("TTL"),
+  KITE_ENTRY_VALIDITY_TTL_MIN: z.coerce.number().default(1),
 
   // PATCH-7: Quote guard (throttle + chunk + backoff + circuit breaker)
   QUOTE_GUARD_ENABLED: z.string().default("true"),
@@ -272,6 +284,8 @@ const schema = z.object({
   OPT_ALTERNATE_CONTRACT_TOP_N: z.coerce.number().default(3),
   // Conservative confidence allowance used only for the pre-route fast reject.
   OPT_PRE_ROUTE_MAX_CONF_BOOST: z.coerce.number().default(14),
+  OPT_ROUTE_MAX_NEG_ADJUSTMENT: z.coerce.number().default(8),
+  OPT_ROUTE_MAX_SPREAD_PENALTY: z.coerce.number().default(6),
 
   // Strike step sizes (override if exchange changes lot/steps)
   OPT_STRIKE_STEP_NIFTY: z.coerce.number().default(50),
@@ -370,13 +384,13 @@ const schema = z.object({
 
   // Option SL fitter (to make 1-lot risk fit RISK_PER_TRADE_INR caps when lot sizes are large)
   // If disabled, engine may block trades when 1-lot risk exceeds cap after lot-normalization.
-  OPT_SL_FIT_ENABLED: boolFromEnv.default(false),
+  OPT_SL_FIT_ENABLED: boolFromEnv.default(true),
   // Current scope: only attempt pre-entry SL compression after the original strategy stop fails
   // the min-tradable risk-fit gate. Keep this opt-in so the engine blocks instead of over-
   // compressing strategy stops by default.
-  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(false),
+  OPT_SL_FIT_WHEN_CAP_BLOCKS: boolFromEnv.default(true),
   OPT_SL_FIT_MIN_DISTANCE_KEEP_PCT: z.coerce.number().default(80),
-  PRE_ENTRY_SL_COMPRESSION_ENABLED: boolFromEnv.default(false),
+  PRE_ENTRY_SL_COMPRESSION_ENABLED: boolFromEnv.default(true),
   PRE_ENTRY_SL_COMPRESSION_MAX_PCT: z.coerce.number().default(0.10),
   PRE_ENTRY_SL_COMPRESSION_MAX_TICKS: z.coerce.number().default(6),
   PRE_ENTRY_SL_COMPRESSION_MAX_POINTS: z.coerce.number().optional(),
@@ -727,10 +741,10 @@ const schema = z.object({
   // Reliability guards
   MAX_CONSECUTIVE_FAILURES: z.coerce.number().default(3),
 
-  // Order rate limits (soft guard; tune per account)
+  // Order rate limits (conservative broker-side safety defaults)
   MAX_ORDERS_PER_SEC: z.coerce.number().default(10),
-  MAX_ORDERS_PER_MIN: z.coerce.number().default(200),
-  MAX_ORDERS_PER_DAY: z.coerce.number().default(3000),
+  MAX_ORDERS_PER_MIN: z.coerce.number().default(400),
+  MAX_ORDERS_PER_DAY: z.coerce.number().default(5000),
 
   // Safe placement retry (only for retryable transport errors and only after de-dup check)
   ORDER_PLACE_RETRY_MAX: z.coerce.number().default(1),
@@ -941,6 +955,7 @@ const schema = z.object({
   // Signal quality gating (reduces overtrading)
   // Skip signals below this confidence score (0-100). Set to 0 to disable.
   MIN_SIGNAL_CONFIDENCE: z.coerce.number().default(75),
+  POST_ROUTE_CONFIDENCE_SOFT_BAND: z.coerce.number().default(4),
   SIGNAL_PREEMIT_GLOBAL_MIN_NORMALIZED_CONFIDENCE: z.coerce.number().default(67),
   SIGNAL_PREEMIT_GLOBAL_MIN_QUALITY_SCORE: z.coerce.number().default(60),
   SIGNAL_PREEMIT_GLOBAL_MIN_CONTEXT_SCORE: z.coerce.number().default(58),
@@ -1044,7 +1059,7 @@ const schema = z.object({
   ENTRY_PENDING_MAX_MS_OPEN: z.coerce.number().default(9000),
   ENTRY_PENDING_MAX_MS_TREND: z.coerce.number().default(12000),
   ENTRY_PENDING_MAX_MS_RANGE: z.coerce.number().default(20000),
-  ALLOW_ONE_LOT_RISK_BUFFER_PCT: z.coerce.number().default(25),
+  ALLOW_ONE_LOT_RISK_BUFFER_PCT: z.coerce.number().default(10),
   ENABLE_SL_COMPRESSION_WHEN_BLOCKED: boolFromEnv.default(true),
   MAX_SL_COMPRESSION_PCT: z.coerce.number().default(20),
   FNO_FORCE_ONE_LOT_MAX_BREACH_PCT: z.coerce.number().default(8),

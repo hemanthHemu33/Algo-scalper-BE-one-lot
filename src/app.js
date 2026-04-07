@@ -51,6 +51,12 @@ const { getLatestLtp, getLatestLtps } = require("./market/ltpStream");
 const { getQuoteGuardStats } = require("./kite/quoteGuard");
 const { exchangeAndStoreKiteSession } = require("./kite/kiteLogin");
 const {
+  refreshLivePreflight,
+  updateLivePreflightContext,
+} = require("./runtime/livePreflight");
+const { getSessionControlStatus } = require("./kite/sessionControl");
+const { getTokenWatcherStatus } = require("./tokenWatcher");
+const {
   normalizeActiveTrade,
   normalizeTradeRow,
 } = require("./trading/tradeNormalization");
@@ -288,6 +294,18 @@ function buildApp() {
     }
   }
 
+  async function refreshLiveStatus(source = "app_status") {
+    const ticker = getTickerStatus?.() || null;
+    updateLivePreflightContext({
+      tickerStatus: ticker,
+      pipelineReady: !!getPipelineSafe(),
+    });
+    return refreshLivePreflight({
+      source,
+      requireRuntimeReady: false,
+    });
+  }
+
   // Optional: FE can exchange request_token (if your Kite redirect_url points to FE).
   // In production, this endpoint is protected by ADMIN_API_KEY (same as other /admin routes).
   app.post("/admin/kite/session", requirePerm("admin"), async (req, res) => {
@@ -324,7 +342,17 @@ function buildApp() {
       tokenFilters: {
         user_id: env.TOKEN_FILTER_USER_ID || null,
         api_key: env.TOKEN_FILTER_API_KEY || null,
+        environment: env.TOKEN_FILTER_ENV || null,
         tokenField: env.TOKEN_FIELD || null,
+      },
+      appEnv: env.APP_ENV || null,
+      kiteStaticIp: {
+        enforce: env.KITE_ENFORCE_STATIC_IP,
+        expectedIps: String(env.EXPECTED_EGRESS_IPS || "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+        allowWithoutStaticIp: env.KITE_ALLOW_LIVE_WITHOUT_STATIC_IP,
       },
       subscribeTokens: env.SUBSCRIBE_TOKENS || "",
       subscribeSymbols: env.SUBSCRIBE_SYMBOLS || "",
@@ -375,14 +403,20 @@ function buildApp() {
       const pipeline = getPipeline();
       const ticker = getTickerStatus();
       const halted = isHalted();
+      const livePreflight = await refreshLiveStatus("ready");
 
-      const ok = !!pipeline && ticker.connected && !halted;
+      const ok =
+        !!pipeline &&
+        ticker.connected &&
+        !halted &&
+        (livePreflight?.requestedByEnv ? livePreflight?.ok !== false : true);
 
       res.status(ok ? 200 : 503).json({
         ok,
         halted,
         haltInfo: getHaltInfo(),
         ticker,
+        livePreflight,
         now: new Date().toISOString(),
       });
     } catch (e) {
@@ -398,6 +432,7 @@ function buildApp() {
       const halted = isHalted();
       const haltInfo = getHaltInfo();
       const quoteGuard = getQuoteGuardStats();
+      const livePreflight = await refreshLiveStatus("critical_health");
 
       let pipeline = null;
       try {
@@ -449,6 +484,18 @@ function buildApp() {
         checks.push({ ok: true, code: "QUOTE_BREAKER_OK" });
       }
 
+      if (livePreflight?.requestedByEnv && livePreflight?.ok === false) {
+        checks.push({
+          ok: false,
+          code: "LIVE_PREFLIGHT_BLOCKED",
+          meta: {
+            blockingReasons: livePreflight.blockingReasons,
+          },
+        });
+      } else {
+        checks.push({ ok: true, code: "LIVE_PREFLIGHT_OK" });
+      }
+
       const deep = String(req.query.deep || "").trim() === "1";
       const pipeStatus = deep && pipeline ? await pipeline.status() : null;
 
@@ -463,6 +510,7 @@ function buildApp() {
         haltInfo,
         killSwitch,
         quoteGuard,
+        livePreflight,
         pipeline: pipeline ? { ok: true } : { ok: false },
         ...(pipeStatus ? { deepStatus: pipeStatus } : {}),
       });
@@ -479,6 +527,9 @@ function buildApp() {
       const s = await pipeline.status();
       const ticker = getTickerStatus();
       const halted = isHalted();
+      const livePreflight = await refreshLiveStatus("admin_status");
+      const sessionControl = getSessionControlStatus();
+      const tokenWatcher = getTokenWatcherStatus();
       const normalizedTicker = {
         connected: false,
         lastDisconnect: null,
@@ -532,9 +583,16 @@ function buildApp() {
         ...s,
         tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
         killSwitch: s?.killSwitch ?? false,
+        effectiveLiveEnabled:
+          s?.effectiveLiveEnabled ??
+          livePreflight?.effectiveLiveEnabled ??
+          false,
+        livePreflight,
         halted,
         haltInfo: getHaltInfo(),
         ticker: normalizedTicker,
+        kiteSession: sessionControl,
+        tokenWatcher,
         now: new Date().toISOString(),
         tradesToday: s?.tradesToday ?? 0,
         ordersPlacedToday: s?.ordersPlacedToday ?? 0,

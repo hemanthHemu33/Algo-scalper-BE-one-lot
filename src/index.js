@@ -10,12 +10,22 @@ const { ensureRetentionIndexes } = require("./market/retention");
 const { buildApp } = require("./app");
 const { watchLatestToken } = require("./tokenWatcher");
 const {
+  startSessionControl,
+  stopSessionControl,
+  trackSession,
+  clearTrackedSession,
+} = require("./kite/sessionControl");
+const {
   setSession,
   stopSession: stopKiteSession,
   getTickerStatus,
   getPipeline,
   getKiteClient,
 } = require("./kite/tickerManager");
+const {
+  refreshLivePreflight,
+  updateLivePreflightContext,
+} = require("./runtime/livePreflight");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
@@ -74,6 +84,24 @@ function todayKey() {
   return DateTime.now()
     .setZone(env.CANDLE_TZ || "Asia/Kolkata")
     .toFormat("yyyy-LL-dd");
+}
+
+async function evaluateLiveStartupPreflight({
+  source,
+  tokenDoc,
+  tickerStatus = null,
+  pipelineReady = false,
+} = {}) {
+  updateLivePreflightContext({
+    tokenDoc: tokenDoc || null,
+    tickerStatus,
+    pipelineReady,
+  });
+  return refreshLivePreflight({
+    source: source || "startup",
+    requireRuntimeReady: false,
+    forceNetworkRefresh: true,
+  });
 }
 
 async function persistKill(reason, meta) {
@@ -168,6 +196,27 @@ async function main() {
       })
     : null;
 
+  startSessionControl({
+    onSessionInvalidated: async ({ reason, doc }) => {
+      clearTrackedSession(reason);
+      try {
+        await stopKiteSession(reason);
+      } catch (err) {
+        logger.warn(
+          { reason, err: err?.message || String(err) },
+          "[kite-session] stopSession failed after invalidation",
+        );
+      }
+      logger.warn(
+        {
+          reason,
+          updatedAt: doc?.updatedAt || doc?.createdAt || null,
+        },
+        "[kite-session] live trading disabled after session invalidation",
+      );
+    },
+  });
+
   await watchLatestToken({
     onToken: async (accessToken, doc, reason) => {
       const updatedAt = doc?.updatedAt || doc?.createdAt || null;
@@ -192,12 +241,50 @@ async function main() {
         updatedAt,
       }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
 
+      trackSession({ accessToken, doc, source: reason });
+      const startupPreflight = await evaluateLiveStartupPreflight({
+        source: `token_${reason}`,
+        tokenDoc: doc,
+        tickerStatus: getTickerStatus?.() || null,
+        pipelineReady: false,
+      });
+      if (startupPreflight?.requestedByEnv && startupPreflight?.ok === false) {
+        try {
+          await stopKiteSession("LIVE_PREFLIGHT_FAILED");
+        } catch (err) {
+          logger.warn(
+            {
+              reason,
+              updatedAt,
+              err: err?.message || String(err),
+            },
+            "[kite] stopSession failed after live preflight block",
+          );
+        }
+        logger.error(
+          {
+            reason,
+            updatedAt,
+            blockingReasons: startupPreflight.blockingReasons,
+            details: startupPreflight.details,
+          },
+          "[kite] live preflight blocked session startup",
+        );
+        return;
+      }
+
       try {
         if (engineLifecycle) {
           await engineLifecycle.setToken(accessToken);
         } else {
           await setSession(accessToken);
         }
+        await evaluateLiveStartupPreflight({
+          source: `session_${reason}`,
+          tokenDoc: doc,
+          tickerStatus: getTickerStatus?.() || null,
+          pipelineReady: true,
+        });
       } catch (e) {
         const err = describeErr(e);
         logger.error(
@@ -232,6 +319,9 @@ async function main() {
     try {
       try {
         engineLifecycle?.stop?.();
+      } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+      try {
+        stopSessionControl();
       } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
       try {
         if (io) io.close();

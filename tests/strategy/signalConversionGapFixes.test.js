@@ -8,6 +8,7 @@ const {
   resetSignalLayerState,
 } = require("../../src/strategy/signalControls");
 const {
+  buildRouteConfidenceAssessment,
   buildSignalConversionSummary,
   shouldEmitLiveCandidate,
 } = require("../../src/strategy/signalLifecycle");
@@ -298,11 +299,53 @@ function testConversionSummaryIsNormalized() {
   });
 }
 
+function testRouteConfidenceCapsExcessiveNegativeAdjustments() {
+  const assessment = buildRouteConfidenceAssessment({
+    signal: {
+      underlying_symbol: "NIFTY",
+      selectorParticipation: 28,
+      volumeQuality: 36,
+      qualityScore: 42,
+      contextScore: 40,
+    },
+    baseConfidence: 76,
+    pick: {
+      ltp: 410,
+      bps: 240,
+      health_score: 42,
+      depth: 1,
+      delta: 0.2,
+      meta: {
+        selectionObservability: {
+          selectedByFallback: true,
+          fallbackReason: "WIDE_SPREAD_FALLBACK",
+        },
+      },
+    },
+    env: {
+      OPT_MAX_SPREAD_BPS: 35,
+      OPT_ROUTE_MAX_NEG_ADJUSTMENT: 8,
+      OPT_ROUTE_MAX_SPREAD_PENALTY: 6,
+      OPT_MIN_PREMIUM_NIFTY: 80,
+      OPT_MAX_PREMIUM_NIFTY: 350,
+      OPT_PREMIUM_BAND_ENFORCE_NIFTY: true,
+      OPT_DELTA_BAND_MIN: 0.35,
+      OPT_DELTA_BAND_MAX: 0.65,
+      OPT_DELTA_TARGET: 0.5,
+    },
+  });
+
+  assert.equal(assessment.expectedRouteAdjustment, -8);
+  assert.equal(assessment.routedScore, 68);
+  assert.equal(assessment.contractMetrics.fallbackReason, "WIDE_SPREAD_FALLBACK");
+}
+
 function main() {
   testMtfMissingVsTrueDisagreement();
   testRouteAwarePreEmitUsesSoftPenaltyBeforeRouting();
   testMtfEdgeCaseUsesSoftPenaltyInsteadOfHardReject();
   testConversionSummaryIsNormalized();
+  testRouteConfidenceCapsExcessiveNegativeAdjustments();
   console.log("signalConversionGapFixes.test.js passed");
 }
 

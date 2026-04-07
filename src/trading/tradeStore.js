@@ -531,7 +531,14 @@ async function getOrderLogs({ order_id, tradeId, limit = 200 }) {
     .toArray();
 }
 
-async function upsertLiveOrderSnapshot({ tradeId, orderId, role, order, source }) {
+async function upsertLiveOrderSnapshot({
+  tradeId,
+  orderId,
+  role,
+  order,
+  source,
+  metadata,
+}) {
   const db = getDb();
   const tid = String(tradeId || "");
   const oid = String(orderId || "");
@@ -549,6 +556,7 @@ async function upsertLiveOrderSnapshot({ tradeId, orderId, role, order, source }
     source: source || null,
     seenAt: now,
     order: order || null,
+    ...(metadata && typeof metadata === "object" ? metadata : {}),
   };
 
   const setPatch = {

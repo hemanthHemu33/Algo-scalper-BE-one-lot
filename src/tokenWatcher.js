@@ -5,6 +5,26 @@ const { alert } = require("./alerts/alertService");
 const { getDb } = require("./db");
 const { readLatestTokenDoc } = require("./tokenStore");
 const { reportFault } = require("./runtime/errorBus");
+const {
+  invalidateStoredSession,
+  isTokenFromPreviousTradingDay,
+  trackSession,
+  clearTrackedSession,
+} = require("./kite/sessionControl");
+const { updateLivePreflightContext } = require("./runtime/livePreflight");
+
+const watcherState = {
+  lastReason: null,
+  lastUpdatedAt: null,
+  missing: false,
+  activeEnvironment: String(env.TOKEN_FILTER_ENV || env.APP_ENV || env.NODE_ENV || "local"),
+  activeSource: null,
+  staleTokenBlockedAt: null,
+};
+
+function getTokenWatcherStatus() {
+  return { ...watcherState };
+}
 
 async function watchLatestToken({ onToken }) {
   const db = getDb();
@@ -47,6 +67,11 @@ async function watchLatestToken({ onToken }) {
         missing = true;
         lastToken = null;
       }
+      clearTrackedSession("missing_token");
+      updateLivePreflightContext({ tokenDoc: null });
+      watcherState.missing = true;
+      watcherState.lastReason = res?.reason || "NO_TOKEN";
+      watcherState.activeSource = null;
       logger.warn(
         {
           reason,
@@ -62,12 +87,69 @@ async function watchLatestToken({ onToken }) {
 
     const accessToken = String(res.accessToken);
     missing = false;
+    watcherState.missing = false;
+    watcherState.lastUpdatedAt = res?.doc?.updatedAt || res?.doc?.createdAt || null;
+    watcherState.activeSource = res?.doc?.sessionSource || "token_store";
+
+    if (
+      env.KITE_BLOCK_PREV_DAY_TOKEN === true &&
+      res?.doc &&
+      isTokenFromPreviousTradingDay(res.doc)
+    ) {
+      try {
+        await invalidateStoredSession({
+          doc: res.doc,
+          reason: "PREVIOUS_TRADING_DAY_TOKEN",
+          meta: { source: reason },
+        });
+      } catch (err) {
+        logger.warn(
+          {
+            reason,
+            error: err?.message || String(err),
+          },
+          "[tokenWatcher] failed to invalidate previous-day token",
+        );
+      }
+      clearTrackedSession("previous_day_token");
+      updateLivePreflightContext({ tokenDoc: res.doc });
+      watcherState.lastReason = "PREVIOUS_TRADING_DAY_TOKEN";
+      watcherState.staleTokenBlockedAt = new Date().toISOString();
+      lastToken = null;
+      logger.error(
+        {
+          reason,
+          updatedAt: watcherState.lastUpdatedAt,
+          environment:
+            res?.doc?.environment || env.TOKEN_FILTER_ENV || env.APP_ENV || null,
+        },
+        "[tokenWatcher] previous-day kite token blocked",
+      );
+      await maybeNotifyMissing({
+        ...res,
+        reason: "PREVIOUS_TRADING_DAY_TOKEN",
+      });
+      return;
+    }
 
     if (accessToken === lastToken) return;
 
     lastToken = accessToken;
+    watcherState.lastReason = reason;
+    trackSession({
+      accessToken,
+      doc: res?.doc || null,
+      source: reason,
+    });
+    updateLivePreflightContext({ tokenDoc: res?.doc || null });
     logger.info(
-      { reason, updatedAt: res?.doc?.updatedAt || null },
+      {
+        reason,
+        updatedAt: res?.doc?.updatedAt || null,
+        environment:
+          res?.doc?.environment || env.TOKEN_FILTER_ENV || env.APP_ENV || null,
+        sessionSource: res?.doc?.sessionSource || null,
+      },
       "[token] loaded/updated"
     );
     alert("info", "🔑 Kite token loaded/updated").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
@@ -121,4 +203,4 @@ async function watchLatestToken({ onToken }) {
   };
 }
 
-module.exports = { watchLatestToken };
+module.exports = { getTokenWatcherStatus, watchLatestToken };

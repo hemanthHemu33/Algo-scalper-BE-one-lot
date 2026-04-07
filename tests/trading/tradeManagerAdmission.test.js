@@ -4,6 +4,7 @@ const {
   TradeManager,
   evaluatePreRouteTradability,
   evaluatePreRouteConfidenceGate,
+  resolvePostRouteConfidenceDecision,
   resolveMinLotRiskPolicyDecision,
   resolvePreEntrySlFitDecision,
   resolvePreRouteConfidenceAllowance,
@@ -95,6 +96,83 @@ const postRouteConfidence = TradeManager.prototype._finalOptionSignalConfidence.
 );
 assert.equal(postRouteConfidence, 69);
 
+const softPassPostRoute = resolvePostRouteConfidenceDecision({
+  signal: {
+    option_meta: {
+      bps: 18,
+      health_score: 74,
+      depth: 42,
+    },
+    routeConfidence: {
+      preRouteScore: 78,
+      expectedRouteAdjustment: -6,
+      routedScore: 72,
+      contractMetrics: {
+        spreadBps: 18,
+        healthScore: 74,
+        depth: 42,
+        selectedByFallback: false,
+      },
+    },
+  },
+  conf: 72,
+  minConf: 75,
+  config: {
+    POST_ROUTE_CONFIDENCE_SOFT_BAND: 4,
+    OPT_MAX_SPREAD_BPS: 35,
+    OPT_HEALTH_SCORE_MIN: 45,
+  },
+});
+
+assert.equal(softPassPostRoute.blocked, false);
+assert.equal(softPassPostRoute.adjusted, true);
+assert.equal(
+  softPassPostRoute.reasonCode,
+  "POST_ROUTE_CONFIDENCE_SOFT_PASS",
+);
+assert.equal(softPassPostRoute.postRouteDecision, "SOFT_PASS");
+assert.equal(softPassPostRoute.meta.confidenceGap, 3);
+assert.equal(softPassPostRoute.meta.routedScore, 72);
+
+const hardRejectPostRoute = resolvePostRouteConfidenceDecision({
+  signal: {
+    option_meta: {
+      bps: 52,
+      health_score: 41,
+      depth: 4,
+      meta: {
+        selectionObservability: {
+          selectedByFallback: true,
+          fallbackReason: "WIDE_SPREAD_FALLBACK",
+        },
+      },
+    },
+    routeConfidence: {
+      preRouteScore: 78,
+      expectedRouteAdjustment: -6,
+      routedScore: 72,
+      contractMetrics: {
+        spreadBps: 52,
+        healthScore: 41,
+        depth: 4,
+        selectedByFallback: true,
+        fallbackReason: "WIDE_SPREAD_FALLBACK",
+      },
+    },
+  },
+  conf: 72,
+  minConf: 75,
+  config: {
+    POST_ROUTE_CONFIDENCE_SOFT_BAND: 4,
+    OPT_MAX_SPREAD_BPS: 35,
+    OPT_HEALTH_SCORE_MIN: 45,
+  },
+});
+
+assert.equal(hardRejectPostRoute.blocked, true);
+assert.equal(hardRejectPostRoute.adjusted, false);
+assert.equal(hardRejectPostRoute.reasonCode, "POST_ROUTE_LOW_CONFIDENCE");
+
 const capBlockedSkip = resolvePreEntrySlFitDecision({
   config: {
     PRE_ENTRY_SL_COMPRESSION_ENABLED: true,
@@ -134,20 +212,20 @@ assert.equal(capBlockedAttempt.compressionSkipReason, null);
 assert.deepEqual(
   resolveMinLotRiskPolicyDecision({
     config: {
-      ALLOW_ONE_LOT_RISK_BUFFER_PCT: 25,
+      ALLOW_ONE_LOT_RISK_BUFFER_PCT: 10,
       FNO_MIN_LOT_POLICY: "STRICT",
     },
     lotSize: 50,
     riskBudgetInr: 1800,
     strategyRiskFit: {
       fitsMinTradable: false,
-      oneLotAllInRiskInr: 2200,
-      breachPct: 22.22,
+      oneLotAllInRiskInr: 1960,
+      breachPct: 8.89,
     },
     sizingRiskFit: {
       fitsMinTradable: false,
-      oneLotAllInRiskInr: 2200,
-      breachPct: 22.22,
+      oneLotAllInRiskInr: 1960,
+      breachPct: 8.89,
     },
     riskFitMode: "FIT",
     minLotPolicy: "STRICT",
@@ -158,18 +236,18 @@ assert.deepEqual(
     riskFitDecision: "BREACH_ALLOWED",
     riskFitMode: "BUFFER_ALLOWED",
     riskBreachState: "SOFT",
-    originalRiskInr: 2200,
-    adjustedRiskInr: 2200,
-    riskBreachPct: 22.22,
+    originalRiskInr: 1960,
+    adjustedRiskInr: 1960,
+    riskBreachPct: 8.89,
     riskBreachTag: "RISK_BREACH_ALLOWED",
-    bufferPctAllowed: 25,
+    bufferPctAllowed: 10,
   },
 );
 
 assert.deepEqual(
   resolveMinLotRiskPolicyDecision({
     config: {
-      ALLOW_ONE_LOT_RISK_BUFFER_PCT: 25,
+      ALLOW_ONE_LOT_RISK_BUFFER_PCT: 10,
       FNO_MIN_LOT_POLICY: "STRICT",
     },
     lotSize: 50,
@@ -197,7 +275,42 @@ assert.deepEqual(
     adjustedRiskInr: 1760,
     riskBreachPct: 0,
     riskBreachTag: null,
-    bufferPctAllowed: 25,
+    bufferPctAllowed: 10,
+  },
+);
+
+assert.deepEqual(
+  resolveMinLotRiskPolicyDecision({
+    config: {
+      ALLOW_ONE_LOT_RISK_BUFFER_PCT: 10,
+      FNO_MIN_LOT_POLICY: "STRICT",
+    },
+    lotSize: 50,
+    riskBudgetInr: 1800,
+    strategyRiskFit: {
+      fitsMinTradable: false,
+      oneLotAllInRiskInr: 2400,
+      breachPct: 33.33,
+    },
+    sizingRiskFit: {
+      fitsMinTradable: false,
+      oneLotAllInRiskInr: 2300,
+      breachPct: 27.78,
+    },
+    riskFitMode: "FIT",
+    minLotPolicy: "STRICT",
+  }),
+  {
+    allowOneLot: false,
+    hardReject: true,
+    riskFitDecision: "REJECT",
+    riskFitMode: "FIT",
+    riskBreachState: "NONE",
+    originalRiskInr: 2400,
+    adjustedRiskInr: 2300,
+    riskBreachPct: 27.78,
+    riskBreachTag: null,
+    bufferPctAllowed: 10,
   },
 );
 

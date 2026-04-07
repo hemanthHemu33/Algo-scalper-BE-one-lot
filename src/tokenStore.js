@@ -9,6 +9,7 @@ async function readLatestTokenDoc() {
   const filter = {};
   if (env.TOKEN_FILTER_USER_ID) filter.user_id = env.TOKEN_FILTER_USER_ID;
   if (env.TOKEN_FILTER_API_KEY) filter.api_key = env.TOKEN_FILTER_API_KEY;
+  if (env.TOKEN_FILTER_ENV) filter.environment = env.TOKEN_FILTER_ENV;
 
   const doc = await col
     .aggregate([
@@ -57,7 +58,12 @@ async function readLatestTokenDoc() {
     doc.updatedAt = doc.createdAt;
   }
 
-  return { doc, accessToken: String(accessToken) };
+  return {
+    doc,
+    accessToken: String(accessToken),
+    filter,
+    collection: env.TOKENS_COLLECTION,
+  };
 }
 
 module.exports = { readLatestTokenDoc };
