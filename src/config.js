@@ -205,6 +205,7 @@ const schema = z.object({
   KITE_BLOCK_PREV_DAY_TOKEN: boolFromEnv.default(true),
   KITE_MAX_MODIFICATIONS_PER_ORDER: z.coerce.number().default(25),
   KITE_USE_AUTOSLICE: boolFromEnv.default(true),
+  KITE_HTTP_TIMEOUT_MS: z.coerce.number().default(15000),
   KITE_ENTRY_VALIDITY: z.enum(["DAY", "TTL"]).default("TTL"),
   KITE_ENTRY_VALIDITY_TTL_MIN: z.coerce.number().default(1),
 

@@ -1,11 +1,54 @@
+const http = require("node:http");
+const https = require("node:https");
 const KiteConnect = require("kiteconnect").KiteConnect;
 const KiteTicker = require("kiteconnect").KiteTicker;
+const { env } = require("../config");
 const { logger } = require("../logger");
 const { halt } = require("../runtime/halt");
 const { reportFault } = require("../runtime/errorBus");
 
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
+}
+
+let sharedHttpAgent = null;
+let sharedHttpsAgent = null;
+
+function kiteHttpTimeoutMs() {
+  const ms = Number(env.KITE_HTTP_TIMEOUT_MS);
+  return Number.isFinite(ms) && ms >= 1000 ? Math.floor(ms) : 15000;
+}
+
+function getSharedAgents() {
+  if (!sharedHttpAgent) {
+    sharedHttpAgent = new http.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 16,
+    });
+  }
+  if (!sharedHttpsAgent) {
+    sharedHttpsAgent = new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 16,
+    });
+  }
+  return {
+    httpAgent: sharedHttpAgent,
+    httpsAgent: sharedHttpsAgent,
+  };
+}
+
+function applyTransportTuning(kc) {
+  const timeout = kiteHttpTimeoutMs();
+  kc.timeout = timeout;
+
+  if (!kc?.requestInstance?.defaults) return kc;
+
+  kc.requestInstance.defaults.timeout = timeout;
+  Object.assign(kc.requestInstance.defaults, getSharedAgents());
+  return kc;
 }
 
 function isAuthError(err) {
@@ -54,7 +97,16 @@ async function withRetry(fn, { name, attempts = 3, baseDelayMs = 250 } = {}) {
       if (i === attempts - 1) break;
       const jitter = Math.floor(Math.random() * 100);
       const wait = baseDelayMs * Math.pow(2, i) + jitter;
-      logger.warn({ name, attempt: i + 1, wait, e: e.message }, "[kite] call failed; retrying");
+      logger.warn(
+        {
+          name,
+          attempt: i + 1,
+          wait,
+          timeoutMs: kiteHttpTimeoutMs(),
+          e: e.message,
+        },
+        "[kite] call failed; retrying",
+      );
       await sleep(wait);
     }
   }
@@ -114,8 +166,12 @@ function wrapKiteConnect(kc) {
 }
 
 function createKiteConnect({ apiKey, accessToken }) {
-  const kc = new KiteConnect({ api_key: apiKey });
+  const kc = new KiteConnect({
+    api_key: apiKey,
+    timeout: kiteHttpTimeoutMs(),
+  });
   kc.setAccessToken(accessToken);
+  applyTransportTuning(kc);
   return wrapKiteConnect(kc);
 }
 
@@ -128,4 +184,8 @@ function createTicker({ apiKey, accessToken }) {
   return t;
 }
 
-module.exports = { createKiteConnect, createTicker };
+module.exports = {
+  createKiteConnect,
+  createTicker,
+  kiteHttpTimeoutMs,
+};
