@@ -34,6 +34,82 @@ assert.equal(normalized.exitFamily, "LOSS_CONTAINMENT");
 assert.equal(normalized.exitReasonCode, "HARD_SL");
 assert.equal(normalized.exitAuthority, "STOP_ORDER");
 
+const loserExitNormalized = normalizeTradeLifecycleState({
+  side: "BUY",
+  entryPrice: 100,
+  initialStopLoss: 90,
+  executionRiskInr: 1000,
+  exitReason: "ALC_EXIT_NOW",
+  loserCompressionTargetState: "L2",
+  loserCompressionSubmittedState: "L1",
+  loserCompressionAppliedState: "L1",
+  loserCompressionPendingAction: "STOP_MODIFY",
+  loserCompressionPendingSince: "2026-01-01T09:16:00.000Z",
+  loserCompressionLastRequestedStop: 94.5,
+  loserCompressionLastConfirmedStop: 95,
+  loserCompressionLastAttemptAt: "2026-01-01T09:16:10.000Z",
+  loserCompressionLastConfirmedAt: "2026-01-01T09:16:15.000Z",
+  loserCompressionAppliedSource: "ALC_L1",
+  loserCompressionAppliedConfirmed: true,
+  loserCompressionAttributionConfidence: "HIGH",
+  loserCompressionRetryCount: 2,
+  loserCompressionBlockedReason: "ALC_BLOCKED_PENDING_MODIFY",
+  loserCompressionLastAction: "COMPRESS_L2",
+  loserCompressionTriggeredAt: "2026-01-01T09:16:00.000Z",
+  loserExitTriggered: true,
+  loserExitReasonCode: "ALC_EXIT_NOW",
+});
+assert.equal(loserExitNormalized.exitFamily, "LOSS_CONTAINMENT");
+assert.equal(loserExitNormalized.exitReasonCode, "ALC_EXIT_NOW");
+assert.equal(loserExitNormalized.exitAuthority, "ADAPTIVE_LOSER_ENGINE");
+assert.equal(loserExitNormalized.loserCompressionTargetState, "L2");
+assert.equal(loserExitNormalized.loserCompressionSubmittedState, "L1");
+assert.equal(loserExitNormalized.loserCompressionAppliedState, "L1");
+assert.equal(loserExitNormalized.loserCompressionPendingAction, "STOP_MODIFY");
+assert.equal(
+  loserExitNormalized.loserCompressionPendingSince,
+  "2026-01-01T09:16:00.000Z",
+);
+assert.equal(loserExitNormalized.loserCompressionLastRequestedStop, 94.5);
+assert.equal(loserExitNormalized.loserCompressionLastConfirmedStop, 95);
+assert.equal(
+  loserExitNormalized.loserCompressionLastAttemptAt,
+  "2026-01-01T09:16:10.000Z",
+);
+assert.equal(
+  loserExitNormalized.loserCompressionLastConfirmedAt,
+  "2026-01-01T09:16:15.000Z",
+);
+assert.equal(loserExitNormalized.loserCompressionAppliedSource, "ALC_L1");
+assert.equal(loserExitNormalized.loserCompressionAppliedConfirmed, true);
+assert.equal(
+  loserExitNormalized.loserCompressionAttributionConfidence,
+  "HIGH",
+);
+assert.equal(loserExitNormalized.loserCompressionRetryCount, 2);
+assert.equal(
+  loserExitNormalized.loserCompressionBlockedReason,
+  "ALC_BLOCKED_PENDING_MODIFY",
+);
+assert.equal(loserExitNormalized.loserCompressionLastAction, "COMPRESS_L2");
+assert.equal(
+  loserExitNormalized.loserCompressionTriggeredAt,
+  "2026-01-01T09:16:00.000Z",
+);
+assert.equal(loserExitNormalized.loserExitTriggered, true);
+assert.equal(loserExitNormalized.loserExitReasonCode, "ALC_EXIT_NOW");
+assert.equal(loserExitNormalized.alcRequested, true);
+assert.equal(loserExitNormalized.alcRequestedLevel, "L2");
+assert.equal(loserExitNormalized.alcAppliedLevel, "L1");
+assert.equal(loserExitNormalized.alcAppliedSource, "ALC_L1");
+assert.equal(loserExitNormalized.alcAttributionConfidence, "HIGH");
+assert.equal(loserExitNormalized.alcRequestedButNotApplied, false);
+assert.equal(loserExitNormalized.alcAppliedButSuperseded, false);
+assert.equal(loserExitNormalized.alcSupersededBy, null);
+assert.equal(loserExitNormalized.alcFinalProtectionOwner, "ALC_EXIT_NOW");
+assert.equal(loserExitNormalized.alcSavedRiskR, 0.5);
+assert.equal(loserExitNormalized.alcSavedRiskInr, 500);
+
 assert.equal(deriveStopExitReasonCode({}), "HARD_SL");
 assert.equal(deriveStopExitReasonCode({ beLocked: true }), "HARD_SL");
 assert.equal(

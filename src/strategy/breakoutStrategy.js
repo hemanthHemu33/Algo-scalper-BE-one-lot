@@ -34,6 +34,7 @@ function breakoutCandidate({
     actionable,
     meta: {
       triggerLevel: side === "BUY" ? hi : lo,
+      anchorValue: side === "BUY" ? hi : lo,
       lookback,
       lookbackUsed,
       rangeHigh: hi,

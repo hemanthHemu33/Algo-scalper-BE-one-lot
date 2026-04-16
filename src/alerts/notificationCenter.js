@@ -1,6 +1,6 @@
 const { getDb } = require("../db");
 const { ObjectId } = require("mongodb");
-const { alert } = require("./alertService");
+const { dispatchNotification } = require("./alertService");
 const { reportFault } = require("../runtime/errorBus");
 
 const CHANNELS = "notification_channels";
@@ -56,10 +56,23 @@ async function listIncidents({ limit = 100 } = {}) {
 }
 
 async function emitNotification({ type, message, severity, meta }) {
-  await recordIncident({ type, message, severity, meta });
-
   try {
-    await alert(severity, message, meta);
+    await dispatchNotification({
+      kind: "incident",
+      severity: severity || "info",
+      entityType: meta?.tradeId ? "trade" : "engine",
+      entityId: meta?.tradeId || type || "notification_center",
+      tradeId: meta?.tradeId || null,
+      dedupeKey: `notification_center:${String(type || "incident").toUpperCase()}:${meta?.tradeId || "global"}`,
+      event: String(type || "incident").toUpperCase(),
+      status: meta?.status || null,
+      source: "notification_center",
+      payload: {
+        message: message || "",
+        meta: meta || null,
+      },
+      createdAt: new Date().toISOString(),
+    });
   } catch (err) { reportFault({ code: "ALERTS_NOTIFICATIONCENTER_CATCH", err, message: "[src/alerts/notificationCenter.js] caught and continued" }); }
 
   let db;

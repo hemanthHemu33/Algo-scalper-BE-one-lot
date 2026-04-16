@@ -1,6 +1,6 @@
 const { env } = require("../config");
 const { logger } = require("../logger");
-const { alert } = require("../alerts/alertService");
+const { dispatchNotification } = require("../alerts/alertService");
 const { reportFault } = require("./errorBus");
 
 function classifyLifecycleEvent(event) {
@@ -27,7 +27,21 @@ async function notifyLifecycle(event, payload = {}) {
   logger[meta.level]?.({ event, payload }, meta.message);
 
   try {
-    await alert(meta.level, meta.message, { event, ...payload });
+    await dispatchNotification({
+      kind: "incident",
+      severity: meta.level,
+      entityType: "engine",
+      entityId: "lifecycle",
+      dedupeKey: `engine:lifecycle:${String(event || "UNKNOWN").toUpperCase()}`,
+      event: String(event || "UNKNOWN").toUpperCase(),
+      status: payload?.mode || null,
+      source: "engine_lifecycle",
+      payload: {
+        message: meta.message,
+        meta: { event, ...payload },
+      },
+      createdAt: new Date().toISOString(),
+    });
     return { ok: true, skipped: false };
   } catch (err) {
     reportFault({

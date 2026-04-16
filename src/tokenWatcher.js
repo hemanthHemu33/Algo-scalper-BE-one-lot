@@ -1,10 +1,9 @@
-// src/tokenWatcher.js
 const { env } = require("./config");
 const { logger } = require("./logger");
 const { alert } = require("./alerts/alertService");
 const { getDb } = require("./db");
 const { readLatestTokenDoc } = require("./tokenStore");
-const { reportFault } = require("./runtime/errorBus");
+const { reportFault, reportWindowedFault } = require("./runtime/errorBus");
 const {
   invalidateStoredSession,
   isTokenFromPreviousTradingDay,
@@ -12,12 +11,19 @@ const {
   clearTrackedSession,
 } = require("./kite/sessionControl");
 const { updateLivePreflightContext } = require("./runtime/livePreflight");
+const { isTransientMongoError } = require("./runtime/isTransientMongoError");
+const {
+  markMongoHealthy,
+  markMongoDegraded,
+} = require("./runtime/mongoRuntimeState");
 
 const watcherState = {
   lastReason: null,
   lastUpdatedAt: null,
   missing: false,
-  activeEnvironment: String(env.TOKEN_FILTER_ENV || env.APP_ENV || env.NODE_ENV || "local"),
+  activeEnvironment: String(
+    env.TOKEN_FILTER_ENV || env.APP_ENV || env.NODE_ENV || "local",
+  ),
   activeSource: null,
   staleTokenBlockedAt: null,
 };
@@ -26,19 +32,30 @@ function getTokenWatcherStatus() {
   return { ...watcherState };
 }
 
+function isMongoWatcherTransientError(error) {
+  return (
+    isTransientMongoError(error) ||
+    String(error?.message || "").includes("Mongo not connected yet")
+  );
+}
+
 async function watchLatestToken({ onToken }) {
-  const db = getDb();
-  const col = db.collection(env.TOKENS_COLLECTION);
-
   let lastToken = null;
-
-  // Missing-token notification state (avoid spamming)
+  let changeStream = null;
+  let changeStreamDisabled = false;
+  let pollTimer = null;
+  let refreshInFlight = null;
+  let stopped = false;
   let missing = false;
   let lastMissingAlertAt = 0;
+  let mongoDegraded = false;
+  let mongoBackoffMs = 0;
+
+  const pollMs = Math.max(5000, Number(env.TOKEN_POLL_INTERVAL_MS ?? 30000));
 
   const maybeNotifyMissing = async (meta) => {
     const now = Date.now();
-    const everyMs = 30 * 60 * 1000; // 30 minutes
+    const everyMs = 30 * 60 * 1000;
     if (now - lastMissingAlertAt < everyMs) return;
 
     lastMissingAlertAt = now;
@@ -53,15 +70,73 @@ async function watchLatestToken({ onToken }) {
     logger.error(details, "[tokenWatcher] kite access token missing");
     alert(
       "warn",
-      "🔑 Kite access token missing. Please login to Kite and sync token to Mongo.",
-      details
-    ).catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
+      "ðŸ”‘ Kite access token missing. Please login to Kite and sync token to Mongo.",
+      details,
+    ).catch((err) => {
+      reportFault({
+        code: "TOKENWATCHER_ASYNC",
+        err,
+        message: "[src/tokenWatcher.js] async task failed",
+      });
+    });
+  };
+
+  const schedulePoll = (delayMs = pollMs) => {
+    if (stopped) return;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      runRefresh("poll").catch((err) => {
+        reportFault({
+          code: "TOKENWATCHER_ASYNC",
+          err,
+          message: "[src/tokenWatcher.js] async task failed",
+        });
+      });
+    }, Math.max(1000, Number(delayMs) || pollMs));
+    pollTimer.unref?.();
+  };
+
+  const nextMongoBackoffMs = () => {
+    mongoBackoffMs = mongoBackoffMs
+      ? Math.min(mongoBackoffMs * 2, 30_000)
+      : 1_000;
+    return mongoBackoffMs;
+  };
+
+  const clearMongoDegraded = () => {
+    if (!mongoDegraded) {
+      mongoBackoffMs = 0;
+      return;
+    }
+    mongoDegraded = false;
+    mongoBackoffMs = 0;
+    markMongoHealthy();
+    logger.info("[tokenWatcher] mongo recovered");
+  };
+
+  const deferForMongo = (error, reason) => {
+    const backoffMs = nextMongoBackoffMs();
+    mongoDegraded = true;
+    markMongoDegraded({
+      error,
+      reason: `token_watcher_${reason}`,
+    });
+    reportWindowedFault({
+      windowKey: "token_watcher_mongo_degraded",
+      windowMs: 30_000,
+      code: "TOKENWATCHER_MONGO_DEGRADED",
+      err: error,
+      message: "[tokenWatcher] mongo degraded; watcher deferred",
+      meta: { reason, backoffMs },
+    });
+    schedulePoll(backoffMs);
+    return { ok: false, deferred: true, backoffMs };
   };
 
   const refreshAndNotify = async (reason = "manual") => {
     const res = await readLatestTokenDoc();
 
-    // No doc / no access token -> keep the process alive and notify operator.
     if (!res?.accessToken) {
       if (!missing) {
         missing = true;
@@ -79,16 +154,17 @@ async function watchLatestToken({ onToken }) {
           collection: res?.collection || env.TOKENS_COLLECTION,
           filter: res?.filter || {},
         },
-        "[tokenWatcher] no usable kite token. Engine will stay up and wait."
+        "[tokenWatcher] no usable kite token. Engine will stay up and wait.",
       );
       await maybeNotifyMissing(res);
-      return;
+      return { ok: true, waiting: true, reason: res?.reason || "NO_TOKEN" };
     }
 
     const accessToken = String(res.accessToken);
     missing = false;
     watcherState.missing = false;
-    watcherState.lastUpdatedAt = res?.doc?.updatedAt || res?.doc?.createdAt || null;
+    watcherState.lastUpdatedAt =
+      res?.doc?.updatedAt || res?.doc?.createdAt || null;
     watcherState.activeSource = res?.doc?.sessionSource || "token_store";
 
     if (
@@ -129,10 +205,13 @@ async function watchLatestToken({ onToken }) {
         ...res,
         reason: "PREVIOUS_TRADING_DAY_TOKEN",
       });
-      return;
+      return { ok: true, blocked: true };
     }
 
-    if (accessToken === lastToken) return;
+    if (accessToken === lastToken) {
+      watcherState.lastReason = reason;
+      return { ok: true, unchanged: true };
+    }
 
     lastToken = accessToken;
     watcherState.lastReason = reason;
@@ -150,55 +229,128 @@ async function watchLatestToken({ onToken }) {
           res?.doc?.environment || env.TOKEN_FILTER_ENV || env.APP_ENV || null,
         sessionSource: res?.doc?.sessionSource || null,
       },
-      "[token] loaded/updated"
+      "[token] loaded/updated",
     );
-    alert("info", "🔑 Kite token loaded/updated").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
+    alert("info", "ðŸ”‘ Kite token loaded/updated").catch((err) => {
+      reportFault({
+        code: "TOKENWATCHER_ASYNC",
+        err,
+        message: "[src/tokenWatcher.js] async task failed",
+      });
+    });
     await onToken(accessToken, res?.doc || null, reason);
+    return { ok: true, updated: true };
   };
 
-  // Initial refresh should never crash the app now
-  await refreshAndNotify("startup");
+  const maybeStartChangeStream = async () => {
+    if (stopped || changeStream || changeStreamDisabled) return;
 
-  // Best-effort: Change stream watch (replica set / Atlas)
-  let changeStream = null;
-  try {
-    changeStream = col.watch([], { fullDocument: "updateLookup" });
-    changeStream.on("change", async () => {
-      try {
-        await refreshAndNotify("change_stream");
-      } catch (e) {
-        logger.warn(
-          { e: e.message },
-          "[tokenWatcher] refresh failed on change"
-        );
+    let col;
+    try {
+      col = getDb().collection(env.TOKENS_COLLECTION);
+    } catch (error) {
+      if (isMongoWatcherTransientError(error)) {
+        deferForMongo(error, "change_stream_start");
+        return;
       }
-    });
-    changeStream.on("error", (err) => {
+      throw error;
+    }
+
+    try {
+      changeStream = col.watch([], { fullDocument: "updateLookup" });
+      changeStream.on("change", () => {
+        runRefresh("change_stream").catch((err) => {
+          reportFault({
+            code: "TOKENWATCHER_ASYNC",
+            err,
+            message: "[src/tokenWatcher.js] async task failed",
+          });
+        });
+      });
+      changeStream.on("error", (err) => {
+        changeStream = null;
+        if (isMongoWatcherTransientError(err)) {
+          reportWindowedFault({
+            windowKey: "token_watcher_change_stream_degraded",
+            windowMs: 30_000,
+            code: "TOKENWATCHER_CHANGE_STREAM_DEGRADED",
+            err,
+            message: "[tokenWatcher] change stream degraded (will rely on polling)",
+          });
+          deferForMongo(err, "change_stream_error");
+          return;
+        }
+        logger.warn(
+          { e: err?.message || String(err) },
+          "[tokenWatcher] change stream error (will rely on polling)",
+        );
+        changeStreamDisabled = true;
+      });
+      logger.info("[tokenWatcher] change stream started (collection-wide)");
+    } catch (e) {
+      if (isMongoWatcherTransientError(e)) {
+        reportWindowedFault({
+          windowKey: "token_watcher_change_stream_start",
+          windowMs: 30_000,
+          code: "TOKENWATCHER_CHANGE_STREAM_START",
+          err: e,
+          message: "[tokenWatcher] change stream degraded (will rely on polling)",
+        });
+        deferForMongo(e, "change_stream_start");
+        return;
+      }
       logger.warn(
-        { e: err?.message || String(err) },
-        "[tokenWatcher] change stream error (will rely on polling)"
+        { e: e?.message || String(e) },
+        "[tokenWatcher] change streams not available (will rely on polling)",
       );
-    });
-    logger.info("[tokenWatcher] change stream started (collection-wide)");
-  } catch (e) {
-    logger.warn(
-      { e: e.message },
-      "[tokenWatcher] change streams not available (will rely on polling)"
-    );
+      changeStreamDisabled = true;
+    }
+  };
+
+  const runRefresh = async (reason) => {
+    if (refreshInFlight) return refreshInFlight;
+
+    refreshInFlight = (async () => {
+      try {
+        const result = await refreshAndNotify(reason);
+        clearMongoDegraded();
+        await maybeStartChangeStream();
+        schedulePoll(pollMs);
+        return result;
+      } catch (error) {
+        if (isMongoWatcherTransientError(error)) {
+          return deferForMongo(error, reason);
+        }
+        throw error;
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+
+    return refreshInFlight;
+  };
+
+  try {
+    await runRefresh("startup");
+  } catch (error) {
+    if (!isMongoWatcherTransientError(error)) {
+      throw error;
+    }
   }
 
-  // Polling fallback: keeps working even if change streams are not supported
-  const pollMs = Math.max(5000, Number(env.TOKEN_POLL_INTERVAL_MS ?? 30000));
-  const interval = setInterval(() => {
-    refreshAndNotify("poll").catch((err) => { reportFault({ code: "TOKENWATCHER_ASYNC", err, message: "[src/tokenWatcher.js] async task failed" }); });
-  }, pollMs);
-
   return () => {
-    clearInterval(interval);
+    stopped = true;
+    if (pollTimer) clearTimeout(pollTimer);
     if (changeStream) {
       try {
         changeStream.close();
-      } catch (err) { reportFault({ code: "TOKENWATCHER_CATCH", err, message: "[src/tokenWatcher.js] caught and continued" }); }
+      } catch (err) {
+        reportFault({
+          code: "TOKENWATCHER_CATCH",
+          err,
+          message: "[src/tokenWatcher.js] caught and continued",
+        });
+      }
     }
   };
 }

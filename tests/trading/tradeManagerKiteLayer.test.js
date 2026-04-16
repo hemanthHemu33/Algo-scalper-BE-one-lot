@@ -113,7 +113,7 @@ function makeRiskEngine() {
   };
 }
 
-async function testEntryOrdersApplyTtlAndAutoslice() {
+async function testEntryOrdersApplyTtlWithoutAutosliceBelowFreeze() {
   const placeCalls = [];
 
   const harness = loadTradeManagerHarness({
@@ -165,10 +165,85 @@ async function testEntryOrdersApplyTtlAndAutoslice() {
         validity: "DAY",
         tag: "ENTRY-TAG",
       },
-      { purpose: "ENTRY", tradeId: "T-ENTRY" },
+      {
+          purpose: "ENTRY",
+          tradeId: "T-ENTRY",
+          instrument: { exchange: "NFO", freeze_qty: 1800 },
+        },
     );
 
     assert.equal(result.orderId, "ENTRY-1");
+    assert.equal(placeCalls.length, 1);
+    assert.equal(placeCalls[0].autoslice, undefined);
+    assert.equal(placeCalls[0].validity, "TTL");
+    assert.equal(placeCalls[0].validity_ttl, 1);
+    assert.equal(tm._autosliceUsedToday, 0);
+    assert.equal(tm._ttlEntryUsedToday, 1);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testEntryOrdersApplyTtlAndAutosliceAboveFreeze() {
+  const placeCalls = [];
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      upsertDailyRisk: async () => {},
+    },
+    envOverrides: {
+      TRADING_ENABLED: "false",
+      KITE_USE_AUTOSLICE: true,
+      KITE_ENTRY_VALIDITY: "TTL",
+      KITE_ENTRY_VALIDITY_TTL_MIN: 1,
+      MAX_ORDERS_PER_DAY: 5000,
+    },
+    livePreflightOverrides: {
+      refreshLivePreflight: async () => ({
+        ok: true,
+        requestedByEnv: false,
+        warnings: [],
+        blockingReasons: [],
+        details: {},
+      }),
+      updateLivePreflightContext: () => {},
+      getEffectiveLiveEnabled: () => false,
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {
+        placeOrder: async (_variety, params) => {
+          placeCalls.push(params);
+          return { order_id: "ENTRY-2" };
+        },
+      },
+      riskEngine: makeRiskEngine(),
+    });
+
+    const result = await tm._safePlaceOrder(
+      "regular",
+      {
+        exchange: "NFO",
+        tradingsymbol: "NIFTY26APR22500CE",
+        transaction_type: "BUY",
+        quantity: 1875,
+        product: "MIS",
+        order_type: "LIMIT",
+        price: 123.45,
+        validity: "DAY",
+        tag: "ENTRY-TAG-2",
+      },
+      {
+        purpose: "ENTRY",
+        tradeId: "T-ENTRY-2",
+        instrument: { exchange: "NFO", freeze_qty: 1800 },
+      },
+    );
+
+    assert.equal(result.orderId, "ENTRY-2");
     assert.equal(placeCalls.length, 1);
     assert.equal(placeCalls[0].autoslice, true);
     assert.equal(placeCalls[0].validity, "TTL");
@@ -301,7 +376,8 @@ async function testModifyCapTriggersCancelReplace() {
 }
 
 async function main() {
-  await testEntryOrdersApplyTtlAndAutoslice();
+  await testEntryOrdersApplyTtlWithoutAutosliceBelowFreeze();
+  await testEntryOrdersApplyTtlAndAutosliceAboveFreeze();
   await testModifyCapTriggersCancelReplace();
   console.log("tradeManagerKiteLayer.test.js passed");
 }

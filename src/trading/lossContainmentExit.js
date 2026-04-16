@@ -691,4 +691,12 @@ function applyLossContainmentExitRules({
   };
 }
 
-module.exports = { applyLossContainmentExitRules };
+module.exports = {
+  adverseUnderlyingBps,
+  applyLossContainmentExitRules,
+  barMsFromTrade,
+  resolveStructureBuffer,
+  resolveStructureReference,
+  structureBreachAmount,
+  structureObservedPrice,
+};

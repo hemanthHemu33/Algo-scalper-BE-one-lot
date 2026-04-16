@@ -68,6 +68,13 @@ function enabledStrategyIds() {
     .filter(Boolean);
 }
 
+function assertEnabledStrategyAdmissionProfiles(options = {}) {
+  const {
+    assertRuntimeAdmissionProfiles,
+  } = require("../trading/admissionProfiles");
+  return assertRuntimeAdmissionProfiles(enabledStrategyIds(), options);
+}
+
 function wrapSignalAsSetup(signal, opts = {}) {
   if (!signal) return null;
   return {
@@ -323,6 +330,7 @@ function runStrategy(strategyId, candles, ctx = {}) {
 
 module.exports = {
   enabledStrategyIds,
+  assertEnabledStrategyAdmissionProfiles,
   evaluateSetup,
   runStrategy,
   getStrategyMeta,

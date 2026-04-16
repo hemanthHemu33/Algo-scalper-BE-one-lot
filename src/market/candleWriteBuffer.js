@@ -1,7 +1,12 @@
 const { env } = require("../config");
 const { insertManyCandles } = require("./candleStore");
 const { logger } = require("../logger");
-const { reportFault } = require("../runtime/errorBus");
+const { reportFault, reportWindowedFault } = require("../runtime/errorBus");
+const { isTransientMongoError } = require("../runtime/isTransientMongoError");
+const {
+  markMongoHealthy,
+  markMongoDegraded,
+} = require("../runtime/mongoRuntimeState");
 
 function _bool(v, def = false) {
   if (v === undefined || v === null) return def;
@@ -28,6 +33,9 @@ class CandleWriteBuffer {
     this.totalBuffered = 0;
     this.dropped = 0;
     this._lastDropLogAt = 0;
+    this._mongoDegraded = false;
+    this._mongoBackoffMs = 0;
+    this._nextFlushAt = 0;
   }
 
   start() {
@@ -44,7 +52,7 @@ class CandleWriteBuffer {
       clearInterval(this._timer);
       this._timer = null;
     }
-    await this.flush().catch((err) => { reportFault({ code: "MARKET_CANDLEWRITEBUFFER_ASYNC", err, message: "[src/market/candleWriteBuffer.js] async task failed" }); });
+    await this.flush({ force: true }).catch((err) => { reportFault({ code: "MARKET_CANDLEWRITEBUFFER_ASYNC", err, message: "[src/market/candleWriteBuffer.js] async task failed" }); });
   }
 
   enqueue(candle) {
@@ -88,9 +96,48 @@ class CandleWriteBuffer {
     };
   }
 
-  async flush() {
+  _nextMongoBackoffMs() {
+    this._mongoBackoffMs = this._mongoBackoffMs
+      ? Math.min(this._mongoBackoffMs * 2, 20_000)
+      : 1_000;
+    this._nextFlushAt = Date.now() + this._mongoBackoffMs;
+    return this._mongoBackoffMs;
+  }
+
+  _markMongoRecovered() {
+    if (!this._mongoDegraded) {
+      this._mongoBackoffMs = 0;
+      this._nextFlushAt = 0;
+      return;
+    }
+    this._mongoDegraded = false;
+    this._mongoBackoffMs = 0;
+    this._nextFlushAt = 0;
+    markMongoHealthy();
+    logger.info("[candle-writer] mongo recovered; flush resumed");
+  }
+
+  _deferMongoFlush(error, intervalMin) {
+    const backoffMs = this._nextMongoBackoffMs();
+    this._mongoDegraded = true;
+    markMongoDegraded({
+      error,
+      reason: "candle_write_buffer_flush",
+    });
+    reportWindowedFault({
+      windowKey: "candle_writer_mongo_degraded",
+      windowMs: 30_000,
+      code: "CANDLE_WRITER_MONGO_DEGRADED",
+      err: error,
+      message: "[candle-writer] mongo degraded; flush deferred",
+      meta: { intervalMin, backoffMs, totalBuffered: this.totalBuffered },
+    });
+  }
+
+  async flush({ force = false } = {}) {
     if (!this.enabled) return;
     if (!this.totalBuffered) return;
+    if (!force && this._nextFlushAt && Date.now() < this._nextFlushAt) return;
 
     // Serialize flushes (avoid overlapping bulkWrite)
     this._serial = this._serial.then(async () => {
@@ -106,13 +153,22 @@ class CandleWriteBuffer {
           try {
             await insertManyCandles(intervalMin, batch);
             this.totalBuffered -= batch.length;
+            this._markMongoRecovered();
           } catch (e) {
             // Put back and retry later
             arr.unshift(...batch);
-            logger.warn(
-              { intervalMin, e: e?.message || String(e) },
-              "[candle-writer] bulkWrite failed; will retry",
-            );
+            if (isTransientMongoError(e)) {
+              this._deferMongoFlush(e, intervalMin);
+              return;
+            }
+            reportWindowedFault({
+              windowKey: "candle_writer_flush_failed",
+              windowMs: 30_000,
+              code: "CANDLE_WRITER_FLUSH_FAILED",
+              err: e,
+              message: "[candle-writer] bulkWrite failed; will retry",
+              meta: { intervalMin, totalBuffered: this.totalBuffered },
+            });
             return;
           }
         }

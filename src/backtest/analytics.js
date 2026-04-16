@@ -103,6 +103,52 @@ function normalizeBacktestTrade(trade, context = {}) {
     trailHit: Boolean(trade?.trailHit),
     earlyFailArmed: Boolean(trade?.earlyFailArmed),
     earlyFailReason: trade?.earlyFailReason || null,
+    loserCompressionDesiredAction:
+      normalized.loserCompressionDesiredAction || "HOLD",
+    loserCompressionTargetState:
+      normalized.loserCompressionTargetState || "NONE",
+    loserCompressionSubmittedState:
+      normalized.loserCompressionSubmittedState || "NONE",
+    loserCompressionAppliedState:
+      normalized.loserCompressionAppliedState || "NONE",
+    loserCompressionRetryCount: n(normalized.loserCompressionRetryCount, 0),
+    loserCompressionBlockedReason:
+      normalized.loserCompressionBlockedReason || null,
+    loserCompressionLastRequestedStop: n(
+      normalized.loserCompressionLastRequestedStop,
+      null,
+    ),
+    loserCompressionLastConfirmedStop: n(
+      normalized.loserCompressionLastConfirmedStop,
+      null,
+    ),
+    loserCompressionAppliedSource:
+      normalized.loserCompressionAppliedSource || null,
+    loserCompressionAppliedConfirmed: Boolean(
+      normalized.loserCompressionAppliedConfirmed,
+    ),
+    loserCompressionAttributionConfidence:
+      normalized.loserCompressionAttributionConfidence || null,
+    alcRequested: Boolean(normalized.alcRequested),
+    alcAppliedConfirmed: Boolean(normalized.alcAppliedConfirmed),
+    alcRequestedLevel: normalized.alcRequestedLevel || null,
+    alcAppliedLevel: normalized.alcAppliedLevel || null,
+    alcAppliedSource: normalized.alcAppliedSource || null,
+    alcAttributionConfidence:
+      normalized.alcAttributionConfidence || null,
+    alcRequestedButNotApplied: Boolean(
+      normalized.alcRequestedButNotApplied,
+    ),
+    alcAppliedButSuperseded: Boolean(
+      normalized.alcAppliedButSuperseded,
+    ),
+    alcSupersededBy: normalized.alcSupersededBy || null,
+    alcFinalProtectionOwner:
+      normalized.alcFinalProtectionOwner || null,
+    alcSavedRiskR: n(normalized.alcSavedRiskR, null),
+    alcSavedRiskInr: n(normalized.alcSavedRiskInr, null),
+    loserExitTriggered: Boolean(normalized.loserExitTriggered),
+    loserExitReasonCode: normalized.loserExitReasonCode || null,
     executionSpreadBpsEntry: n(trade?.entryExecutionModel?.spreadBps, null),
     executionSlippageBpsEntry: n(trade?.entryExecutionModel?.slippageBps, null),
     executionLatencyBarsEntry: n(trade?.entryExecutionModel?.latencyBars, null),
@@ -322,6 +368,77 @@ function buildAnalytics({
     ? Math.max(...generatedCurves.drawdownCurve.map((row) => n(row.drawdownPct)))
     : 0;
   const forcedExitCount = trades.filter((trade) => Boolean(trade.forcedExit)).length;
+  const alcTrades = trades.filter(
+    (trade) =>
+      Boolean(trade?.alcRequested) ||
+      String(trade?.loserCompressionTargetState || "NONE").toUpperCase() !==
+        "NONE",
+  );
+  const alcBlockedCountByReason = alcTrades.reduce((acc, trade) => {
+    const reason = String(trade?.loserCompressionBlockedReason || "").trim();
+    if (!reason) return acc;
+    acc[reason] = (acc[reason] || 0) + 1;
+    return acc;
+  }, {});
+  const alcActionDistributionByStrategy = alcTrades.reduce((acc, trade) => {
+    const strategy = String(trade?.strategyId || "UNKNOWN");
+    const action = String(
+      trade?.loserCompressionDesiredAction ||
+        trade?.alcRequestedLevel ||
+        trade?.loserCompressionTargetState ||
+        "UNKNOWN",
+    );
+    const key = `${strategy}|${action}`;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const alcActionDistributionByRegime = alcTrades.reduce((acc, trade) => {
+    const regime = String(trade?.regime || "UNKNOWN");
+    const action = String(
+      trade?.loserCompressionDesiredAction ||
+        trade?.alcRequestedLevel ||
+        trade?.loserCompressionTargetState ||
+        "UNKNOWN",
+    );
+    const key = `${regime}|${action}`;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const alcActionDistributionBySpreadRegime = alcTrades.reduce((acc, trade) => {
+    const entrySpreadBps = n(
+      trade?.executionSpreadBpsEntry ?? trade?.entrySpread ?? trade?.spreadAtEntry,
+      null,
+    );
+    const spreadRegime =
+      !Number.isFinite(entrySpreadBps) || entrySpreadBps <= 0
+        ? "UNKNOWN"
+        : entrySpreadBps >= 35
+          ? "WIDE"
+          : entrySpreadBps >= 20
+            ? "MID"
+            : "TIGHT";
+    const action = String(
+      trade?.loserCompressionDesiredAction ||
+        trade?.alcRequestedLevel ||
+        trade?.loserCompressionTargetState ||
+        "UNKNOWN",
+    );
+    const key = `${spreadRegime}|${action}`;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const alcSupersededBy = alcTrades.reduce((acc, trade) => {
+    const owner = String(trade?.alcSupersededBy || "").trim();
+    if (!owner) return acc;
+    acc[owner] = (acc[owner] || 0) + 1;
+    return acc;
+  }, {});
+  const alcFinalProtectionOwner = alcTrades.reduce((acc, trade) => {
+    const owner = String(trade?.alcFinalProtectionOwner || "").trim();
+    if (!owner) return acc;
+    acc[owner] = (acc[owner] || 0) + 1;
+    return acc;
+  }, {});
   const rejectedByDataIssues = rejectionLog.filter((row) => row.blockedByDataQuality).length;
   const governorBlockCounts = rejectionLog.reduce((acc, row) => {
     const code = normalizeReasonCode(row.rejectionReasonCode);
@@ -360,6 +477,24 @@ function buildAnalytics({
     rejectedByDataIssuesPct: admissionLog.length > 0 ? (rejectedByDataIssues / admissionLog.length) * 100 : 0,
     forcedExitPct: trades.length > 0 ? (forcedExitCount / trades.length) * 100 : 0,
     governorBlockCounts,
+    alcTriggeredCount: alcTrades.length,
+    alcL1Count: alcTrades.filter((trade) => String(trade?.alcRequestedLevel || trade?.loserCompressionTargetState).toUpperCase() === "L1").length,
+    alcL2Count: alcTrades.filter((trade) => String(trade?.alcRequestedLevel || trade?.loserCompressionTargetState).toUpperCase() === "L2").length,
+    alcExitNowCount: alcTrades.filter((trade) => String(trade?.alcRequestedLevel || trade?.loserCompressionTargetState).toUpperCase() === "EXIT").length,
+    alcRetryCount: alcTrades.reduce((acc, trade) => acc + n(trade?.loserCompressionRetryCount, 0), 0),
+    alcAppliedConfirmedCount: alcTrades.filter((trade) => Boolean(trade?.alcAppliedConfirmed || trade?.alcAppliedLevel || trade?.loserCompressionAppliedConfirmed)).length,
+    alcRequestedButNotAppliedCount: alcTrades.filter((trade) => Boolean(trade?.alcRequestedButNotApplied)).length,
+    alcSupersededCount: alcTrades.filter((trade) => Boolean(trade?.alcAppliedButSuperseded)).length,
+    alcAttributionLowConfidenceCount: alcTrades.filter((trade) => String(trade?.alcAttributionConfidence || "").toUpperCase() === "LOW").length,
+    alcSavedRiskR: alcTrades.reduce((acc, trade) => acc + n(trade?.alcSavedRiskR, 0), 0),
+    alcSavedRiskInr: alcTrades.reduce((acc, trade) => acc + n(trade?.alcSavedRiskInr, 0), 0),
+    alcBlockedCountByReason,
+    alcActionDistributionByStrategy,
+    alcActionDistributionByRegime,
+    alcActionDistributionBySpreadRegime,
+    alcSupersededBy,
+    alcFinalProtectionOwner,
+    alcFalsePositiveCandidates: alcTrades.filter((trade) => Boolean(trade?.alcRequested) && n(trade?.peakR, 0) >= 1 && String(trade?.alcAppliedLevel || "").toUpperCase() !== "EXIT").length,
     portfolio: portfolioSummary,
   };
 

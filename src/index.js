@@ -1,6 +1,10 @@
 const { env } = require("./config");
 const { logger } = require("./logger");
-const { alert } = require("./alerts/alertService");
+const {
+  alert,
+  startAlertService,
+  setNotificationHeartbeatProvider,
+} = require("./alerts/alertService");
 const { halt } = require("./runtime/halt");
 const { upsertDailyRisk } = require("./trading/tradeStore");
 const { DateTime } = require("luxon");
@@ -9,6 +13,7 @@ const { connectMongo } = require("./db");
 const { ensureRetentionIndexes } = require("./market/retention");
 const { buildApp } = require("./app");
 const { watchLatestToken } = require("./tokenWatcher");
+const { getPublicIp, parseExpectedIps } = require("./kite/networkIdentity");
 const {
   startSessionControl,
   stopSessionControl,
@@ -34,6 +39,9 @@ const { attachSocketServer } = require("./socket/socketServer");
 const { reportFault } = require("./runtime/errorBus");
 const { setTradingEnabled } = require("./runtime/tradingEnabled");
 const { createEngineLifecycle } = require("./runtime/engineLifecycle");
+const {
+  assertEnabledStrategyAdmissionProfiles,
+} = require("./strategy/registry");
 
 function applyWindowsSrvDnsWorkaround() {
   // Workaround for Node.js Windows SRV DNS regressions that can manifest as:
@@ -80,10 +88,214 @@ function describeErr(e) {
   };
 }
 
+function detectIpFamily(ip) {
+  const value = String(ip || "").trim();
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return "IPv4";
+  if (value.includes(":")) return "IPv6";
+  return "unknown";
+}
+
+const IPV4_PUBLIC_IP_PROVIDERS = ["https://api.ipify.org"];
+const IPV6_PUBLIC_IP_PROVIDERS = ["https://api6.ipify.org"];
+
+async function resolvePublicIpForFamily(family) {
+  const providers =
+    family === "IPv6" ? IPV6_PUBLIC_IP_PROVIDERS : IPV4_PUBLIC_IP_PROVIDERS;
+
+  try {
+    const result = await getPublicIp({
+      providers,
+      retries: 1,
+      timeoutMs: 2500,
+    });
+    const ip = result?.ip || null;
+    const detectedFamily = detectIpFamily(ip);
+    if (result?.ok && ip && detectedFamily === family) {
+      return {
+        ok: true,
+        ip,
+        family,
+        provider: result.provider || null,
+        checkedAt: result.checkedAt || new Date().toISOString(),
+        attempts: result.attempts || [],
+      };
+    }
+    return {
+      ok: false,
+      ip: null,
+      family,
+      provider: result?.provider || null,
+      checkedAt: result?.checkedAt || new Date().toISOString(),
+      attempts: result?.attempts || [],
+      error:
+        result?.error ||
+        (ip ? `UNEXPECTED_${detectedFamily || "UNKNOWN"}_RESPONSE` : "IP_LOOKUP_FAILED"),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      ip: null,
+      family,
+      provider: null,
+      checkedAt: new Date().toISOString(),
+      attempts: [],
+      error: err?.message || String(err),
+    };
+  }
+}
+
 function todayKey() {
   return DateTime.now()
     .setZone(env.CANDLE_TZ || "Asia/Kolkata")
     .toFormat("yyyy-LL-dd");
+}
+
+async function logStartupEgressIpObservability() {
+  const expectedEgressIps = parseExpectedIps(env.EXPECTED_EGRESS_IPS || "");
+  const expectedConfigured = expectedEgressIps.length > 0;
+
+  try {
+    const [ipv4Info, ipv6Info] = await Promise.all([
+      resolvePublicIpForFamily("IPv4"),
+      resolvePublicIpForFamily("IPv6"),
+    ]);
+    const publicIpv4 = ipv4Info?.ok ? ipv4Info.ip : null;
+    const publicIpv6 = ipv6Info?.ok ? ipv6Info.ip : null;
+    const publicIp = publicIpv4 || publicIpv6 || null;
+    const provider =
+      ipv4Info?.ok ? ipv4Info.provider : ipv6Info?.ok ? ipv6Info.provider : null;
+    const ipFamily = detectIpFamily(publicIp);
+    const checkedAt =
+      ipv6Info?.checkedAt || ipv4Info?.checkedAt || new Date().toISOString();
+    const resolvedPublicIps = [publicIpv4, publicIpv6].filter(Boolean);
+
+    if (!publicIp) {
+      logger.warn(
+        {
+          err: [ipv4Info?.error, ipv6Info?.error].filter(Boolean).join("; "),
+          checkedAt,
+          ipv4Provider: ipv4Info?.provider || null,
+          ipv6Provider: ipv6Info?.provider || null,
+        },
+        "[network] unable to resolve public egress IP",
+      );
+      console.log("KITE_WHITELIST_IP=UNKNOWN");
+      console.log("KITE_WHITELIST_IP_FAMILY=unknown");
+      console.log("KITE_WHITELIST_IPV4=UNKNOWN");
+      console.log("KITE_WHITELIST_IPV6=UNKNOWN");
+      if (expectedConfigured) {
+        console.log(`KITE_EXPECTED_EGRESS_IPS=${expectedEgressIps.join(",")}`);
+        console.log("KITE_WHITELIST_STATUS=MISMATCH");
+        console.warn(
+          `KITE_WHITELIST_MISMATCH actual_v4=UNKNOWN actual_v6=UNKNOWN expected=${expectedEgressIps.join(",")}`,
+        );
+      } else {
+        console.log("KITE_WHITELIST_STATUS=NOT_CONFIGURED");
+      }
+      return;
+    }
+
+    let matchStatus = "not_configured";
+    let isMatch = false;
+    let matchedPublicIp = null;
+
+    if (expectedConfigured) {
+      matchedPublicIp =
+        resolvedPublicIps.find((ip) => expectedEgressIps.includes(ip)) || null;
+      isMatch = Boolean(matchedPublicIp);
+      matchStatus = isMatch ? "match" : "mismatch";
+    }
+
+    logger.info(
+      {
+        publicIp,
+        publicIpv4,
+        publicIpv6,
+        ipFamily,
+        provider,
+        ipv4Provider: ipv4Info?.provider || null,
+        ipv6Provider: ipv6Info?.provider || null,
+        checkedAt,
+        expectedEgressIps,
+        expectedConfigured,
+        matchStatus,
+      },
+      "[network] public egress IP for Kite whitelist",
+    );
+
+    console.log(`KITE_WHITELIST_IP=${publicIp}`);
+    console.log(`KITE_WHITELIST_IP_FAMILY=${ipFamily}`);
+    console.log(`KITE_WHITELIST_IPV4=${publicIpv4 || "UNKNOWN"}`);
+    console.log(`KITE_WHITELIST_IPV6=${publicIpv6 || "UNKNOWN"}`);
+    if (expectedConfigured) {
+      console.log(`KITE_EXPECTED_EGRESS_IPS=${expectedEgressIps.join(",")}`);
+      console.log(`KITE_WHITELIST_STATUS=${isMatch ? "MATCH" : "MISMATCH"}`);
+    } else {
+      console.log("KITE_WHITELIST_STATUS=NOT_CONFIGURED");
+      logger.info(
+        {
+          publicIp,
+          publicIpv4,
+          publicIpv6,
+          ipFamily,
+          provider,
+          ipv4Provider: ipv4Info?.provider || null,
+          ipv6Provider: ipv6Info?.provider || null,
+          checkedAt,
+        },
+        "[network] public egress IP comparison skipped (no expected IPs configured)",
+      );
+    }
+
+    if (expectedConfigured && !isMatch) {
+      logger.warn(
+        {
+          resolvedPublicIp: publicIp,
+          resolvedPublicIpv4: publicIpv4,
+          resolvedPublicIpv6: publicIpv6,
+          resolvedIpFamily: ipFamily,
+          expectedEgressIps,
+          checkedAt,
+        },
+        "[network] public egress IP does not match configured expected IPs",
+      );
+      console.warn(
+        `KITE_WHITELIST_MISMATCH actual_v4=${publicIpv4 || "UNKNOWN"} actual_v6=${publicIpv6 || "UNKNOWN"} expected=${expectedEgressIps.join(",")}`,
+      );
+    } else if (expectedConfigured) {
+      logger.info(
+        {
+          resolvedPublicIp: matchedPublicIp || publicIp,
+          resolvedPublicIpv4: publicIpv4,
+          resolvedPublicIpv6: publicIpv6,
+          resolvedIpFamily: matchedPublicIp
+            ? detectIpFamily(matchedPublicIp)
+            : ipFamily,
+          expectedEgressIps,
+          checkedAt,
+        },
+        "[network] public egress IP matches configured expected IPs",
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err?.message || String(err) },
+      "[network] unable to resolve public egress IP",
+    );
+    console.log("KITE_WHITELIST_IP=UNKNOWN");
+    console.log("KITE_WHITELIST_IP_FAMILY=unknown");
+    console.log("KITE_WHITELIST_IPV4=UNKNOWN");
+    console.log("KITE_WHITELIST_IPV6=UNKNOWN");
+    if (expectedConfigured) {
+      console.log(`KITE_EXPECTED_EGRESS_IPS=${expectedEgressIps.join(",")}`);
+      console.log("KITE_WHITELIST_STATUS=MISMATCH");
+      console.warn(
+        `KITE_WHITELIST_MISMATCH actual_v4=UNKNOWN actual_v6=UNKNOWN expected=${expectedEgressIps.join(",")}`,
+      );
+    } else {
+      console.log("KITE_WHITELIST_STATUS=NOT_CONFIGURED");
+    }
+  }
 }
 
 async function evaluateLiveStartupPreflight({
@@ -120,9 +332,12 @@ function exitAfterCrash(delayMs = 750) {
 }
 
 async function main() {
+  assertEnabledStrategyAdmissionProfiles();
   // Apply SRV DNS workaround early (before Mongo connects)
   applyWindowsSrvDnsWorkaround();
   await connectMongo();
+  await logStartupEgressIpObservability();
+  await startAlertService();
   // PATCH-9: Ensure candle retention TTL indexes (prevents MongoDB growth)
   try {
     if (String(env.RETENTION_ENSURE_ON_START || "true") === "true") {
@@ -303,6 +518,22 @@ async function main() {
   });
 
   const app = buildApp();
+  setNotificationHeartbeatProvider(async () => {
+    const pipeline = getPipeline?.() || null;
+    let tradeStatus = {};
+    try {
+      tradeStatus = pipeline?.status ? await pipeline.status() : {};
+    } catch {
+      tradeStatus = {};
+    }
+    return {
+      ...tradeStatus,
+      engineLifecycle: engineLifecycle?.status?.() || null,
+      engineMode: engineLifecycle?.status?.().mode || null,
+      ticker: getTickerStatus?.() || null,
+      tickerConnected: Boolean(getTickerStatus?.()?.connected),
+    };
+  });
   const httpServer = http.createServer(app);
   const io = attachSocketServer(httpServer);
   const server = httpServer.listen(env.PORT, () => {

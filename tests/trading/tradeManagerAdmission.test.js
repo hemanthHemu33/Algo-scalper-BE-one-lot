@@ -5,6 +5,7 @@ const {
   evaluatePreRouteTradability,
   evaluatePreRouteConfidenceGate,
   resolvePostRouteConfidenceDecision,
+  shouldAllowMultiTfTrendTransitionPass,
   resolveMinLotRiskPolicyDecision,
   resolvePreEntrySlFitDecision,
   resolvePreRouteConfidenceAllowance,
@@ -98,6 +99,8 @@ assert.equal(postRouteConfidence, 69);
 
 const softPassPostRoute = resolvePostRouteConfidenceDecision({
   signal: {
+    strategyId: "ema_pullback",
+    strategyStyle: "TREND",
     option_meta: {
       bps: 18,
       health_score: 74,
@@ -133,9 +136,17 @@ assert.equal(
 assert.equal(softPassPostRoute.postRouteDecision, "SOFT_PASS");
 assert.equal(softPassPostRoute.meta.confidenceGap, 3);
 assert.equal(softPassPostRoute.meta.routedScore, 72);
+assert.equal(softPassPostRoute.meta.softPassUsed, true);
+assert.equal(
+  softPassPostRoute.meta.softPassProfile,
+  "trend_near_threshold_clean_contract",
+);
+assert.equal(softPassPostRoute.meta.contractQualityBucket, "USABLE");
 
 const hardRejectPostRoute = resolvePostRouteConfidenceDecision({
   signal: {
+    strategyId: "ema_pullback",
+    strategyStyle: "TREND",
     option_meta: {
       bps: 52,
       health_score: 41,
@@ -172,6 +183,83 @@ const hardRejectPostRoute = resolvePostRouteConfidenceDecision({
 assert.equal(hardRejectPostRoute.blocked, true);
 assert.equal(hardRejectPostRoute.adjusted, false);
 assert.equal(hardRejectPostRoute.reasonCode, "POST_ROUTE_LOW_CONFIDENCE");
+
+const mtfTransitionPass = shouldAllowMultiTfTrendTransitionPass({
+  strategyId: "breakout",
+  signal: {
+    strategyId: "breakout",
+    confidence: 79,
+    setupState: "TRIGGERED",
+    meta: {
+      freshness: 88,
+      setupState: "TRIGGERED",
+      retestState: "FIRST_BREAK",
+      triggerType: "BREAKOUT_LEVEL",
+      volumeQuality: 74,
+      structureQuality: 78,
+      boundaryQuality: 76,
+      expansionQuality: 75,
+    },
+  },
+  regimeMeta: {
+    regime: "TREND_COMPRESSED",
+    secondaryRegime: "BREAKOUT_WATCH",
+    compressionActive: true,
+  },
+  multiTfMeta: {
+    strengthBps: 14,
+  },
+  config: {
+    MULTI_TF_TRANSITION_MAX_OPPOSITE_BPS: 22,
+    MULTI_TF_TRANSITION_MIN_FRESHNESS: 82,
+    MULTI_TF_TRANSITION_MIN_CONFIDENCE: 74,
+    MULTI_TF_TRANSITION_MIN_STRUCTURE_QUALITY: 72,
+    MULTI_TF_TRANSITION_MIN_VOLUME_QUALITY: 68,
+    MULTI_TF_TRANSITION_MIN_BOUNDARY_QUALITY: 70,
+    MULTI_TF_TRANSITION_MIN_EXPANSION_QUALITY: 70,
+  },
+});
+
+assert.equal(mtfTransitionPass.allowed, true);
+assert.equal(mtfTransitionPass.reason, "MULTI_TF_TREND_TRANSITION_PASS");
+assert.equal(mtfTransitionPass.meta.mtfStrengthBps, 14);
+assert.equal(mtfTransitionPass.meta.transitionPassProfile, "breakout_transition");
+assert.equal(mtfTransitionPass.meta.mismatchStrengthBucket, "MODERATE");
+
+const mtfTransitionBlocked = shouldAllowMultiTfTrendTransitionPass({
+  strategyId: "breakout",
+  signal: {
+    strategyId: "breakout",
+    confidence: 79,
+    setupState: "TRIGGERED",
+    meta: {
+      freshness: 88,
+      setupState: "TRIGGERED",
+      retestState: "FIRST_BREAK",
+      triggerType: "BREAKOUT_LEVEL",
+      volumeQuality: 74,
+      structureQuality: 78,
+      boundaryQuality: 76,
+      expansionQuality: 75,
+    },
+  },
+  regimeMeta: {
+    regime: "TREND_COMPRESSED",
+    secondaryRegime: "BREAKOUT_WATCH",
+    compressionActive: true,
+  },
+  multiTfMeta: {
+    strengthBps: 34,
+  },
+  config: {
+    MULTI_TF_TRANSITION_MAX_OPPOSITE_BPS: 22,
+  },
+});
+
+assert.equal(mtfTransitionBlocked.allowed, false);
+assert.equal(mtfTransitionBlocked.reason, "TRANSITION_GATES_FAILED");
+assert.equal(mtfTransitionBlocked.meta.mtfStrengthBps, 34);
+assert.equal(mtfTransitionBlocked.meta.mismatchStrengthBucket, "STRONG");
 
 const capBlockedSkip = resolvePreEntrySlFitDecision({
   config: {

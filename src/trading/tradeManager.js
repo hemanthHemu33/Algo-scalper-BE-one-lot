@@ -15,7 +15,7 @@ const { logger } = require("../logger");
 const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
 const { marginAwareSizing } = require("./marginSizer");
-const { alert } = require("../alerts/alertService");
+const { alert, dispatchTradeUpdate } = require("../alerts/alertService");
 const { halt, isHalted } = require("../runtime/halt");
 const { getDb } = require("../db");
 const {
@@ -29,6 +29,22 @@ const {
 } = require("../fno/optionsRouter");
 const { computePacingPolicy } = require("../policy/pacingPolicy");
 const { buildTradePlan } = require("./planBuilder");
+const { getAdmissionProfile } = require("./admissionProfiles");
+const {
+  createAdmissionSnapshot,
+  buildAdmissionContext,
+  buildDecisionAudit,
+  mergeDecisionStage,
+  buildDecisionSignalPatch,
+  bucketContractQuality,
+  bucketMismatchStrength,
+  bucketFreshness,
+  bucketSpread,
+  bucketHealth,
+} = require("./admissionDecision");
+const {
+  resolveAdmissionThresholds,
+} = require("./admissionThresholds");
 const { roundToTick } = require("./priceUtils");
 const {
   reportFault,
@@ -63,6 +79,11 @@ const {
   deriveStopExitReasonCode,
   resolveExitLifecycle,
 } = require("./tradeLifecycleState");
+const {
+  alcAppliedSourceForState,
+  deriveAlcAttribution,
+  normalizeAlcAppliedSource,
+} = require("./alcAttribution");
 const {
   buildMissingWinnerProtectionPatch,
 } = require("./winnerProtectionState");
@@ -228,6 +249,26 @@ function withSignalLifecycleMeta(signal, meta = {}) {
     regimeSnapshotId:
       signal?.regimeSnapshotId || signal?.regimeSnapshot?.snapshotId || null,
     ...meta,
+  };
+}
+
+function tradeLifecycleNotificationMeta(meta = {}) {
+  return {
+    ...meta,
+    notificationOrigin: "trade_lifecycle",
+    notificationIntent: "suppress_if_trade_card",
+    notificationCategory:
+      meta?.notificationCategory || "TRADE_LIFECYCLE",
+  };
+}
+
+function tradeIncidentNotificationMeta(meta = {}) {
+  return {
+    ...meta,
+    notificationOrigin: "trade_incident",
+    notificationIntent: meta?.notificationIntent || "incident_only",
+    notificationCategory:
+      meta?.notificationCategory || "TRADE_INCIDENT",
   };
 }
 
@@ -450,14 +491,26 @@ function resolvePostRouteConfidenceDecision({
     signal?.option_meta?.meta?.selectionObservability?.selectedReason ||
     signal?.option_meta?.meta?.selectionPath?.selectedReason ||
     null;
+  const deltaTarget = toFiniteOrNull(contractMetrics?.deltaTarget);
+  const deltaUsed = toFiniteOrNull(contractMetrics?.deltaUsed);
+  const deltaGap =
+    deltaTarget != null && deltaUsed != null
+      ? Math.abs(Math.abs(deltaUsed) - deltaTarget)
+      : null;
+  const strategyId = String(signal?.strategyId || "").trim().toLowerCase();
+  const admissionProfile = getAdmissionProfile(
+    strategyId,
+    signal?.strategyStyle || null,
+  );
+  const thresholdSet = resolveAdmissionThresholds({
+    config,
+    profile: admissionProfile,
+  });
+  const softPassThresholds = thresholdSet.softPass;
   const confidenceGap =
     confidence != null && minConfidence != null
       ? Math.max(0, minConfidence - confidence)
       : null;
-  const softBand = Math.max(
-    0,
-    Number(config?.POST_ROUTE_CONFIDENCE_SOFT_BAND ?? 4),
-  );
 
   const meta = {
     conf: confidence,
@@ -468,8 +521,16 @@ function resolvePostRouteConfidenceDecision({
     spreadBps,
     healthScore,
     depth,
+    deltaTarget,
+    deltaUsed,
+    deltaGap,
+    strategyId: strategyId || null,
+    family: admissionProfile?.family || null,
+    style: admissionProfile?.style || null,
     selectedByFallback,
     fallbackReason,
+    softPassSupported: softPassThresholds.supported === true,
+    softPassProfile: null,
   };
 
   if (
@@ -488,27 +549,54 @@ function resolvePostRouteConfidenceDecision({
     };
   }
 
-  const maxSpreadBps = Math.max(1, Number(config?.OPT_MAX_SPREAD_BPS ?? 35));
-  const materialSpreadLimit = Math.max(maxSpreadBps + 5, maxSpreadBps * 1.2);
-  const weakHealthFloor = Math.max(
-    55,
-    Number(config?.OPT_HEALTH_SCORE_MIN ?? 45),
-  );
   const withinSoftBand =
-    routedScore != null && routedScore >= minConfidence - softBand;
+    routedScore != null &&
+    routedScore >= minConfidence - softPassThresholds.confidenceSoftBand;
+  const withinTrendNearThresholdBand =
+    softPassThresholds.supported === true &&
+    routedScore != null &&
+    routedScore >= minConfidence - softPassThresholds.maxConfidenceGap;
   const compatibilityPoor =
     eligibilityPassed === false ||
     minEligibilityChecksPassed === false ||
     selectedReason === "FAILED_ELIGIBILITY";
-  const spreadTooWide = spreadBps != null && spreadBps > materialSpreadLimit;
-  const healthTooWeak = healthScore != null && healthScore < weakHealthFloor;
+  const spreadTooWide =
+    spreadBps != null && spreadBps > thresholdSet.routeQuality.materialSpreadLimit;
+  const healthTooWeak =
+    healthScore != null && healthScore < thresholdSet.routeQuality.weakHealthFloor;
+  const cleanTrendContract =
+    softPassThresholds.supported === true &&
+    !selectedByFallback &&
+    (spreadBps == null || spreadBps <= softPassThresholds.spreadLimit) &&
+    (healthScore == null || healthScore >= softPassThresholds.healthFloor) &&
+    (depth == null || depth >= softPassThresholds.depthFloor) &&
+    (deltaGap == null || deltaGap <= softPassThresholds.deltaGapMax);
   const fallbackStillWeak =
     selectedByFallback &&
     confidenceGap != null &&
-    confidenceGap > Math.max(1, softBand / 2);
+    confidenceGap > softPassThresholds.weakFallbackGap;
+  meta.contractQualityBucket = bucketContractQuality({
+    spreadBps,
+    healthScore,
+    depth,
+    selectedByFallback,
+    eligibilityPassed,
+    minEligibilityChecksPassed,
+    maxSpreadBps: thresholdSet.routeQuality.maxSpreadBps,
+    minHealth: thresholdSet.routeQuality.weakHealthFloor,
+    minDepth: softPassThresholds.depthFloor,
+  });
+  meta.spreadBucket = bucketSpread(
+    spreadBps,
+    thresholdSet.routeQuality.maxSpreadBps,
+  );
+  meta.healthBucket = bucketHealth(
+    healthScore,
+    thresholdSet.routeQuality.weakHealthFloor,
+  );
 
   if (
-    withinSoftBand &&
+    (withinSoftBand || (withinTrendNearThresholdBand && cleanTrendContract)) &&
     !compatibilityPoor &&
     !spreadTooWide &&
     !healthTooWeak &&
@@ -519,7 +607,15 @@ function resolvePostRouteConfidenceDecision({
       adjusted: true,
       reasonCode: "POST_ROUTE_CONFIDENCE_SOFT_PASS",
       postRouteDecision: "SOFT_PASS",
-      meta,
+      meta: {
+        ...meta,
+        softPassUsed: true,
+        softPassProfile: softPassThresholds.profileId || null,
+        softPassReason:
+          withinSoftBand
+            ? "WITHIN_SOFT_BAND"
+            : "TREND_NEAR_THRESHOLD_CLEAN_CONTRACT",
+      },
     };
   }
 
@@ -529,6 +625,138 @@ function resolvePostRouteConfidenceDecision({
     reasonCode: "POST_ROUTE_LOW_CONFIDENCE",
     postRouteDecision: "BLOCKED",
     meta,
+  };
+}
+
+function shouldAllowMultiTfTrendTransitionPass({
+  strategyId,
+  signal = null,
+  regimeMeta = {},
+  multiTfMeta = {},
+  config = env,
+}) {
+  const admissionProfile = getAdmissionProfile(
+    strategyId || signal?.strategyId || null,
+    signal?.strategyStyle || null,
+  );
+  const thresholdSet = resolveAdmissionThresholds({
+    config,
+    profile: admissionProfile,
+  });
+  const transitionThresholds = thresholdSet.transitionPass;
+  const family = String(admissionProfile?.family || "").trim().toLowerCase();
+  if (admissionProfile?.allowTransitionPass !== true) {
+    return { allowed: false, reason: "NOT_BREAKOUT_FAMILY" };
+  }
+
+  const compressionActive =
+    regimeMeta?.compressionActive === true ||
+    String(regimeMeta?.regime || "").toUpperCase() === "TREND_COMPRESSED";
+  const secondaryRegime = String(regimeMeta?.secondaryRegime || "").toUpperCase();
+  const transitionLike =
+    compressionActive ||
+    secondaryRegime === "BREAKOUT_WATCH" ||
+    secondaryRegime.includes("TRANSITION");
+  if (!transitionLike) {
+    return { allowed: false, reason: "NO_TRANSITION_CONTEXT" };
+  }
+
+  const freshness = Number(signal?.meta?.freshness ?? 0);
+  const setupState = String(signal?.setupState || signal?.meta?.setupState || "").toUpperCase();
+  const retestState = String(signal?.meta?.retestState || "").toUpperCase();
+  const signalConfidence = Number(signal?.confidence ?? 0);
+  const volumeQuality = Number(signal?.meta?.volumeQuality ?? 0);
+  const structureQuality = Number(signal?.meta?.structureQuality ?? 0);
+  const boundaryQuality = Number(signal?.meta?.boundaryQuality ?? 0);
+  const expansionQuality = Number(signal?.meta?.expansionQuality ?? 0);
+  const triggerType = String(signal?.meta?.triggerType || signal?.triggerType || "").toUpperCase();
+  const mtfStrengthBps = Number(multiTfMeta?.strengthBps ?? NaN);
+  const freshnessOk =
+    freshness >= transitionThresholds.minFreshness ||
+    setupState === "TRIGGERED" ||
+    retestState === "FIRST_BREAK";
+  const qualityOk =
+    signalConfidence >= transitionThresholds.minConfidence &&
+    structureQuality >= transitionThresholds.minStructureQuality &&
+    volumeQuality >= transitionThresholds.minVolumeQuality &&
+    boundaryQuality >= transitionThresholds.minBoundaryQuality &&
+    expansionQuality >= transitionThresholds.minExpansionQuality;
+  const triggerOk =
+    triggerType.includes("BREAKOUT") || triggerType.includes("BREAKDOWN");
+  const routeConfidence = signal?.routeConfidence || null;
+  const contractMetrics = routeConfidence?.contractMetrics || {};
+  const contractQualityBucket = bucketContractQuality({
+    spreadBps: contractMetrics?.spreadBps ?? signal?.option_meta?.bps,
+    healthScore: contractMetrics?.healthScore ?? signal?.option_meta?.health_score,
+    depth: contractMetrics?.depth ?? signal?.option_meta?.depth,
+    selectedByFallback:
+      contractMetrics?.selectedByFallback === true ||
+      signal?.option_meta?.meta?.selectionObservability?.selectedByFallback === true,
+    eligibilityPassed: contractMetrics?.eligibilityPassed,
+    minEligibilityChecksPassed: contractMetrics?.minEligibilityChecksPassed,
+    maxSpreadBps: transitionThresholds.contractQuality.maxSpreadBps,
+    minHealth: transitionThresholds.contractQuality.minHealthScore,
+    minDepth: transitionThresholds.contractQuality.minDepth,
+  });
+  const contractQualityOk = !["POOR", "WEAK_FALLBACK", "FAILED_ELIGIBILITY"].includes(
+    contractQualityBucket,
+  );
+  const mismatchIsWeak =
+    !Number.isFinite(mtfStrengthBps) ||
+    mtfStrengthBps <= transitionThresholds.weakMismatchLimit;
+
+  if (!(freshnessOk && qualityOk && triggerOk && mismatchIsWeak && contractQualityOk)) {
+    return {
+      allowed: false,
+      reason: "TRANSITION_GATES_FAILED",
+      meta: {
+        transitionPassSupported: true,
+        transitionPassProfile: null,
+        freshness,
+        setupState,
+        retestState,
+        signalConfidence,
+        volumeQuality,
+        structureQuality,
+        boundaryQuality,
+        expansionQuality,
+        triggerType: triggerType || null,
+        mtfStrengthBps: Number.isFinite(mtfStrengthBps) ? mtfStrengthBps : null,
+        weakMismatchLimit: transitionThresholds.weakMismatchLimit,
+        mismatchStrengthBucket: bucketMismatchStrength(
+          mtfStrengthBps,
+          transitionThresholds.weakMismatchLimit,
+        ),
+        freshnessBucket: bucketFreshness(freshness),
+        contractQualityBucket,
+      },
+    };
+  }
+
+  return {
+    allowed: true,
+    reason: "MULTI_TF_TREND_TRANSITION_PASS",
+    meta: {
+      transitionPassSupported: true,
+      transitionPassProfile: admissionProfile?.transitionPassProfile || null,
+      freshness,
+      setupState,
+      retestState,
+      signalConfidence,
+      volumeQuality,
+      structureQuality,
+      boundaryQuality,
+      expansionQuality,
+      triggerType: triggerType || null,
+      mtfStrengthBps: Number.isFinite(mtfStrengthBps) ? mtfStrengthBps : null,
+      weakMismatchLimit: transitionThresholds.weakMismatchLimit,
+      mismatchStrengthBucket: bucketMismatchStrength(
+        mtfStrengthBps,
+        transitionThresholds.weakMismatchLimit,
+      ),
+      freshnessBucket: bucketFreshness(freshness),
+      contractQualityBucket,
+    },
   };
 }
 
@@ -1123,7 +1351,12 @@ const STOP_IMPROVE_BLOCKED_REASON_TAGS = Object.freeze(
   ]),
 );
 const LOSS_CONTAINMENT_STOP_AUTHORITIES = Object.freeze(
-  new Set(["EARLY_FAIL_ENGINE", "TIME_STOP_ENGINE", "POST_FILL_RISK_ENGINE"]),
+  new Set([
+    "EARLY_FAIL_ENGINE",
+    "TIME_STOP_ENGINE",
+    "POST_FILL_RISK_ENGINE",
+    "ADAPTIVE_LOSER_ENGINE",
+  ]),
 );
 
 function getOrderUpdateSignatureHistory(signatureMap, orderId) {
@@ -1208,7 +1441,25 @@ function evaluateDynamicSlModifyAuthority({ trade, plan }) {
   const structureTrailAllowed = Boolean(plan?.meta?.structureTrailAllowed);
   const protectionGateOpen = Boolean(plan?.meta?.protectionGateOpen);
   const winnerModeActive = Boolean(plan?.meta?.winnerModeActive);
+  const protectedStopSource = String(
+    plan?.meta?.protectedStopSource ??
+      plan?.tradePatch?.protectedStopSource ??
+      "",
+  )
+    .trim()
+    .toUpperCase();
+  const earlyWinnerActive = Boolean(plan?.meta?.earlyWinnerActive);
+  const earlyWinnerConfirmed = Boolean(plan?.meta?.earlyWinnerConfirmed);
+  const earlyWinnerTier = Number(plan?.meta?.earlyWinnerTier ?? 0);
   const mfeLockTier = Number(plan?.meta?.mfeLockTier ?? plan?.mfeLockTier ?? 0);
+  const loserCompressionActive = Boolean(plan?.meta?.loserCompressionActive);
+  const loserCompressionRequestReady =
+    plan?.meta?.loserCompressionRequestReady !== false;
+  const loserCompressionRequestBlockedReason =
+    plan?.meta?.loserCompressionRequestBlockedReason ??
+    plan?.meta?.loserCompressionBlockedReason ??
+    null;
+  const alcOwnsProtectionFloor = /^ALC_L[12]$/.test(protectedStopSource);
   const reasonTags = Array.isArray(plan?.meta?.reasonTags) ? plan.meta.reasonTags : [];
   const exitAuthority = String(
     plan?.meta?.exitAuthority ??
@@ -1230,6 +1481,9 @@ function evaluateDynamicSlModifyAuthority({ trade, plan }) {
     plan?.meta?.beApplied ||
       plan?.meta?.trailAllowed ||
       plan?.meta?.trailActive ||
+      loserCompressionActive ||
+      earlyWinnerActive ||
+      earlyWinnerTier > 0 ||
       plan?.meta?.greenLockActive ||
       plan?.meta?.profitLockArmed ||
       mfeLockTier > 0 ||
@@ -1273,6 +1527,13 @@ function evaluateDynamicSlModifyAuthority({ trade, plan }) {
   } else if (
     !blockedReason &&
     proposalImprovesBrokerStop &&
+    alcOwnsProtectionFloor &&
+    !loserCompressionRequestReady
+  ) {
+    blockedReason = loserCompressionRequestBlockedReason || "ALC_BLOCKED_PENDING_MODIFY";
+  } else if (
+    !blockedReason &&
+    proposalImprovesBrokerStop &&
     onlyBlockedReasonTags
   ) {
     blockedReason = "BLOCKED_REASON_TAGS_ONLY";
@@ -1289,6 +1550,7 @@ function evaluateDynamicSlModifyAuthority({ trade, plan }) {
       finalStopImprovesBrokerStop &&
       stopImproveAuthorized &&
       derivedAuthorityActive &&
+      !(alcOwnsProtectionFloor && !loserCompressionRequestReady) &&
       !onlyBlockedReasonTags,
     proposalImprovesBrokerStop,
     finalStopImprovesBrokerStop,
@@ -1304,6 +1566,12 @@ function evaluateDynamicSlModifyAuthority({ trade, plan }) {
     structureTrailAllowed,
     protectionGateOpen,
     winnerModeActive,
+    loserCompressionActive,
+    loserCompressionRequestReady,
+    loserCompressionRequestBlockedReason,
+    earlyWinnerActive,
+    earlyWinnerConfirmed,
+    earlyWinnerTier,
     mfeLockTier,
     exitAuthority: exitAuthority || null,
     reasonTags,
@@ -1449,6 +1717,376 @@ function clearProtectionUpgradeStatePatch() {
   };
 }
 
+const PROTECTION_PATCH_STOP_FIELDS = Object.freeze([
+  "telemetryProposalFloor",
+  "executableHardFloor",
+  "desiredStopLoss",
+  "finalStopLoss",
+  "hardFloor",
+  "earlyWinnerFloorPrice",
+  "greenLockFloorPrice",
+  "mfeLockFloorPrice",
+  "post1RTrailFloorPrice",
+  "structureMappedFloor",
+  "structureTrailFloor",
+  "protectionUpgradeTargetStopLoss",
+  "loserCompressionLastRequestedStop",
+  "loserCompressionLastConfirmedStop",
+]);
+
+const PROTECTION_PATCH_LATCH_BOOL_FIELDS = Object.freeze([
+  "beEligible",
+  "beLocked",
+  "beLockHit",
+  "earlyWinnerEligible",
+  "earlyWinnerArmed",
+  "earlyWinnerConfirmed",
+  "earlyWinnerActive",
+  "earlyWinnerMfeLockActive",
+  "earlyWinnerHandoffReady",
+  "greenLockActive",
+  "profitLockArmed",
+  "tightenActive",
+  "hardGivebackExitArmed",
+  "trailHit",
+  "trailActive",
+  "structureCandidateAvailable",
+  "structureTrailAllowed",
+  "protectionGateOpen",
+  "winnerModeActive",
+  "loserCompressionAppliedConfirmed",
+]);
+
+const PROTECTION_PATCH_MAX_NUMERIC_FIELDS = Object.freeze([
+  "earlyWinnerConfirmTicks",
+  "earlyWinnerConfirmMs",
+  "earlyWinnerTier",
+  "earlyWinnerKeepR",
+  "mfeLockTier",
+  "mfeLockFloorR",
+  "tightenActivatedAtR",
+  "hardGivebackThresholdR",
+  "hardGivebackThresholdPct",
+  "hardGivebackConfirmTicks",
+  "givebackConfirmMs",
+  "peakR",
+  "lastProtectedR",
+  "dynamicTrailArmR",
+  "handoffMaturity",
+  "loserCompressionScoreAtLastAction",
+  "loserCompressionRetryCount",
+]);
+
+const PROTECTION_PATCH_EARLIEST_TS_FIELDS = Object.freeze([
+  "earlyWinnerArmAt",
+  "earlyWinnerConfirmedAt",
+  "hardGivebackArmedAt",
+  "protectionUpgradeUnconfirmedSince",
+  "loserCompressionActivatedAt",
+  "loserCompressionPendingSince",
+  "loserCompressionTriggeredAt",
+]);
+
+const PROTECTION_PATCH_LATEST_TS_FIELDS = Object.freeze([
+  "loserCompressionLastActionAt",
+  "loserCompressionEscalatedAt",
+  "loserCompressionLastAttemptAt",
+  "loserCompressionLastConfirmedAt",
+]);
+
+const PROTECTION_STATE_PATCH_KEYS = Object.freeze(
+  new Set([
+    ...PROTECTION_PATCH_STOP_FIELDS,
+    ...PROTECTION_PATCH_LATCH_BOOL_FIELDS,
+    ...PROTECTION_PATCH_MAX_NUMERIC_FIELDS,
+    ...PROTECTION_PATCH_EARLIEST_TS_FIELDS,
+    "earlyWinnerFloorSource",
+    "protectedStopSource",
+    "protectionPhase",
+    "protectionStateVersion",
+    "structureReferenceType",
+    "structureReferencePrice",
+    "loserCompressionDesiredAction",
+    "loserCompressionTargetState",
+    "loserCompressionSubmittedState",
+    "loserCompressionAppliedState",
+    "loserCompressionPendingAction",
+    "loserCompressionPendingSince",
+    "loserCompressionLastRequestedStop",
+    "loserCompressionLastConfirmedStop",
+    "loserCompressionLastAttemptAt",
+    "loserCompressionLastConfirmedAt",
+    "loserCompressionRetryCount",
+    "loserCompressionState",
+    "loserCompressionLastActionAt",
+    "loserCompressionActivatedAt",
+    "loserCompressionEscalatedAt",
+    "loserCompressionScoreAtLastAction",
+    "loserCompressionReasonAtLastAction",
+    "loserCompressionBlockedReason",
+    "loserCompressionLastAction",
+    "loserCompressionTriggeredAt",
+    "loserCompressionAppliedSource",
+    "loserCompressionAppliedConfirmed",
+    "loserCompressionAttributionConfidence",
+    "loserExitTriggered",
+    "loserExitReasonCode",
+  ]),
+);
+
+function loserCompressionStateRank(state) {
+  const raw = String(state || "NONE").trim().toUpperCase();
+  if (raw === "EXITED" || raw === "EXIT") return 3;
+  if (raw === "L2") return 2;
+  if (raw === "L1") return 1;
+  return 0;
+}
+
+function protectionPhaseRank(phase) {
+  const raw = String(phase || "").toUpperCase();
+  if (raw.includes("PHASE_4")) return 4;
+  if (raw.includes("PHASE_3")) return 3;
+  if (raw.includes("PHASE_2")) return 2;
+  if (raw.includes("PHASE_1")) return 1;
+  return 0;
+}
+
+function equivalentTradeFieldValue(current, next, tick = 0.05) {
+  if (current instanceof Date || next instanceof Date) {
+    const currentTs =
+      current instanceof Date ? current.getTime() : Date.parse(current);
+    const nextTs = next instanceof Date ? next.getTime() : Date.parse(next);
+    return Number.isFinite(currentTs) &&
+      Number.isFinite(nextTs)
+      ? currentTs === nextTs
+      : String(current || "") === String(next || "");
+  }
+  if (typeof current === "boolean" || typeof next === "boolean") {
+    return Boolean(current) === Boolean(next);
+  }
+  if (typeof current === "string" || typeof next === "string") {
+    return String(current || "") === String(next || "");
+  }
+  const currentNum = Number(current);
+  const nextNum = Number(next);
+  if (Number.isFinite(currentNum) && Number.isFinite(nextNum)) {
+    return Math.abs(currentNum - nextNum) < Math.max(0.000001, tick / 2);
+  }
+  return current === next;
+}
+
+function mergeProtectionPatchAgainstTrade({
+  trade,
+  patch,
+  side,
+  tick,
+  noopWriteSkip = true,
+  dedupeEnabled = true,
+}) {
+  const currentTrade = trade || {};
+  const nextPatch = { ...(patch || {}) };
+  const mergeNotes = [];
+  let dominatedByCurrent = false;
+
+  if (dedupeEnabled) {
+    for (const key of PROTECTION_PATCH_STOP_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(nextPatch, key)) continue;
+      const currentValue = toFiniteOrNull(currentTrade?.[key]);
+      const nextValue = toFiniteOrNull(nextPatch[key]);
+      if (!Number.isFinite(nextValue) || !Number.isFinite(currentValue)) continue;
+      if (!isBetterStopForTradeSide(side, nextValue, currentValue)) {
+        nextPatch[key] = currentValue;
+        dominatedByCurrent = true;
+        mergeNotes.push(`${key}:current_dominates`);
+      }
+    }
+
+    for (const key of PROTECTION_PATCH_LATCH_BOOL_FIELDS) {
+      if (
+        Object.prototype.hasOwnProperty.call(nextPatch, key) &&
+        Boolean(currentTrade?.[key]) &&
+        !Boolean(nextPatch[key])
+      ) {
+        nextPatch[key] = true;
+        mergeNotes.push(`${key}:latched_true`);
+      }
+    }
+
+    for (const key of PROTECTION_PATCH_MAX_NUMERIC_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(nextPatch, key)) continue;
+      const currentValue = toFiniteOrNull(currentTrade?.[key]);
+      const nextValue = toFiniteOrNull(nextPatch[key]);
+      if (!Number.isFinite(currentValue) || !Number.isFinite(nextValue)) continue;
+      if (nextValue < currentValue) {
+        nextPatch[key] = currentValue;
+        mergeNotes.push(`${key}:max_merged`);
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(nextPatch, "protectionPhase")) {
+      const currentRank = protectionPhaseRank(currentTrade?.protectionPhase);
+      const nextRank = protectionPhaseRank(nextPatch.protectionPhase);
+      if (currentRank > nextRank) {
+        nextPatch.protectionPhase = currentTrade?.protectionPhase;
+        mergeNotes.push("protectionPhase:max_merged");
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(nextPatch, "loserCompressionState")) {
+      const currentRank = loserCompressionStateRank(
+        currentTrade?.loserCompressionState,
+      );
+      const nextRank = loserCompressionStateRank(nextPatch.loserCompressionState);
+      if (currentRank > nextRank) {
+        nextPatch.loserCompressionState = currentTrade?.loserCompressionState;
+        for (const key of [
+          "loserCompressionLastActionAt",
+          "loserCompressionActivatedAt",
+          "loserCompressionEscalatedAt",
+          "loserCompressionScoreAtLastAction",
+          "loserCompressionReasonAtLastAction",
+        ]) {
+          if (Object.prototype.hasOwnProperty.call(currentTrade, key)) {
+            nextPatch[key] = currentTrade[key];
+          }
+        }
+        mergeNotes.push("loserCompressionState:max_merged");
+      }
+    }
+
+    for (const field of [
+      "loserCompressionTargetState",
+      "loserCompressionSubmittedState",
+      "loserCompressionAppliedState",
+    ]) {
+      if (!Object.prototype.hasOwnProperty.call(nextPatch, field)) continue;
+      const currentRank = loserCompressionStateRank(currentTrade?.[field]);
+      const nextRank = loserCompressionStateRank(nextPatch[field]);
+      if (currentRank > nextRank) {
+        nextPatch[field] = currentTrade?.[field];
+        mergeNotes.push(`${field}:max_merged`);
+      }
+    }
+
+    for (const key of PROTECTION_PATCH_EARLIEST_TS_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(nextPatch, key)) continue;
+      const currentTs = Date.parse(currentTrade?.[key] || "");
+      const nextTs =
+        nextPatch[key] instanceof Date
+          ? nextPatch[key].getTime()
+          : Date.parse(nextPatch[key]);
+      if (
+        Number.isFinite(currentTs) &&
+        Number.isFinite(nextTs) &&
+        currentTs <= nextTs
+      ) {
+        nextPatch[key] = currentTrade?.[key];
+        mergeNotes.push(`${key}:earliest_preserved`);
+      }
+    }
+
+    for (const key of PROTECTION_PATCH_LATEST_TS_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(nextPatch, key)) continue;
+      const currentTs = Date.parse(currentTrade?.[key] || "");
+      const nextTs =
+        nextPatch[key] instanceof Date
+          ? nextPatch[key].getTime()
+          : Date.parse(nextPatch[key]);
+      if (
+        Number.isFinite(currentTs) &&
+        Number.isFinite(nextTs) &&
+        currentTs >= nextTs
+      ) {
+        nextPatch[key] = currentTrade?.[key];
+        mergeNotes.push(`${key}:latest_preserved`);
+      }
+    }
+
+    const currentProtectionStop = bestStopForTradeSide(side, [
+      currentTrade?.finalStopLoss,
+      currentTrade?.desiredStopLoss,
+      currentTrade?.telemetryProposalFloor,
+      currentTrade?.stopLoss,
+      currentTrade?.brokerStopLoss,
+    ]);
+    const nextProtectionStop = bestStopForTradeSide(side, [
+      nextPatch?.finalStopLoss,
+      nextPatch?.desiredStopLoss,
+      nextPatch?.telemetryProposalFloor,
+      nextPatch?.hardFloor,
+      nextPatch?.structureMappedFloor,
+    ]);
+    if (
+      Number.isFinite(currentProtectionStop) &&
+      Number.isFinite(nextProtectionStop) &&
+      !isBetterStopForTradeSide(side, nextProtectionStop, currentProtectionStop)
+    ) {
+      if (
+        Object.prototype.hasOwnProperty.call(currentTrade, "protectedStopSource")
+      ) {
+        nextPatch.protectedStopSource = currentTrade.protectedStopSource;
+        mergeNotes.push("protectedStopSource:current_dominates");
+      }
+      if (
+        stopImproveDistance(side, currentProtectionStop, nextProtectionStop) >=
+        Math.max(0.000001, tick / 2)
+      ) {
+        dominatedByCurrent = true;
+      }
+    }
+  }
+
+  const effectivePatch = {};
+  for (const [key, value] of Object.entries(nextPatch)) {
+    if (noopWriteSkip && equivalentTradeFieldValue(currentTrade?.[key], value, tick)) {
+      continue;
+    }
+    effectivePatch[key] = value;
+  }
+
+  const meaningfulProtectionWrite = Object.keys(effectivePatch).some((key) =>
+    PROTECTION_STATE_PATCH_KEYS.has(key),
+  );
+  if (
+    Object.prototype.hasOwnProperty.call(effectivePatch, "protectionStateVersion")
+  ) {
+    if (!meaningfulProtectionWrite) {
+      delete effectivePatch.protectionStateVersion;
+    } else {
+      effectivePatch.protectionStateVersion = Math.max(
+        Number(currentTrade?.protectionStateVersion ?? 0) + 1,
+        Number(effectivePatch.protectionStateVersion ?? 0) || 0,
+      );
+      if (
+        noopWriteSkip &&
+        equivalentTradeFieldValue(
+          currentTrade?.protectionStateVersion,
+          effectivePatch.protectionStateVersion,
+          1,
+        )
+      ) {
+        delete effectivePatch.protectionStateVersion;
+      }
+    }
+  }
+
+  return {
+    patch: effectivePatch,
+    dominatedByCurrent,
+    mergeAction: Object.keys(effectivePatch).length
+      ? dominatedByCurrent
+        ? "MERGED_WITH_CURRENT_PROTECTION"
+        : mergeNotes.length
+          ? "NORMALIZED_PROTECTION_PATCH"
+          : "APPLY_PATCH"
+      : dominatedByCurrent
+        ? "DOMINATED_BY_CURRENT"
+        : "NOOP",
+    protectionWriteNoop: Object.keys(effectivePatch).length === 0,
+    mergeNotes,
+  };
+}
+
 function isSoftBrokerModifyError(error) {
   const msg = String(error?.message || error || "").toLowerCase();
   return (
@@ -1477,6 +2115,270 @@ function protectionUpgradeReason({
   if (label) return label;
   if (trade?.tp1Done) return "RUNNER_PROTECTION";
   return "PROTECTION_UPGRADE";
+}
+
+function normalizeLoserCompressionStateValue(state, fallback = "NONE") {
+  const raw = String(state || fallback).trim().toUpperCase();
+  if (raw === "EXITED") return "EXIT";
+  if (["NONE", "L1", "L2", "EXIT"].includes(raw)) return raw;
+  return fallback;
+}
+
+function loserCompressionStateLegacyValue(state, fallback = "NONE") {
+  const normalized = normalizeLoserCompressionStateValue(state, fallback);
+  return normalized === "EXIT" ? "EXITED" : normalized;
+}
+
+function loserCompressionStateFromProtectedStopSource(protectedStopSource = null) {
+  const raw = String(protectedStopSource || "").trim().toUpperCase();
+  if (raw === "ALC_L2") return "L2";
+  if (raw === "ALC_L1") return "L1";
+  return null;
+}
+
+function isAlcExitStateLive(trade = {}, exitReasonCode = null) {
+  const resolvedExitReasonCode = String(
+    exitReasonCode ??
+      trade?.exitReasonCode ??
+      trade?.panicExitReason ??
+      "",
+  )
+    .trim()
+    .toUpperCase();
+  return Boolean(
+    trade?.loserExitTriggered ||
+      resolvedExitReasonCode === "ALC_EXIT_NOW" ||
+      String(trade?.loserCompressionDesiredAction || "")
+        .trim()
+        .toUpperCase() === "EXIT_NOW" ||
+      normalizeLoserCompressionStateValue(
+        trade?.loserCompressionTargetState ??
+          trade?.loserCompressionSubmittedState ??
+          trade?.loserCompressionAppliedState ??
+          trade?.loserCompressionState,
+        "NONE",
+      ) === "EXIT",
+  );
+}
+
+function buildAlcBaseStatePatch({
+  trade,
+  plan = null,
+  now = new Date(),
+  targetState = null,
+}) {
+  const resolvedTargetState = normalizeLoserCompressionStateValue(
+    targetState ??
+      plan?.meta?.loserCompressionTargetState ??
+      trade?.loserCompressionTargetState ??
+      trade?.loserCompressionState,
+    "NONE",
+  );
+  const failureScore = toFiniteOrNull(
+    plan?.meta?.failureScore ?? trade?.loserCompressionScoreAtLastAction,
+  );
+  const patch = {
+    loserCompressionDesiredAction:
+      plan?.meta?.loserCompressionDesiredAction ??
+      trade?.loserCompressionDesiredAction ??
+      "HOLD",
+    loserCompressionTargetState: resolvedTargetState,
+    loserCompressionState: loserCompressionStateLegacyValue(resolvedTargetState),
+    loserCompressionScoreAtLastAction: failureScore,
+    loserCompressionReasonAtLastAction:
+      plan?.meta?.loserCompressionReason ??
+      trade?.loserCompressionReasonAtLastAction ??
+      null,
+    loserCompressionLastAction:
+      plan?.meta?.loserCompressionAction ??
+      trade?.loserCompressionLastAction ??
+      null,
+    loserCompressionLastActionAt: now,
+    loserCompressionAppliedSource:
+      trade?.loserCompressionAppliedSource ?? null,
+    loserCompressionAppliedConfirmed: Boolean(
+      trade?.loserCompressionAppliedConfirmed,
+    ),
+    loserCompressionAttributionConfidence:
+      trade?.loserCompressionAttributionConfidence ?? null,
+  };
+  const triggeredAt =
+    trade?.loserCompressionTriggeredAt ??
+    trade?.loserCompressionActivatedAt ??
+    (resolvedTargetState !== "NONE" ? now : null);
+  if (triggeredAt) {
+    patch.loserCompressionTriggeredAt = triggeredAt;
+  }
+  if (resolvedTargetState !== "NONE" && !trade?.loserCompressionActivatedAt) {
+    patch.loserCompressionActivatedAt = now;
+  }
+  return patch;
+}
+
+function buildAlcSubmittedStatePatch({
+  trade,
+  plan = null,
+  now = new Date(),
+  targetState = null,
+  requestedStop = null,
+  pendingAction = null,
+  blockedReason = "ALC_REQUEST_SUBMITTED",
+  retryCount = null,
+  lastRequestedStop = null,
+}) {
+  const resolvedTargetState = normalizeLoserCompressionStateValue(
+    targetState ??
+      plan?.meta?.loserCompressionTargetState ??
+      trade?.loserCompressionTargetState ??
+      trade?.loserCompressionState,
+    "NONE",
+  );
+  const patch = {
+    ...buildAlcBaseStatePatch({
+      trade,
+      plan,
+      now,
+      targetState: resolvedTargetState,
+    }),
+    loserCompressionSubmittedState: resolvedTargetState,
+    loserCompressionPendingAction: pendingAction,
+    loserCompressionPendingSince: pendingAction ? now : null,
+    loserCompressionLastRequestedStop: Number.isFinite(Number(lastRequestedStop))
+      ? Number(lastRequestedStop)
+      : Number.isFinite(Number(requestedStop))
+        ? Number(requestedStop)
+        : toFiniteOrNull(trade?.loserCompressionLastRequestedStop),
+    loserCompressionLastAttemptAt: now,
+    loserCompressionBlockedReason: blockedReason,
+    loserCompressionRetryCount: Math.max(
+      0,
+      Number(
+        retryCount ??
+          trade?.loserCompressionRetryCount ??
+          0,
+      ),
+    ),
+    loserCompressionAppliedSource:
+      trade?.loserCompressionAppliedSource ?? null,
+    loserCompressionAppliedConfirmed: Boolean(
+      trade?.loserCompressionAppliedConfirmed,
+    ),
+    loserCompressionAttributionConfidence:
+      trade?.loserCompressionAttributionConfidence ?? null,
+    loserExitTriggered:
+      resolvedTargetState === "EXIT" || Boolean(trade?.loserExitTriggered),
+    loserExitReasonCode:
+      resolvedTargetState === "EXIT"
+        ? "ALC_EXIT_NOW"
+        : trade?.loserExitReasonCode ?? null,
+  };
+  return patch;
+}
+
+function buildAlcAppliedStatePatch({
+  trade,
+  plan = null,
+  now = new Date(),
+  appliedState = null,
+  confirmedStop = null,
+  blockedReason = "ALC_APPLIED_CONFIRMED",
+  keepRetryCount = false,
+}) {
+  const resolvedAppliedState = normalizeLoserCompressionStateValue(
+    appliedState ??
+      trade?.loserCompressionAppliedState ??
+      trade?.loserCompressionTargetState ??
+      trade?.loserCompressionState,
+    "NONE",
+  );
+  return {
+    ...buildAlcBaseStatePatch({
+      trade,
+      plan,
+      now,
+      targetState:
+        plan?.meta?.loserCompressionTargetState ??
+        trade?.loserCompressionTargetState ??
+        resolvedAppliedState,
+    }),
+    loserCompressionSubmittedState:
+      plan?.meta?.loserCompressionTargetState ??
+      trade?.loserCompressionSubmittedState ??
+      resolvedAppliedState,
+    loserCompressionAppliedState: resolvedAppliedState,
+    loserCompressionPendingAction: null,
+    loserCompressionPendingSince: null,
+    loserCompressionLastConfirmedStop: Number.isFinite(Number(confirmedStop))
+      ? Number(confirmedStop)
+      : toFiniteOrNull(trade?.loserCompressionLastConfirmedStop),
+    loserCompressionLastConfirmedAt: now,
+    loserCompressionBlockedReason: blockedReason,
+    loserCompressionAppliedSource:
+      alcAppliedSourceForState(resolvedAppliedState),
+    loserCompressionAppliedConfirmed:
+      resolvedAppliedState !== "NONE",
+    loserCompressionAttributionConfidence:
+      resolvedAppliedState !== "NONE" ? "HIGH" : null,
+    loserCompressionRetryCount: keepRetryCount
+      ? Math.max(0, Number(trade?.loserCompressionRetryCount ?? 0))
+      : 0,
+    loserCompressionState: loserCompressionStateLegacyValue(resolvedAppliedState),
+    loserExitTriggered:
+      resolvedAppliedState === "EXIT" || Boolean(trade?.loserExitTriggered),
+    loserExitReasonCode:
+      resolvedAppliedState === "EXIT"
+        ? "ALC_EXIT_NOW"
+        : trade?.loserExitReasonCode ?? null,
+  };
+}
+
+function buildAlcRetryStatePatch({
+  trade,
+  plan = null,
+  now = new Date(),
+  targetState = null,
+  requestedStop = null,
+  blockedReason = null,
+  retryIncrement = 1,
+}) {
+  const resolvedTargetState = normalizeLoserCompressionStateValue(
+    targetState ??
+      plan?.meta?.loserCompressionTargetState ??
+      trade?.loserCompressionTargetState ??
+      trade?.loserCompressionState,
+    "NONE",
+  );
+  return {
+    ...buildAlcBaseStatePatch({
+      trade,
+      plan,
+      now,
+      targetState: resolvedTargetState,
+    }),
+    loserCompressionLastRequestedStop: Number.isFinite(Number(requestedStop))
+      ? Number(requestedStop)
+      : toFiniteOrNull(trade?.loserCompressionLastRequestedStop),
+    loserCompressionLastAttemptAt: now,
+    loserCompressionPendingAction: null,
+    loserCompressionPendingSince: null,
+    loserCompressionBlockedReason: blockedReason || trade?.loserCompressionBlockedReason || null,
+    loserCompressionAppliedSource:
+      trade?.loserCompressionAppliedSource ?? null,
+    loserCompressionAppliedConfirmed: Boolean(
+      trade?.loserCompressionAppliedConfirmed,
+    ),
+    loserCompressionAttributionConfidence:
+      trade?.loserCompressionAttributionConfidence ?? null,
+    loserCompressionRetryCount:
+      Math.max(0, Number(trade?.loserCompressionRetryCount ?? 0)) +
+      Math.max(0, Number(retryIncrement ?? 0)),
+    loserExitTriggered:
+      resolvedTargetState === "EXIT" || Boolean(trade?.loserExitTriggered),
+    loserExitReasonCode:
+      resolvedTargetState === "EXIT"
+        ? "ALC_EXIT_NOW"
+        : trade?.loserExitReasonCode ?? null,
+  };
 }
 
 function buildRunnerRebasePatch({
@@ -1555,6 +2457,31 @@ function buildRunnerRebasePatch({
     givebackConfirmMs: 0,
     hardGivebackArmedAt: null,
     shouldExitNowReason: null,
+    loserCompressionDesiredAction: "HOLD",
+    loserCompressionTargetState: "NONE",
+    loserCompressionSubmittedState: "NONE",
+    loserCompressionAppliedState: "NONE",
+    loserCompressionPendingAction: null,
+    loserCompressionPendingSince: null,
+    loserCompressionLastRequestedStop: null,
+    loserCompressionLastConfirmedStop: null,
+    loserCompressionLastAttemptAt: null,
+    loserCompressionLastConfirmedAt: null,
+    loserCompressionAppliedSource: null,
+    loserCompressionAppliedConfirmed: false,
+    loserCompressionAttributionConfidence: null,
+    loserCompressionRetryCount: 0,
+    loserCompressionState: "NONE",
+    loserCompressionLastActionAt: null,
+    loserCompressionActivatedAt: null,
+    loserCompressionEscalatedAt: null,
+    loserCompressionScoreAtLastAction: null,
+    loserCompressionReasonAtLastAction: null,
+    loserCompressionBlockedReason: null,
+    loserCompressionLastAction: null,
+    loserCompressionTriggeredAt: null,
+    loserExitTriggered: false,
+    loserExitReasonCode: null,
     greenLockActive: false,
     greenLockFloorPrice: null,
     profitLockArmed: false,
@@ -1572,8 +2499,12 @@ const PROTECTION_SAFETY_SOURCE_TAGS = Object.freeze(
     "TRUE_BE",
     "MIN_GREEN",
     "BE_PROFIT_LOCK",
+    "EARLY_WINNER_RETENTION",
+    "EARLY_WINNER_STRUCTURE",
     "PROFIT_LOCK",
     "GREEN_LOCK",
+    "MFE_LOCK",
+    "POST_1R_TIGHTEN",
     "TP1_BE_REPRICE",
   ]),
 );
@@ -1891,6 +2822,24 @@ class TradeManager {
         err.result = result;
         throw err;
       }
+
+      if (result.status === "APPLIED" && result.trade) {
+        observeBackgroundTask(
+          this._notifyTradeStateChange(currentTrade, result.trade, {
+            source:
+              options?.commandType ||
+              context?.type ||
+              EXEC_COMMAND.DIRECT_PATCH,
+          }),
+          (err) => {
+            reportFault({
+              code: "TRADING_TRADEMANAGER_ASYNC",
+              err,
+              message: "[src/trading/tradeManager.js] async task failed",
+            });
+          },
+        );
+      }
       return result;
     };
 
@@ -1911,6 +2860,157 @@ class TradeManager {
         allowMissing: Boolean(options?.allowMissing),
       },
     );
+  }
+
+  _buildTradeNotificationRuntime(trade = null) {
+    const token = Number(
+      trade?.instrument_token ?? trade?.instrumentToken ?? trade?.instrument?.instrument_token ?? 0,
+    );
+    const ltp = Number.isFinite(token) ? Number(this.lastPriceByToken.get(token)) : NaN;
+    const ltpTsRaw = Number.isFinite(token)
+      ? Number(this.lastTickAtByToken.get(token) ?? 0)
+      : NaN;
+    return {
+      ltp: Number.isFinite(ltp) ? ltp : null,
+      ltpTs:
+        Number.isFinite(ltpTsRaw) && ltpTsRaw > 0
+          ? new Date(ltpTsRaw).toISOString()
+          : null,
+      displayUpdatedAt:
+        Number.isFinite(ltpTsRaw) && ltpTsRaw > 0
+          ? new Date(ltpTsRaw).toISOString()
+          : new Date().toISOString(),
+      activeTradeId: this.activeTradeId || null,
+      killSwitch:
+        typeof this.risk?.getKillSwitch === "function"
+          ? Boolean(this.risk.getKillSwitch())
+          : null,
+    };
+  }
+
+  async _notifyTradeStateChange(previousTrade, trade, { source } = {}) {
+    if (!trade || !trade.tradeId) {
+      return { ok: true, skipped: true, reason: "missing_trade" };
+    }
+    return dispatchTradeUpdate({
+      previousTrade: previousTrade || null,
+      trade,
+      runtime: this._buildTradeNotificationRuntime(trade),
+      source: source || "trade_store",
+    });
+  }
+
+  async _applyProtectionStatePatch({
+    tradeId,
+    trade,
+    patch,
+    attemptId,
+    computationId,
+  }) {
+    const tradeKey = String(tradeId || "");
+    const tick = Math.max(
+      Number(trade?.instrument?.tick_size ?? 0.05) || 0.05,
+      0.01,
+    );
+    const side = String(trade?.side || "BUY").toUpperCase();
+    const noopWriteSkip = envFlagEnabled(env.PROTECTION_NOOP_WRITE_SKIP, true);
+    const dedupeEnabled = envFlagEnabled(env.PROTECTION_DEDUPE_ENABLED, true);
+    const allowRetry = envFlagEnabled(env.PROTECTION_CONFLICT_RETRY_ONCE, true);
+    let liveTrade = trade || null;
+    let protectionPatchConflict = false;
+
+    for (let attempt = 0; attempt < (allowRetry ? 2 : 1); attempt += 1) {
+      const prepared = mergeProtectionPatchAgainstTrade({
+        trade: liveTrade,
+        patch,
+        side,
+        tick,
+        noopWriteSkip,
+        dedupeEnabled,
+      });
+      if (prepared.protectionWriteNoop) {
+        logger.info(
+          {
+            tradeId: tradeKey,
+            protectionComputationId: computationId,
+            protectionApplyAttemptId: attemptId,
+            protectionPatchConflict,
+            protectionPatchDominatedByCurrent: prepared.dominatedByCurrent,
+            protectionStateMergeAction: prepared.mergeAction,
+            protectionWriteNoop: true,
+            protectionPatchSkippedReason: prepared.dominatedByCurrent
+              ? "DOMINATED_BY_CURRENT_PROTECTION"
+              : "NO_EFFECTIVE_CHANGE",
+          },
+          "[dyn_exit] protection patch skipped",
+        );
+        return {
+          trade: liveTrade,
+          applied: false,
+          ...prepared,
+          protectionPatchConflict,
+          protectionPatchSkippedReason: prepared.dominatedByCurrent
+            ? "DOMINATED_BY_CURRENT_PROTECTION"
+            : "NO_EFFECTIVE_CHANGE",
+        };
+      }
+
+      try {
+        const result = await this._updateTrade(tradeKey, prepared.patch, {
+          currentTrade: liveTrade,
+          expectedVersion: Number.isFinite(Number(liveTrade?.version))
+            ? Number(liveTrade.version)
+            : undefined,
+          commandType: EXEC_COMMAND.ADJUST_PROTECTION,
+        });
+        const latestTrade =
+          result?.trade ||
+          this._tradeCommandContexts.get(tradeKey)?.trade ||
+          { ...(liveTrade || {}), ...(prepared.patch || {}) };
+        logger.info(
+          {
+            tradeId: tradeKey,
+            protectionComputationId: computationId,
+            protectionApplyAttemptId: attemptId,
+            protectionPatchConflict,
+            protectionPatchDominatedByCurrent: prepared.dominatedByCurrent,
+            protectionStateMergeAction: prepared.mergeAction,
+            protectionWriteNoop: false,
+            patchKeys: Object.keys(prepared.patch),
+          },
+          "[dyn_exit] protection patch applied",
+        );
+        return {
+          trade: latestTrade,
+          applied: true,
+          ...prepared,
+          protectionPatchConflict,
+          protectionPatchSkippedReason: null,
+        };
+      } catch (err) {
+        if (
+          err?.code !== "TRADE_VERSION_CONFLICT" ||
+          !allowRetry ||
+          attempt > 0 ||
+          !err?.result?.trade
+        ) {
+          throw err;
+        }
+        liveTrade = err.result.trade;
+        protectionPatchConflict = true;
+      }
+    }
+
+    return {
+      trade: liveTrade,
+      applied: false,
+      patch: {},
+      dominatedByCurrent: false,
+      mergeAction: "CONFLICT_RETRY_EXHAUSTED",
+      protectionWriteNoop: true,
+      protectionPatchConflict,
+      protectionPatchSkippedReason: "CONFLICT_RETRY_EXHAUSTED",
+    };
   }
 
   _collectTrackedTradeIds() {
@@ -2794,10 +3894,20 @@ class TradeManager {
     });
   }
 
-  _buildBrokerPlacementControls(params, { purpose } = {}) {
+  _buildBrokerPlacementControls(params, { purpose, instrument } = {}) {
     const nextParams = { ...(params || {}) };
     const orderType = String(nextParams.order_type || "").toUpperCase();
     const entryPurpose = this._isEntryOrderPurpose(purpose);
+    const qty = Math.max(0, Number(nextParams.quantity ?? 0));
+    const freezeQty = this._resolveFreezeQty(instrument);
+    const autosliceEligible =
+      entryPurpose &&
+      env.KITE_USE_AUTOSLICE === true &&
+      Number.isFinite(qty) &&
+      qty > 0 &&
+      Number.isFinite(freezeQty) &&
+      freezeQty > 0 &&
+      qty > freezeQty;
     let ttlApplied = false;
     let autosliceApplied = false;
 
@@ -2815,7 +3925,7 @@ class TradeManager {
       ttlApplied = true;
     }
 
-    if (entryPurpose && env.KITE_USE_AUTOSLICE === true) {
+    if (autosliceEligible) {
       nextParams.autoslice = true;
       autosliceApplied = true;
     }
@@ -2826,6 +3936,8 @@ class TradeManager {
       autosliceApplied,
       validity: nextParams.validity || null,
       validityTtl: nextParams.validity_ttl ?? null,
+      autosliceEligible,
+      freezeQty: Number.isFinite(freezeQty) && freezeQty > 0 ? freezeQty : null,
     };
   }
 
@@ -3392,6 +4504,102 @@ class TradeManager {
     }
     if (!Object.prototype.hasOwnProperty.call(trade, "shadowExitActive")) {
       patch.shadowExitActive = false;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionDesiredAction")) {
+      patch.loserCompressionDesiredAction = "HOLD";
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionTargetState")) {
+      patch.loserCompressionTargetState = "NONE";
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionSubmittedState")) {
+      patch.loserCompressionSubmittedState = "NONE";
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionAppliedState")) {
+      patch.loserCompressionAppliedState = "NONE";
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionPendingAction")) {
+      patch.loserCompressionPendingAction = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionPendingSince")) {
+      patch.loserCompressionPendingSince = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionLastRequestedStop")) {
+      patch.loserCompressionLastRequestedStop = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionLastConfirmedStop")) {
+      patch.loserCompressionLastConfirmedStop = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionLastAttemptAt")) {
+      patch.loserCompressionLastAttemptAt = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionLastConfirmedAt")) {
+      patch.loserCompressionLastConfirmedAt = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionAppliedSource")) {
+      patch.loserCompressionAppliedSource = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionAppliedConfirmed")) {
+      patch.loserCompressionAppliedConfirmed = false;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        trade,
+        "loserCompressionAttributionConfidence",
+      )
+    ) {
+      patch.loserCompressionAttributionConfidence = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionRetryCount")) {
+      patch.loserCompressionRetryCount = 0;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionState")) {
+      patch.loserCompressionState = "NONE";
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(trade, "loserCompressionLastActionAt")
+    ) {
+      patch.loserCompressionLastActionAt = null;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(trade, "loserCompressionActivatedAt")
+    ) {
+      patch.loserCompressionActivatedAt = null;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(trade, "loserCompressionEscalatedAt")
+    ) {
+      patch.loserCompressionEscalatedAt = null;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        trade,
+        "loserCompressionScoreAtLastAction",
+      )
+    ) {
+      patch.loserCompressionScoreAtLastAction = null;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        trade,
+        "loserCompressionReasonAtLastAction",
+      )
+    ) {
+      patch.loserCompressionReasonAtLastAction = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionBlockedReason")) {
+      patch.loserCompressionBlockedReason = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionLastAction")) {
+      patch.loserCompressionLastAction = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserCompressionTriggeredAt")) {
+      patch.loserCompressionTriggeredAt = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserExitTriggered")) {
+      patch.loserExitTriggered = false;
+    }
+    if (!Object.prototype.hasOwnProperty.call(trade, "loserExitReasonCode")) {
+      patch.loserExitReasonCode = null;
     }
     if (!Object.prototype.hasOwnProperty.call(trade, "protectionUpgradePending")) {
       patch.protectionUpgradePending = false;
@@ -4558,7 +5766,11 @@ class TradeManager {
       alert(
         "error",
         "ENTRY slippage too high -> panic exit",
-        { source, ...metrics.slippageLog },
+        tradeIncidentNotificationMeta({
+          source,
+          ...metrics.slippageLog,
+          notificationCategory: "ENTRY_SLIPPAGE",
+        }),
       ).catch((err) =>
         reportWindowedFault({
           code: "ALERT_SEND_FAILED",
@@ -4687,11 +5899,12 @@ class TradeManager {
     });
 
     if (partial) {
-      alert("warn", "ENTRY partial fill (protecting filled qty)", {
+      alert("warn", "ENTRY partial fill (protecting filled qty)", tradeLifecycleNotificationMeta({
         tradeId,
         source,
         filledQty: finalQty,
-      }).catch((err) =>
+        notificationCategory: "ENTRY_PARTIAL_FILL",
+      })).catch((err) =>
         reportWindowedFault({
           code: "ALERT_SEND_FAILED",
           windowKey: "alert_send_failed",
@@ -4701,14 +5914,15 @@ class TradeManager {
         }),
       );
     } else {
-      alert("info", "ENTRY filled", {
+      alert("info", "ENTRY filled", tradeLifecycleNotificationMeta({
         tradeId,
         source,
         avg: metrics.avg,
         expected: metrics.slippageLog.expected,
         filledQty: finalQty,
         slipBps: metrics.slippageLog.rawSlipBps,
-      }).catch((err) =>
+        notificationCategory: "ENTRY_FILLED",
+      })).catch((err) =>
         reportWindowedFault({
           code: "ALERT_SEND_FAILED",
           windowKey: "alert_send_failed",
@@ -7446,7 +8660,7 @@ class TradeManager {
     await this._flattenNetPositions("HARD_FLAT_ON_RESTART");
   }
 
-  async _safePlaceOrder(variety, params, { purpose, tradeId } = {}) {
+  async _safePlaceOrder(variety, params, { purpose, tradeId, instrument } = {}) {
     const maxAttempts = Math.max(1, Number(env.ORDER_PLACE_RETRY_MAX ?? 1));
     const backoffMs = Math.max(
       0,
@@ -7457,6 +8671,7 @@ class TradeManager {
 
     const placeControls = this._buildBrokerPlacementControls(params, {
       purpose,
+      instrument,
     });
     const baseParams = { ...placeControls.params };
 
@@ -8460,6 +9675,10 @@ class TradeManager {
       exitReasonCode: String(reason || "BROKER_SQUAREOFF").toUpperCase(),
       exitAuthority: "RECONCILER",
     });
+    const alcExitStateLive = isAlcExitStateLive(
+      trade,
+      exitLifecycle.exitReasonCode,
+    );
     await this._updateTrade(tradeId, {
       status: STATUS.CLOSED,
       exitPrice: exitPrice > 0 ? exitPrice : trade?.exitPrice,
@@ -8470,6 +9689,19 @@ class TradeManager {
       exitAuthority: exitLifecycle.exitAuthority,
       brokerSquareoffOrderId: String(order?.order_id || "") || null,
       brokerSquareoffAt: new Date(),
+      ...(alcExitStateLive
+        ? buildAlcAppliedStatePatch({
+            trade,
+            now: new Date(),
+            appliedState: "EXIT",
+            confirmedStop: toFiniteOrNull(
+              trade?.loserCompressionLastConfirmedStop ??
+                trade?.brokerStopLoss ??
+                trade?.stopLoss,
+            ),
+            keepRetryCount: true,
+          })
+        : {}),
       exitAt: new Date(),
       closedAt: new Date(),
     });
@@ -8508,6 +9740,8 @@ class TradeManager {
     const exitLifecycle = resolveExitLifecycle(reason);
     let panicExitPlaced = false;
     let pendingMarked = false;
+    let alcExitRequested = false;
+    let latestPanicTrade = trade;
     try {
       if (!tradeId) return;
       if (this._panicExitInFlight.has(tradeKey) && !opts.force) {
@@ -8517,6 +9751,11 @@ class TradeManager {
 
       // prevent repeated panic exits
       const fresh = (await getTrade(tradeId)) || trade;
+      latestPanicTrade = fresh;
+      alcExitRequested = isAlcExitStateLive(
+        fresh,
+        exitLifecycle.exitReasonCode,
+      );
       if (fresh?.panicExitOrderId && !opts.force) {
         logger.warn(
           { tradeId, panicExitOrderId: fresh.panicExitOrderId },
@@ -8537,6 +9776,16 @@ class TradeManager {
         panicExitState: PANIC_EXIT_STATE_PENDING,
         panicExitStartedAt: new Date(),
         panicExitReason: reason,
+        ...(alcExitRequested
+          ? buildAlcSubmittedStatePatch({
+              trade: fresh,
+              now: new Date(),
+              targetState: "EXIT",
+              pendingAction: "EXIT_REQUEST",
+              blockedReason: "ALC_REQUEST_SUBMITTED",
+              retryCount: fresh?.loserCompressionRetryCount ?? 0,
+            })
+          : {}),
         ...(exitLifecycle.exitReasonCode
           ? {
               exitFamily: exitLifecycle.exitFamily,
@@ -8667,6 +9916,19 @@ class TradeManager {
           exitAuthority: exitLifecycle.exitAuthority ?? "PANIC_EXIT_ENGINE",
           panicExitPending: false,
           panicExitState: STATUS.PANIC_EXIT_CONFIRMED,
+          ...(alcExitRequested
+            ? buildAlcAppliedStatePatch({
+                trade: fresh,
+                now: new Date(),
+                appliedState: "EXIT",
+                confirmedStop: toFiniteOrNull(
+                  fresh?.loserCompressionLastConfirmedStop ??
+                    fresh?.brokerStopLoss ??
+                    fresh?.stopLoss,
+                ),
+                keepRetryCount: true,
+              })
+            : {}),
           closedAt: new Date(),
         });
         pendingMarked = false;
@@ -8698,7 +9960,11 @@ class TradeManager {
         { tradeId, reason, exitSide, qty, isTimeStopReason, preferLimit },
         "[panic] placing exit",
       );
-      alert("warn", `PANIC EXIT: ${reason}`, { tradeId }).catch((err) => {
+      alert("warn", `PANIC EXIT: ${reason}`, tradeIncidentNotificationMeta({
+        tradeId,
+        reason,
+        notificationCategory: "PANIC_EXIT",
+      })).catch((err) => {
         reportFault({
           code: "TRADING_TRADEMANAGER_ASYNC",
           err,
@@ -8793,6 +10059,16 @@ class TradeManager {
           panicExitPlacedAt: new Date(),
           exitPlacedAt: new Date(),
           closeReason: `PANIC_EXIT_PLACED | ${reason}`,
+          ...(alcExitRequested
+            ? buildAlcSubmittedStatePatch({
+                trade: fresh,
+                now: new Date(),
+                targetState: "EXIT",
+                pendingAction: "EXIT_REQUEST",
+                blockedReason: "ALC_REQUEST_SUBMITTED",
+                retryCount: fresh?.loserCompressionRetryCount ?? 0,
+              })
+            : {}),
           exitFamily: exitLifecycle.exitFamily ?? null,
           exitReasonCode: exitLifecycle.exitReasonCode ?? null,
           exitAuthority: exitLifecycle.exitAuthority ?? "PANIC_EXIT_ENGINE",
@@ -8821,6 +10097,19 @@ class TradeManager {
           await this._updateTrade(tradeId, {
             panicExitPending: false,
             panicExitState: null,
+            ...(alcExitRequested
+              ? buildAlcRetryStatePatch({
+                  trade: latestPanicTrade || trade,
+                  now: new Date(),
+                  targetState: "EXIT",
+                  requestedStop: toFiniteOrNull(
+                    latestPanicTrade?.loserCompressionLastRequestedStop ??
+                      latestPanicTrade?.brokerStopLoss ??
+                      latestPanicTrade?.stopLoss,
+                  ),
+                  blockedReason: "ALC_REQUEST_FAILED",
+                })
+              : {}),
           });
         } catch (err) {
           reportFault({
@@ -9192,6 +10481,31 @@ class TradeManager {
             structureTrailAllowed: false,
             protectionGateOpen: false,
             winnerModeActive: false,
+            loserCompressionDesiredAction: "HOLD",
+            loserCompressionTargetState: "NONE",
+            loserCompressionSubmittedState: "NONE",
+            loserCompressionAppliedState: "NONE",
+            loserCompressionPendingAction: null,
+            loserCompressionPendingSince: null,
+            loserCompressionLastRequestedStop: null,
+            loserCompressionLastConfirmedStop: null,
+            loserCompressionLastAttemptAt: null,
+            loserCompressionLastConfirmedAt: null,
+            loserCompressionAppliedSource: null,
+            loserCompressionAppliedConfirmed: false,
+            loserCompressionAttributionConfidence: null,
+            loserCompressionRetryCount: 0,
+            loserCompressionState: "NONE",
+            loserCompressionLastActionAt: null,
+            loserCompressionActivatedAt: null,
+            loserCompressionEscalatedAt: null,
+            loserCompressionScoreAtLastAction: null,
+            loserCompressionReasonAtLastAction: null,
+            loserCompressionBlockedReason: null,
+            loserCompressionLastAction: null,
+            loserCompressionTriggeredAt: null,
+            loserExitTriggered: false,
+            loserExitReasonCode: null,
             exitFamily: null,
             exitReasonCode: null,
             exitAuthority: null,
@@ -9953,7 +11267,16 @@ class TradeManager {
     return this._runTradeCommand(
       trade?.tradeId,
       EXEC_COMMAND.ADJUST_PROTECTION,
-      async () => this._maybeDynamicAdjustExitsImpl(trade, byId),
+      async (context) =>
+        this._maybeDynamicAdjustExitsImpl(
+          envFlagEnabled(env.PROTECTION_DEDUPE_ENABLED, true) ||
+            envFlagEnabled(env.PROTECTION_NOOP_WRITE_SKIP, true) ||
+            envFlagEnabled(env.PROTECTION_CONFLICT_RETRY_ONCE, true)
+            ? context?.trade || trade
+            : trade,
+          byId,
+          context,
+        ),
       {
         seedTrade: trade,
         allowMissing: true,
@@ -9961,7 +11284,7 @@ class TradeManager {
     );
   }
 
-  async _maybeDynamicAdjustExitsImpl(trade, byId) {
+  async _maybeDynamicAdjustExitsImpl(trade, byId, context = null) {
     if (String(env.DYNAMIC_EXITS_ENABLED) !== "true") return;
     const tradeId = String(trade?.tradeId || "");
     if (!tradeId) return;
@@ -10106,6 +11429,11 @@ class TradeManager {
       const tradeForPlan = Number.isFinite(peakFromTick)
         ? { ...trade, peakLtp: peakFromTick }
         : trade;
+      const protectionComputationId = (
+        typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : crypto.randomBytes(8).toString("hex")
+      ).slice(0, 12);
 
       const plan = computeDynamicExitPlan({
         trade: tradeForPlan,
@@ -10155,6 +11483,7 @@ class TradeManager {
           executionRiskInr: plan?.meta?.executionRiskInr ?? trade?.executionRiskInr ?? null,
           executionRiskSource:
             plan?.meta?.executionRiskSource ?? null,
+          protectionComputationId,
           givebackR: plan?.givebackR ?? plan?.meta?.givebackR ?? null,
           givebackPct: plan?.givebackPct ?? plan?.meta?.givebackPct ?? null,
           quoteQuality: plan?.meta?.quoteQuality ?? null,
@@ -10171,6 +11500,65 @@ class TradeManager {
           beLockHit: Boolean(plan?.meta?.beLockHit),
           beFloor: Number(plan?.meta?.beFloor ?? 0) || null,
           beFloorSource: plan?.meta?.beFloorSource ?? null,
+          protectionPhase: plan?.meta?.protectionPhase ?? null,
+          protectionPhaseNumber:
+            Number(plan?.meta?.protectionPhaseNumber ?? 0) || null,
+          earlyWinnerEligible: Boolean(plan?.meta?.earlyWinnerEligible),
+          earlyWinnerArmed: Boolean(plan?.meta?.earlyWinnerArmed),
+          earlyWinnerConfirmed: Boolean(plan?.meta?.earlyWinnerConfirmed),
+          earlyWinnerTier: Number(plan?.meta?.earlyWinnerTier ?? 0) || 0,
+          earlyWinnerFloor: Number(plan?.meta?.earlyWinnerFloor ?? 0) || null,
+          earlyWinnerFloorSource: plan?.meta?.earlyWinnerFloorSource ?? null,
+          earlyWinnerKeepR: plan?.meta?.earlyWinnerKeepR ?? null,
+          earlyWinnerMfeLockActive: Boolean(
+            plan?.meta?.earlyWinnerMfeLockActive,
+          ),
+          earlyWinnerHandoffReady: Boolean(
+            plan?.meta?.earlyWinnerHandoffReady,
+          ),
+          beFirstTouchDetected: Boolean(plan?.meta?.beFirstTouchDetected),
+          beConfirmationProgress:
+            plan?.meta?.beConfirmationProgress ?? null,
+          floorPersistenceState:
+            plan?.meta?.floorPersistenceState ?? null,
+          handoffState: plan?.meta?.handoffState ?? null,
+          dynamicTrailArmR: plan?.meta?.dynamicTrailArmR ?? null,
+          dynamicTrailArmReason: plan?.meta?.dynamicTrailArmReason ?? null,
+          handoffQualityScore: plan?.meta?.handoffQualityScore ?? null,
+          handoffMaturity: plan?.meta?.handoffMaturity ?? null,
+          handoffAdvanceReason: plan?.meta?.handoffAdvanceReason ?? null,
+          handoffDeferredReason: plan?.meta?.handoffDeferredReason ?? null,
+          handoffStateStable: plan?.meta?.handoffStateStable ?? null,
+          handoffHysteresisActive:
+            plan?.meta?.handoffHysteresisActive ?? null,
+          trailDeferredReason: plan?.meta?.trailDeferredReason ?? null,
+          structureCandidateAvailable: Boolean(
+            plan?.meta?.structureCandidateAvailable,
+          ),
+          structureCandidateReason:
+            plan?.meta?.structureCandidateReason ?? null,
+          structureReferenceType:
+            plan?.meta?.structureReferenceType ?? null,
+          structureReferencePrice:
+            Number(plan?.meta?.structureReferencePrice ?? 0) || null,
+          structureMappedFloor:
+            Number(plan?.meta?.structureMappedFloor ?? 0) || null,
+          structureRejectedReason:
+            plan?.meta?.structureRejectedReason ?? null,
+          structureWonArbitration: Boolean(
+            plan?.meta?.structureWonArbitration,
+          ),
+          structureFallbackUsed: Boolean(
+            plan?.meta?.structureFallbackUsed,
+          ),
+          arbitrationWinner: plan?.meta?.arbitrationWinner ?? null,
+          arbitrationWinnerReason:
+            plan?.meta?.arbitrationWinnerReason ?? null,
+          candidateFloors: plan?.meta?.candidateFloors ?? [],
+          rejectedFloorReasons:
+            plan?.meta?.rejectedFloorReasons ?? null,
+          protectionStateVersion:
+            Number(plan?.meta?.protectionStateVersion ?? 0) || 0,
           greenLockActive: Boolean(
             plan?.greenLockActive ??
             plan?.tradePatch?.greenLockActive ??
@@ -10200,6 +11588,111 @@ class TradeManager {
           trailArmed: Boolean(plan?.meta?.trailArmed ?? plan?.meta?.trailHit),
           trailAllowed: Boolean(plan?.meta?.trailAllowed),
           trailActive: Boolean(plan?.meta?.trailActive),
+          loserCompressionEligible: Boolean(
+            plan?.meta?.loserCompressionEligible,
+          ),
+          loserCompressionActive: Boolean(
+            plan?.meta?.loserCompressionActive,
+          ),
+          loserCompressionAction:
+            plan?.meta?.loserCompressionAction ?? null,
+          loserCompressionDesiredAction:
+            plan?.meta?.loserCompressionDesiredAction ?? null,
+          loserCompressionReason:
+            plan?.meta?.loserCompressionReason ?? null,
+          loserCompressionAuthority:
+            plan?.meta?.loserCompressionAuthority ?? null,
+          loserCompressionLevel:
+            Number(plan?.meta?.loserCompressionLevel ?? 0) || 0,
+          loserCompressionTargetState:
+            plan?.meta?.loserCompressionTargetState ?? null,
+          loserCompressionSubmittedState:
+            plan?.meta?.loserCompressionSubmittedState ?? null,
+          loserCompressionAppliedState:
+            plan?.meta?.loserCompressionAppliedState ?? null,
+          loserCompressionPendingAction:
+            plan?.meta?.loserCompressionPendingAction ?? null,
+          loserCompressionPendingSince:
+            plan?.meta?.loserCompressionPendingSince ?? null,
+          loserCompressionRetryCount:
+            Number(plan?.meta?.loserCompressionRetryCount ?? 0) || 0,
+          loserCompressionLastRequestedStop:
+            Number(plan?.meta?.loserCompressionLastRequestedStop ?? 0) || null,
+          loserCompressionLastConfirmedStop:
+            Number(plan?.meta?.loserCompressionLastConfirmedStop ?? 0) || null,
+          loserCompressionRequestOutcome:
+            plan?.meta?.loserCompressionRequestOutcome ?? null,
+          loserCompressionAppliedSource:
+            plan?.meta?.loserCompressionAppliedSource ?? null,
+          loserCompressionAppliedConfirmed: Boolean(
+            plan?.meta?.loserCompressionAppliedConfirmed,
+          ),
+          loserCompressionAttributionConfidence:
+            plan?.meta?.loserCompressionAttributionConfidence ?? null,
+          loserCompressionSuperseded: Boolean(
+            plan?.meta?.loserCompressionSuperseded,
+          ),
+          loserCompressionSupersedeReason:
+            plan?.meta?.loserCompressionSupersedeReason ?? null,
+          loserCompressionFinalProtectionOwner:
+            plan?.meta?.loserCompressionFinalProtectionOwner ?? null,
+          failureScore: Number(plan?.meta?.failureScore ?? 0) || null,
+          failureScoreBreakdown:
+            plan?.meta?.failureScoreBreakdown ?? null,
+          failureWeakFollowThroughScore:
+            Number(plan?.meta?.failureWeakFollowThroughScore ?? 0) || null,
+          failureAdverseProgressionScore:
+            Number(plan?.meta?.failureAdverseProgressionScore ?? 0) || null,
+          failureStructureScore:
+            Number(plan?.meta?.failureStructureScore ?? 0) || null,
+          failureUnderlyingScore:
+            Number(plan?.meta?.failureUnderlyingScore ?? 0) || null,
+          failureMicrostructureScore:
+            Number(plan?.meta?.failureMicrostructureScore ?? 0) || null,
+          failureStructureBroken: Boolean(
+            plan?.meta?.failureStructureBroken,
+          ),
+          failureStructureReasonCode:
+            plan?.meta?.failureStructureReasonCode ?? null,
+          failureUnderlyingBroken: Boolean(
+            plan?.meta?.failureUnderlyingBroken,
+          ),
+          failureGracePassed: Boolean(plan?.meta?.failureGracePassed),
+          failureMfeR: plan?.meta?.failureMfeR ?? null,
+          failureAdverseR: plan?.meta?.failureAdverseR ?? null,
+          loserCompressionProposedStop:
+            Number(plan?.meta?.loserCompressionProposedStop ?? 0) || null,
+          loserCompressionFinalStop:
+            Number(plan?.meta?.loserCompressionFinalStop ?? 0) || null,
+          loserCompressionBlockedReason:
+            plan?.meta?.loserCompressionBlockedReason ?? null,
+          loserCompressionRequestBlockedReason:
+            plan?.meta?.loserCompressionRequestBlockedReason ?? null,
+          loserCompressionTriggeredAt:
+            plan?.meta?.loserCompressionTriggeredAt ?? null,
+          loserCompressionEscalated: Boolean(
+            plan?.meta?.loserCompressionEscalated,
+          ),
+          loserExitTriggered: Boolean(plan?.meta?.loserExitTriggered),
+          loserExitReasonCode:
+            plan?.meta?.loserExitReasonCode ?? null,
+          alcRequested: Boolean(plan?.meta?.alcRequested),
+          alcRequestedLevel: plan?.meta?.alcRequestedLevel ?? null,
+          alcAppliedLevel: plan?.meta?.alcAppliedLevel ?? null,
+          alcAppliedSource: plan?.meta?.alcAppliedSource ?? null,
+          alcAttributionConfidence:
+            plan?.meta?.alcAttributionConfidence ?? null,
+          alcRequestedButNotApplied: Boolean(
+            plan?.meta?.alcRequestedButNotApplied,
+          ),
+          alcAppliedButSuperseded: Boolean(
+            plan?.meta?.alcAppliedButSuperseded,
+          ),
+          alcSupersededBy: plan?.meta?.alcSupersededBy ?? null,
+          alcFinalProtectionOwner:
+            plan?.meta?.alcFinalProtectionOwner ?? null,
+          alcSavedRiskR: Number(plan?.meta?.alcSavedRiskR ?? 0) || null,
+          alcSavedRiskInr: Number(plan?.meta?.alcSavedRiskInr ?? 0) || null,
           trailHit: Boolean(plan?.meta?.trailHit),
           trailBlockReason: plan?.meta?.trailBlockReason ?? null,
           profitLockArmed: Boolean(plan?.meta?.profitLockArmed),
@@ -10426,7 +11919,7 @@ class TradeManager {
                 mfeR: plan?.meta?.mfeR,
               }),
             );
-            alert("warn", `Time stop triggered -> exit (${exitReason})`, {
+            alert("warn", `Time stop triggered -> exit (${exitReason})`, tradeIncidentNotificationMeta({
               tradeId,
               timeStopKind:
                 plan?.meta?.timeStopKind ||
@@ -10441,7 +11934,8 @@ class TradeManager {
               peakPnlR: plan?.meta?.peakPnlR,
               peakPriceR: plan?.meta?.peakPriceR,
               mfeR: plan?.meta?.mfeR,
-            }).catch((err) =>
+              notificationCategory: "TIME_STOP_EXIT",
+            })).catch((err) =>
               reportWindowedFault({
                 code: "ALERT_SEND_FAILED",
                 windowKey: "alert_send_failed",
@@ -10580,7 +12074,7 @@ class TradeManager {
                 minGreenInr: trade?.minGreenInr,
               }),
             );
-            alert("info", "BE armed", {
+            alert("info", "BE armed", tradeLifecycleNotificationMeta({
               tradeId,
               side: trade?.side,
               entryPrice: trade?.entryPrice,
@@ -10593,7 +12087,8 @@ class TradeManager {
               beEligible: Boolean(plan?.meta?.beEligible),
               beArmed: true,
               beApplied: Boolean(plan?.meta?.beApplied),
-            }).catch((err) =>
+              notificationCategory: "BE_ARMED",
+            })).catch((err) =>
               reportWindowedFault({
                 code: "ALERT_SEND_FAILED",
                 windowKey: "alert_send_failed",
@@ -10615,7 +12110,22 @@ class TradeManager {
               "[dyn_exit] BE armed",
             );
           }
-          await this._updateTrade(tradeId, patch);
+          const protectionApplyAttemptId = (
+            typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : crypto.randomBytes(8).toString("hex")
+          ).slice(0, 12);
+          const protectionWrite = await this._applyProtectionStatePatch({
+            tradeId,
+            trade,
+            patch,
+            attemptId: protectionApplyAttemptId,
+            computationId: protectionComputationId,
+          });
+          if (protectionWrite?.trade) {
+            trade = protectionWrite.trade;
+            if (context) context.trade = protectionWrite.trade;
+          }
         } catch (err) {
           reportFault({
             code: "TRADING_TRADEMANAGER_CATCH",
@@ -10625,7 +12135,22 @@ class TradeManager {
         }
       } else if (peakPatch) {
         try {
-          await this._updateTrade(tradeId, peakPatch);
+          const protectionApplyAttemptId = (
+            typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : crypto.randomBytes(8).toString("hex")
+          ).slice(0, 12);
+          const protectionWrite = await this._applyProtectionStatePatch({
+            tradeId,
+            trade,
+            patch: peakPatch,
+            attemptId: protectionApplyAttemptId,
+            computationId: protectionComputationId,
+          });
+          if (protectionWrite?.trade) {
+            trade = protectionWrite.trade;
+            if (context) context.trade = protectionWrite.trade;
+          }
         } catch (err) {
           reportFault({
             code: "TRADING_TRADEMANAGER_CATCH",
@@ -10693,8 +12218,49 @@ class TradeManager {
             trailArmed: Boolean(plan?.meta?.trailArmed ?? plan?.meta?.trailHit),
             trailAllowed: Boolean(plan?.meta?.trailAllowed),
             trailActive: Boolean(plan?.meta?.trailActive),
+            loserCompressionActive: Boolean(
+              plan?.meta?.loserCompressionActive,
+            ),
+            loserCompressionAction:
+              plan?.meta?.loserCompressionAction ?? null,
+            loserCompressionDesiredAction:
+              plan?.meta?.loserCompressionDesiredAction ?? null,
+            loserCompressionReason:
+              plan?.meta?.loserCompressionReason ?? null,
+            loserCompressionTargetState:
+              plan?.meta?.loserCompressionTargetState ?? null,
+            loserCompressionSubmittedState:
+              plan?.meta?.loserCompressionSubmittedState ?? null,
+            loserCompressionAppliedState:
+              plan?.meta?.loserCompressionAppliedState ?? null,
+            loserCompressionPendingAction:
+              plan?.meta?.loserCompressionPendingAction ?? null,
+            loserCompressionRetryCount:
+              Number(plan?.meta?.loserCompressionRetryCount ?? 0) || 0,
+            loserCompressionRequestOutcome:
+              plan?.meta?.loserCompressionRequestOutcome ?? null,
+            loserCompressionRequestBlockedReason:
+              plan?.meta?.loserCompressionRequestBlockedReason ?? null,
+            failureScore: Number(plan?.meta?.failureScore ?? 0) || null,
             trailBlockReason: plan?.meta?.trailBlockReason ?? null,
+            protectionPhase: plan?.meta?.protectionPhase ?? null,
+            earlyWinnerConfirmed: Boolean(plan?.meta?.earlyWinnerConfirmed),
+            earlyWinnerTier: Number(plan?.meta?.earlyWinnerTier ?? 0) || 0,
+            earlyWinnerFloor:
+              Number(plan?.meta?.earlyWinnerFloor ?? 0) || null,
+            earlyWinnerFloorSource:
+              plan?.meta?.earlyWinnerFloorSource ?? null,
+            handoffState: plan?.meta?.handoffState ?? null,
+            trailDeferredReason: plan?.meta?.trailDeferredReason ?? null,
             protectedStopSource: plan?.meta?.protectedStopSource ?? null,
+            arbitrationWinner: plan?.meta?.arbitrationWinner ?? null,
+            arbitrationWinnerReason:
+              plan?.meta?.arbitrationWinnerReason ?? null,
+            candidateFloors: plan?.meta?.candidateFloors ?? [],
+            rejectedFloorReasons:
+              plan?.meta?.rejectedFloorReasons ?? null,
+            protectionStateVersion:
+              Number(plan?.meta?.protectionStateVersion ?? 0) || 0,
             reasonTags: dynamicStopGuard.reasonTags,
           },
           dynamicStopGuard.blockedReason === "NO_AUTHORITY"
@@ -10744,9 +12310,80 @@ class TradeManager {
             currentStopLoss:
               Number(trade.stopLoss ?? sl?.trigger_price ?? 0) || 0,
           };
+          const candidateProtectionStop =
+            Number(plan?.sl?.stopLoss ?? plan?.finalStop ?? 0) || null;
+          const latestDesiredProtectionStop = bestStopForTradeSide(trade.side, [
+            trade?.finalStopLoss,
+            trade?.desiredStopLoss,
+            trade?.telemetryProposalFloor,
+          ]);
+          const pendingProtectionStop = toFiniteOrNull(
+            trade?.protectionUpgradeTargetStopLoss,
+          );
+          const alcPendingModify = /^ALC_L[12]$/.test(
+            String(plan?.meta?.protectedStopSource || ""),
+          );
+          const pendingProtectionSinceMs = Date.parse(
+            trade?.protectionUpgradeUnconfirmedSince ??
+              trade?.loserCompressionPendingSince ??
+              "",
+          );
+          const alcPendingStaleThresholdMs = Math.max(
+            Number(env.ALC_RETRY_COOLDOWN_MS ?? 3000) || 3000,
+            Number(env.ALC_PENDING_STALE_MS ?? 8000) || 8000,
+          );
+          const staleAlcPendingModify =
+            alcPendingModify &&
+            Number.isFinite(pendingProtectionSinceMs) &&
+            Date.now() - pendingProtectionSinceMs >=
+              alcPendingStaleThresholdMs;
+          const duplicatePendingModify =
+            envFlagEnabled(env.PROTECTION_DEDUPE_ENABLED, true) &&
+            Boolean(trade?.protectionUpgradePending) &&
+            Number.isFinite(candidateProtectionStop) &&
+            Number.isFinite(pendingProtectionStop) &&
+            !staleAlcPendingModify &&
+            stopImproveDistance(
+              trade.side,
+              candidateProtectionStop,
+              pendingProtectionStop,
+            ) < dynamicStopTick;
+          const dominatedByCurrentProtection =
+            envFlagEnabled(env.PROTECTION_DEDUPE_ENABLED, true) &&
+            Number.isFinite(candidateProtectionStop) &&
+            Number.isFinite(latestDesiredProtectionStop) &&
+            !isBetterStopForTradeSide(
+              trade.side,
+              candidateProtectionStop,
+              latestDesiredProtectionStop,
+            ) &&
+            stopImproveDistance(
+              trade.side,
+              latestDesiredProtectionStop,
+              candidateProtectionStop,
+            ) >=
+              dynamicStopTick / 2;
+
+          if (duplicatePendingModify || dominatedByCurrentProtection) {
+            logger.info(
+              {
+                tradeId,
+                protectionComputationId,
+                brokerModifyIntentDeduped: true,
+                dedupeReason: duplicatePendingModify
+                  ? "PENDING_TARGET_ALREADY_ACTIVE"
+                  : "DOMINATED_BY_CURRENT_PROTECTION",
+                candidateProtectionStop,
+                latestDesiredProtectionStop,
+                pendingProtectionStop,
+              },
+              "[dyn_exit] broker modify intent deduped",
+            );
+            return;
+          }
 
           try {
-            await this._safeModifyOrder(
+            const modifyResult = await this._safeModifyOrder(
               env.DEFAULT_ORDER_VARIETY,
               trade.slOrderId,
               patch,
@@ -10758,6 +12395,33 @@ class TradeManager {
                 minIntervalMs: Math.max(1000, Number(minModifyMs ?? 0)),
               },
             );
+            let skippedReason = null;
+            if (modifyResult?.skipped) {
+              skippedReason = String(modifyResult.reason || "SKIPPED");
+              const brokerModifyIntentDeduped = [
+                "cooldown",
+                "delta_below_tick",
+                "broker_already_matches_target",
+                "broker_no_change",
+                "no_effective_change",
+              ].includes(skippedReason);
+              logger.info(
+                {
+                  tradeId,
+                  protectionComputationId,
+                  brokerModifyIntentDeduped,
+                  brokerModifySkippedReason: skippedReason,
+                  candidateProtectionStop,
+                },
+                "[dyn_exit] broker modify intent skipped",
+              );
+              if (
+                skippedReason !== "broker_already_matches_target" &&
+                skippedReason !== "broker_no_change"
+              ) {
+                return;
+              }
+            }
             const appliedTrigger = Number(
               retryMeta?.appliedPatch?.trigger_price ?? plan.sl.stopLoss,
             );
@@ -10775,37 +12439,118 @@ class TradeManager {
               (String(trade?.side || "").toUpperCase() === "BUY"
                 ? appliedTrigger >= beFloor
                 : appliedTrigger <= beFloor);
-          const beFloorSource = plan?.meta?.beFloorSource ?? null;
-          const protectedStopSource =
-            plan?.meta?.protectedStopSource ??
-            (beAppliedNow ? beFloorSource : null);
-          const protectionUpgradeLabel = protectionUpgradeReason({
-            trade,
-            source: "DYN_TRAIL_SL",
-            protectedStopSource,
-          });
-          const stopUpdateLogMessage =
-            protectedStopSource === "TRAIL"
-              ? "[dyn_exit] SL trailed"
-                : protectedStopSource === "PROFIT_LOCK"
-                  ? "[dyn_exit] SL moved to profit lock"
-                  : beAppliedNow
-                    ? "[dyn_exit] SL moved to BE floor"
-                    : "[dyn_exit] SL updated";
+            const beFloorSource = plan?.meta?.beFloorSource ?? null;
+            const protectedStopSource =
+              plan?.meta?.protectedStopSource ??
+              (beAppliedNow ? beFloorSource : null);
+            const alcRequestedState =
+              loserCompressionStateFromProtectedStopSource(
+                protectedStopSource,
+              );
+            const alcStateAt = new Date();
+            const alcBrokerConfirmed =
+              Boolean(alcRequestedState) &&
+              ["broker_already_matches_target", "broker_no_change"].includes(
+                skippedReason,
+              );
+            const alcSubmittedPending = Boolean(
+              alcRequestedState && !alcBrokerConfirmed,
+            );
+            const persistedStopLoss = toFiniteOrNull(
+              trade?.stopLoss ?? sl?.trigger_price ?? appliedTrigger,
+            );
+            const persistedSlTrigger = toFiniteOrNull(
+              trade?.slTrigger ?? trade?.stopLoss ?? sl?.trigger_price ?? appliedTrigger,
+            );
+            const alcStatePatch = alcRequestedState
+              ? alcBrokerConfirmed
+                ? buildAlcAppliedStatePatch({
+                    trade,
+                    plan,
+                    now: alcStateAt,
+                    appliedState: alcRequestedState,
+                    confirmedStop: appliedTrigger,
+                  })
+                : buildAlcSubmittedStatePatch({
+                    trade,
+                    plan,
+                    now: alcStateAt,
+                    targetState:
+                      plan?.meta?.loserCompressionTargetState ??
+                      alcRequestedState,
+                    requestedStop: plan?.sl?.stopLoss,
+                    pendingAction: "STOP_MODIFY",
+                    blockedReason: "ALC_REQUEST_SUBMITTED",
+                    retryCount: trade?.loserCompressionRetryCount ?? 0,
+                    lastRequestedStop: appliedTrigger,
+                    })
+              : {};
+            const winnerRetentionSource = /^MFE_LOCK_TIER_/.test(
+              String(protectedStopSource || ""),
+            )
+              ? true
+              : [
+                  "EARLY_WINNER_RETENTION",
+                  "EARLY_WINNER_STRUCTURE",
+                  "MFE_LOCK",
+                  "POST_1R_TIGHTEN",
+                  "GREEN_LOCK",
+                ].includes(String(protectedStopSource || "").toUpperCase());
+            const protectionUpgradeLabel = protectionUpgradeReason({
+              trade,
+              source: "DYN_TRAIL_SL",
+              protectedStopSource,
+            });
+            const stopUpdateLogMessage =
+              protectedStopSource === "TRAIL"
+                ? "[dyn_exit] SL trailed"
+                : /^ALC_L[12]$/.test(String(protectedStopSource || ""))
+                  ? alcBrokerConfirmed
+                    ? "[dyn_exit] adaptive loser compression already confirmed"
+                    : "[dyn_exit] adaptive loser compression modify submitted"
+                  : protectedStopSource === "PROFIT_LOCK"
+                    ? "[dyn_exit] SL moved to profit lock"
+                    : winnerRetentionSource
+                      ? "[dyn_exit] SL moved to winner retention"
+                      : beAppliedNow
+                        ? "[dyn_exit] SL moved to BE floor"
+                        : "[dyn_exit] SL updated";
             const stopUpdateAlertMessage =
               protectedStopSource === "TRAIL"
                 ? "SL trailed"
-                : protectedStopSource === "PROFIT_LOCK"
-                  ? "SL moved to profit lock"
-                  : beAppliedNow
-                    ? "SL moved to BE floor"
-                    : "SL updated";
+                : /^ALC_L[12]$/.test(String(protectedStopSource || ""))
+                  ? alcBrokerConfirmed
+                    ? "Adaptive loser compression already confirmed"
+                    : "Adaptive loser compression modify submitted"
+                  : protectedStopSource === "PROFIT_LOCK"
+                    ? "SL moved to profit lock"
+                    : winnerRetentionSource
+                      ? "SL moved to winner retention"
+                      : beAppliedNow
+                        ? "SL moved to BE floor"
+                        : "SL updated";
             await this._updateTrade(tradeId, {
-              stopLoss: appliedTrigger,
-              slTrigger: appliedTrigger,
+              ...(!alcSubmittedPending
+                ? {
+                    stopLoss: appliedTrigger,
+                    slTrigger: appliedTrigger,
+                    ...(appliedLimit != null ? { slLimitPrice: appliedLimit } : {}),
+                  }
+                : {}),
               shadowExitActive: false,
-              ...clearProtectionUpgradeStatePatch(),
-              ...(appliedLimit != null ? { slLimitPrice: appliedLimit } : {}),
+              ...(
+                alcSubmittedPending
+                  ? protectionUpgradeStatePatch({
+                      proposedStopLoss: appliedTrigger,
+                      pending: true,
+                      softFailed: false,
+                      reason: protectedStopSource,
+                      now: alcStateAt,
+                    })
+                  : clearProtectionUpgradeStatePatch()
+              ),
+              ...(alcBrokerConfirmed ? { brokerStopLoss: appliedTrigger } : {}),
+              ...alcStatePatch,
               ...(beAppliedNow
                 ? {
                     beAppliedAt: new Date(),
@@ -10815,7 +12560,8 @@ class TradeManager {
                 : {}),
               ...this._eventPatch("SL_TRAILED", {
                 tradeId,
-                stopLoss: appliedTrigger,
+                stopLoss: alcSubmittedPending ? persistedStopLoss : appliedTrigger,
+                requestedStopLoss: alcSubmittedPending ? appliedTrigger : null,
                 trailSl: plan?.tradePatch?.trailSl ?? trade?.trailSl,
                 beFloor: Number.isFinite(beFloor) ? beFloor : null,
                 beFloorSource,
@@ -10823,34 +12569,44 @@ class TradeManager {
                 beAppliedNow,
               }),
             });
-            try {
-              this._updateSlWatchTrigger(tradeId, appliedTrigger);
-            } catch (err) {
-              reportFault({
-                code: "TRADING_TRADEMANAGER_CATCH",
-                err,
-                message: "[src/trading/tradeManager.js] caught and continued",
-              });
+            if (!alcSubmittedPending) {
+              try {
+                this._updateSlWatchTrigger(tradeId, appliedTrigger);
+              } catch (err) {
+                reportFault({
+                  code: "TRADING_TRADEMANAGER_CATCH",
+                  err,
+                  message: "[src/trading/tradeManager.js] caught and continued",
+                });
+              }
             }
             did = true;
             logger.info(
               {
                 tradeId,
-                stopLoss: appliedTrigger,
+                stopLoss: alcSubmittedPending ? persistedStopLoss : appliedTrigger,
+                requestedStopLoss: alcSubmittedPending ? appliedTrigger : null,
                 beFloor: Number.isFinite(beFloor) ? beFloor : null,
                 beFloorSource,
                 protectedStopSource,
                 beAppliedNow,
+                loserCompressionSubmittedState:
+                  alcStatePatch?.loserCompressionSubmittedState ?? null,
+                loserCompressionAppliedState:
+                  alcStatePatch?.loserCompressionAppliedState ?? null,
+                loserCompressionPendingAction:
+                  alcStatePatch?.loserCompressionPendingAction ?? null,
                 meta: plan.meta,
               },
               stopUpdateLogMessage,
             );
-            alert("info", stopUpdateAlertMessage, {
+            alert("info", stopUpdateAlertMessage, tradeLifecycleNotificationMeta({
               tradeId,
               side: trade?.side,
               prevStopLoss:
                 Number(trade.stopLoss ?? sl?.trigger_price ?? 0) || null,
-              stopLoss: appliedTrigger,
+              stopLoss: alcSubmittedPending ? persistedStopLoss : appliedTrigger,
+              requestedStopLoss: alcSubmittedPending ? appliedTrigger : null,
               beFloor: Number.isFinite(beFloor) ? beFloor : null,
               beFloorSource,
               protectedStopSource,
@@ -10865,7 +12621,8 @@ class TradeManager {
               trailAllowed: Boolean(plan?.meta?.trailAllowed),
               trailActive: Boolean(plan?.meta?.trailActive),
               trailBlockReason: plan?.meta?.trailBlockReason ?? null,
-            }).catch((err) =>
+              notificationCategory: beAppliedNow ? "BE_ACTIVE" : "STOP_IMPROVED",
+            })).catch((err) =>
               reportWindowedFault({
                 code: "ALERT_SEND_FAILED",
                 windowKey: "alert_send_failed",
@@ -10915,8 +12672,13 @@ class TradeManager {
               source: "DYN_TRAIL_SL",
               protectedStopSource,
             });
+            const alcRequestedState =
+              loserCompressionStateFromProtectedStopSource(
+                protectedStopSource,
+              );
             const meaningfulProtectionUpgrade = Boolean(
               PROTECTION_SAFETY_SOURCE_TAGS.has(protectionUpgradeLabel) ||
+                /^MFE_LOCK_TIER_/.test(String(protectionUpgradeLabel || "")) ||
                 Boolean(plan?.meta?.beArmed) ||
                 Boolean(plan?.meta?.profitLockArmed) ||
                 Boolean(plan?.meta?.greenLockActive),
@@ -10930,7 +12692,42 @@ class TradeManager {
               );
               const nextBeApplyFails =
                 Math.max(0, Number(trade?.beApplyFails ?? 0)) + 1;
-              if (meaningfulProtectionUpgrade) {
+              if (alcRequestedState) {
+                try {
+                  await this._updateTrade(tradeId, {
+                    ...buildAlcSubmittedStatePatch({
+                      trade,
+                      plan,
+                      now: new Date(),
+                      targetState:
+                        plan?.meta?.loserCompressionTargetState ??
+                        alcRequestedState,
+                      requestedStop: plan?.sl?.stopLoss,
+                      pendingAction: "STOP_MODIFY",
+                      blockedReason: "ALC_REQUEST_STALE",
+                      retryCount:
+                        Math.max(
+                          0,
+                          Number(trade?.loserCompressionRetryCount ?? 0),
+                        ) + 1,
+                    }),
+                    ...protectionUpgradeStatePatch({
+                      proposedStopLoss: plan?.sl?.stopLoss,
+                      fallbackMode: "BROKER_PENDING",
+                      pending: true,
+                      softFailed: true,
+                      reason: protectedStopSource,
+                      now: new Date(),
+                    }),
+                  });
+                } catch (err) {
+                  reportFault({
+                    code: "TRADING_TRADEMANAGER_CATCH",
+                    err,
+                    message: "[src/trading/tradeManager.js] caught and continued",
+                  });
+                }
+              } else if (meaningfulProtectionUpgrade) {
                 try {
                   await this._updateTrade(tradeId, {
                     beApplyFails: nextBeApplyFails,
@@ -11019,6 +12816,29 @@ class TradeManager {
 
             const fails = Number(this._dynExitFailCount.get(tradeId) ?? 0) + 1;
             this._dynExitFailCount.set(tradeId, fails);
+            if (alcRequestedState) {
+              try {
+                await this._updateTrade(tradeId, {
+                  ...buildAlcRetryStatePatch({
+                    trade,
+                    plan,
+                    now: new Date(),
+                    targetState:
+                      plan?.meta?.loserCompressionTargetState ??
+                      alcRequestedState,
+                    requestedStop: plan?.sl?.stopLoss,
+                    blockedReason: "ALC_REQUEST_FAILED",
+                  }),
+                  ...clearProtectionUpgradeStatePatch(),
+                });
+              } catch (err) {
+                reportFault({
+                  code: "TRADING_TRADEMANAGER_CATCH",
+                  err,
+                  message: "[src/trading/tradeManager.js] caught and continued",
+                });
+              }
+            }
             const baseBackoff = Number(env.DYN_EXIT_FAIL_BACKOFF_MS ?? 2000);
             const maxBackoff = Number(
               env.DYN_EXIT_FAIL_BACKOFF_MAX_MS ?? 15000,
@@ -12554,7 +14374,7 @@ class TradeManager {
     };
   }
 
-  async _multiTfConfirm(token, side) {
+  async _multiTfConfirm(token, side, options = {}) {
     const info = await this._multiTfTrend(token);
     if (!info.ok) return info;
 
@@ -12568,6 +14388,24 @@ class TradeManager {
     const trendOk = side === "BUY" ? emaFast > emaSlow : emaFast < emaSlow;
 
     if (!trendOk) {
+      const transitionPass = shouldAllowMultiTfTrendTransitionPass({
+        strategyId: options?.strategyId || null,
+        signal: options?.signal || null,
+        regimeMeta: options?.regimeMeta || null,
+        multiTfMeta: info?.meta || null,
+        config: options?.config || env,
+      });
+      if (transitionPass.allowed) {
+        return {
+          ok: true,
+          meta: {
+            ...(info?.meta || {}),
+            transitionPassUsed: true,
+            transitionPassReason: transitionPass.reason,
+            transitionPassMeta: transitionPass.meta || null,
+          },
+        };
+      }
       return {
         ok: false,
         reason: "MULTI_TF_TREND_MISMATCH",
@@ -12590,6 +14428,7 @@ class TradeManager {
     policy,
     underlying,
     isTradeToken,
+    signal,
   }) {
     if (String(env.REGIME_FILTERS_ENABLED) !== "true") return { ok: true };
 
@@ -12684,9 +14523,26 @@ class TradeManager {
       strategyId: strategyId || null,
       strategyStyle: style,
     };
+    const admissionProfile = getAdmissionProfile(strategyId, style);
+    baseMeta.admissionProfileId = admissionProfile.profileId || null;
 
     // Strategy-aware regime gating (pro-level, but tunable)
     if (String(env.STRATEGY_STYLE_REGIME_GATES_ENABLED || "true") === "true") {
+      if (
+        Array.isArray(admissionProfile.allowedRegimeFamilies) &&
+        admissionProfile.allowedRegimeFamilies.length &&
+        baseMeta.regimeFamily &&
+        !admissionProfile.allowedRegimeFamilies.includes(String(baseMeta.regimeFamily).toUpperCase())
+      ) {
+        return {
+          ok: false,
+          reason: `STYLE_REGIME_MISMATCH (${style} in ${baseMeta.regime})`,
+          meta: {
+            ...baseMeta,
+            allowedRegimeFamilies: admissionProfile.allowedRegimeFamilies,
+          },
+        };
+      }
       const styleGate = isStrategyStyleAllowedForRegime({
         strategyStyle: style,
         regime: baseMeta.regime,
@@ -12844,7 +14700,12 @@ class TradeManager {
       (mtfMode === "ALL" || (mtfMode === "TREND_ONLY" && style !== "RANGE"));
 
     if (shouldConfirm) {
-      const tf = await this._multiTfConfirm(token, side);
+      const tf = await this._multiTfConfirm(token, side, {
+        strategyId,
+        signal,
+        regimeMeta: baseMeta,
+        config: env,
+      });
       if (!tf.ok) {
         return { ...tf, meta: { ...baseMeta, ...(tf.meta || {}) } };
       }
@@ -12971,6 +14832,25 @@ class TradeManager {
         conversion: signal.conversionSummary,
       };
     }
+    const admissionProfile = getAdmissionProfile(
+      signal?.strategyId,
+      signal?.strategyStyle,
+    );
+    const baseAdmissionSnapshot = createAdmissionSnapshot({
+      signal,
+      profile: admissionProfile,
+      nowTs: Date.now(),
+      env,
+    });
+    let admissionStageState = {};
+    let admissionSnapshot = buildAdmissionContext({
+      baseSnapshot: baseAdmissionSnapshot,
+      signal,
+      profile: admissionProfile,
+      nowTs: Date.now(),
+      env,
+    });
+    let admissionAudit = buildDecisionAudit({ snapshot: admissionSnapshot });
     markEntryPipelineStage(signal, "routeStartAt");
 
     const applyConversionSummary = (signalLike, patch = {}) => {
@@ -12986,6 +14866,21 @@ class TradeManager {
       }
       return nextSignal;
     };
+    const refreshAdmissionSnapshot = (signalLike = signal, extra = {}) => {
+      admissionStageState = {
+        ...admissionStageState,
+        ...extra,
+      };
+      admissionSnapshot = buildAdmissionContext({
+        baseSnapshot: baseAdmissionSnapshot,
+        signal: signalLike,
+        profile: admissionProfile,
+        nowTs: Date.now(),
+        env,
+        ...admissionStageState,
+      });
+      return admissionSnapshot;
+    };
 
     let s = signal;
     const recordSignalDecision = ({
@@ -12998,9 +14893,32 @@ class TradeManager {
       meta = {},
       conversion = null,
     }) => {
-      const nextSignal = conversion
+      let nextSignal = conversion
         ? applyConversionSummary(signalLike, conversion)
         : signalLike;
+      const snapshot = refreshAdmissionSnapshot(nextSignal);
+      admissionAudit = mergeDecisionStage({
+        audit: admissionAudit,
+        snapshot,
+        outcome,
+        stage,
+        reason,
+        meta,
+      });
+      const finalizedDecision = buildDecisionSignalPatch({
+        signal: nextSignal,
+        priorConversionSummary: nextSignal?.conversionSummary || null,
+        snapshot,
+        audit: admissionAudit,
+        outcome,
+        stage,
+        reason,
+        meta,
+      });
+      nextSignal = applyConversionSummary(
+        nextSignal,
+        finalizedDecision.conversionPatch,
+      );
       if (signalLike === signal) signal = nextSignal;
       if (signalLike === s) s = nextSignal;
       this._recordTradeDecision({
@@ -13010,7 +14928,7 @@ class TradeManager {
         outcome,
         stage,
         reason,
-        meta,
+        meta: finalizedDecision.decisionMeta,
       });
       return nextSignal;
     };
@@ -13659,8 +15577,12 @@ class TradeManager {
         routedConfidence: routeConfidence?.routedScore ?? null,
         postRouteDecision: "ROUTED",
       });
+      refreshAdmissionSnapshot(s, {
+        routeConfidence,
+      });
     } else {
       markEntryPipelineStage(s, "contractSelectedAt");
+      refreshAdmissionSnapshot(s);
     }
 
     const token = Number(s.instrument_token);
@@ -13688,61 +15610,26 @@ class TradeManager {
     });
 
     const trackDecision = (outcome, stage, reason, meta, decisionTrade = null) => {
-      const conversion = {};
-      if (stage === "admission" && outcome === "BLOCKED") {
-        conversion.postRouteDecision =
-          reason === "POST_ROUTE_LOW_CONFIDENCE"
-            ? "BLOCKED"
-            : s?.conversionSummary?.postRouteDecision ??
-              (s.option_meta ? "PASSED" : null);
-        conversion.finalOutcome =
-          reason === "POST_ROUTE_LOW_CONFIDENCE"
-            ? "BLOCKED_POST_ROUTE_CONFIDENCE"
-            : "BLOCKED_ADMISSION";
-        conversion.finalReasonCode = reason;
-        if (reason === "POST_ROUTE_LOW_CONFIDENCE") {
-          conversion.routedConfidence = toFiniteOrNull(meta?.conf ?? s?.confidence);
-        }
-      } else if (stage === "admission" && outcome === "ADJUSTED") {
-        if (reason === "POST_ROUTE_CONFIDENCE_SOFT_PASS") {
-          conversion.postRouteDecision = "SOFT_PASS";
-          conversion.routedConfidence = toFiniteOrNull(meta?.routedScore ?? meta?.conf);
-        }
-      } else if (
-        (stage === "risk_fit" || stage === "affordability") &&
-        outcome === "BLOCKED"
-      ) {
-        conversion.postRouteDecision =
-          s?.conversionSummary?.postRouteDecision ??
-          (s.option_meta ? "PASSED" : null);
-        conversion.riskFitDecision =
-          meta?.riskFitDecision || (stage === "risk_fit" ? "BLOCKED" : null);
-        conversion.finalOutcome = "BLOCKED_RISK_FIT";
-        conversion.finalReasonCode = reason;
-      } else if (stage === "risk_fit" && outcome === "ADJUSTED") {
-        conversion.riskFitDecision = meta?.riskFitDecision || reason || "ADJUSTED";
-      } else if (stage === "entry" && outcome === "READY_FOR_EXECUTION") {
-        conversion.finalOutcome = "READY_FOR_EXECUTION";
-        conversion.finalReasonCode = reason;
-      } else if (stage === "entry" && outcome === "ENTRY_PLACED") {
-        conversion.postRouteDecision =
-          s?.conversionSummary?.postRouteDecision ??
-          (s.option_meta ? "PASSED" : null);
-        conversion.riskFitDecision =
-          s?.conversionSummary?.riskFitDecision || "FIT";
-        conversion.finalOutcome = "READY_FOR_EXECUTION";
-        conversion.finalReasonCode = reason;
-      } else if (stage === "entry" && outcome === "BLOCKED") {
-        conversion.finalOutcome = "BLOCKED_EXECUTION_ADMISSION";
-        conversion.finalReasonCode = reason;
-      } else if (stage === "optimizer" && outcome === "BLOCKED") {
-        conversion.finalOutcome = "BLOCKED_ADMISSION";
-        conversion.finalReasonCode = reason;
-      }
-
-      if (Object.keys(conversion).length > 0) {
-        s = applyConversionSummary(s, conversion);
-      }
+      const snapshot = refreshAdmissionSnapshot(s);
+      admissionAudit = mergeDecisionStage({
+        audit: admissionAudit,
+        snapshot,
+        outcome,
+        stage,
+        reason,
+        meta,
+      });
+      const finalizedDecision = buildDecisionSignalPatch({
+        signal: s,
+        priorConversionSummary: s?.conversionSummary || null,
+        snapshot,
+        audit: admissionAudit,
+        outcome,
+        stage,
+        reason,
+        meta,
+      });
+      s = applyConversionSummary(s, finalizedDecision.conversionPatch);
 
       this._recordTradeDecision({
         signal: s,
@@ -13751,7 +15638,7 @@ class TradeManager {
         outcome,
         stage,
         reason,
-        meta,
+        meta: finalizedDecision.decisionMeta,
       });
     };
 
@@ -14058,6 +15945,7 @@ class TradeManager {
       policy,
       underlying: s?.option_meta?.underlying,
       isTradeToken: !!s.option_meta,
+      signal: s,
     });
     if (!reg.ok) {
       trackDecision("BLOCKED", "admission", reg.reason || "REGIME_BLOCK", {
@@ -14068,6 +15956,29 @@ class TradeManager {
         "[trade] blocked (regime)",
       );
       return;
+    }
+    if (reg?.meta?.multiTf?.transitionPassUsed) {
+      trackDecision(
+        "ADJUSTED",
+        "admission",
+        "MULTI_TF_TREND_TRANSITION_PASS",
+        {
+          strategyId: s.strategyId || null,
+          regime: reg.meta?.regime || null,
+          secondaryRegime: reg.meta?.secondaryRegime || null,
+          compressionActive: reg.meta?.compressionActive === true,
+          multiTf: reg.meta.multiTf,
+        },
+      );
+      logger.info(
+        withSignalLifecycleMeta(s, {
+          token,
+          regime: reg.meta?.regime || null,
+          secondaryRegime: reg.meta?.secondaryRegime || null,
+          multiTf: reg.meta.multiTf,
+        }),
+        "[trade] multi-tf transition pass",
+      );
     }
 
     if (s.option_meta) {
@@ -14346,14 +16257,55 @@ class TradeManager {
           Number.isFinite(atr) && Number.isFinite(cl) && cl > 0
             ? (atr / cl) * 100
             : null;
+        const plannerAdmissionSnapshot = refreshAdmissionSnapshot(s, {
+          regimeMeta: reg?.meta || null,
+          quote: quoteAtEntry,
+          premiumPlanData,
+        });
 
-          plan = buildTradePlan({
+        if (
+          plannerAdmissionSnapshot?.readiness?.state === "BLOCKED_INCOMPLETE" ||
+          plannerAdmissionSnapshot?.readiness?.state === "BLOCKED_STALE"
+        ) {
+          trackDecision(
+            "BLOCKED",
+            "planner",
+            plannerAdmissionSnapshot.readiness.reasonCode ||
+              "ADMISSION_SNAPSHOT_INCOMPLETE",
+            {
+              readinessState: plannerAdmissionSnapshot.readiness.state,
+              readinessDegradedBy:
+                plannerAdmissionSnapshot.readiness.degradedBy || [],
+              readinessBlockers:
+                plannerAdmissionSnapshot.readiness.blockers || [],
+            },
+          );
+          logger.info(
+            withSignalLifecycleMeta(s, {
+              token,
+              readinessState: plannerAdmissionSnapshot.readiness.state,
+              readinessDegradedBy:
+                plannerAdmissionSnapshot.readiness.degradedBy || [],
+              readinessBlockers:
+                plannerAdmissionSnapshot.readiness.blockers || [],
+            }),
+            "[trade] blocked (planner readiness)",
+          );
+          return;
+        }
+
+        plan = buildTradePlan({
           env,
           candles: planCandles,
           premiumCandles,
           intervalMin,
           side: regimeSide,
           signalStyle: s.strategyStyle,
+          signal: s,
+          quote: quoteAtEntry,
+          instrument,
+          regimeMeta: reg?.meta || null,
+          logger,
           entryUnderlying,
           expectedMoveUnderlying: Number(reg?.meta?.expectedMovePerShare),
           atrPeriod: Number(env.EXPECTED_MOVE_ATR_PERIOD ?? 14),
@@ -14364,7 +16316,75 @@ class TradeManager {
           premiumTick: tick,
           atrPctUnderlying,
           rrFloorOverride: optimizerTelemetry.rrUsed,
+          admissionSnapshot: plannerAdmissionSnapshot,
         });
+        refreshAdmissionSnapshot(s, {
+          regimeMeta: reg?.meta || null,
+          quote: quoteAtEntry,
+          premiumPlanData,
+          plan,
+        });
+
+        if (plan?.meta?.planAccept === false) {
+          const plannerTelemetry = plan?.meta?.plannerTelemetry || {};
+          logger.info(
+            withSignalLifecycleMeta(s, {
+              token,
+              plannerReason: plan?.meta?.planRejectReason || plan?.reason || "PLANNER_REJECT",
+              planQualityScore: Number(plan?.meta?.planQualityScore ?? 0) || null,
+              validationRejectReasons: plan?.meta?.validation?.validationRejectReasons || [],
+              planWarnings: plan?.meta?.planWarnings || [],
+              family: plan?.meta?.setup?.family || null,
+              plannerPathUsed: plan?.meta?.plannerPathUsed || null,
+              readinessState: plan?.meta?.plannerTelemetry?.readinessState || null,
+              resolvedTriggerLevel:
+                plannerTelemetry.resolvedTriggerLevel ??
+                plan?.meta?.setup?.triggerLevel ??
+                null,
+              resolvedAnchorValue:
+                plannerTelemetry.resolvedAnchorValue ??
+                plan?.meta?.setup?.anchorValue ??
+                null,
+              authoritativePrimaryRrUsed:
+                Number(plan?.meta?.authoritativePrimaryRrUsed ?? plan?.authoritativePrimaryRrUsed) ||
+                null,
+              invalidTargetSources: Array.isArray(plannerTelemetry.invalidTargetSources)
+                ? plannerTelemetry.invalidTargetSources
+                : [],
+            }),
+            "[trade] blocked (planner)",
+          );
+          trackDecision(
+            "BLOCKED",
+            "planner",
+            plan?.meta?.planRejectReason || plan?.reason || "PLANNER_REJECT",
+            {
+              planQualityScore: Number(plan?.meta?.planQualityScore ?? 0) || null,
+              validationRejectReasons: plan?.meta?.validation?.validationRejectReasons || [],
+              planWarnings: plan?.meta?.planWarnings || [],
+              family: plan?.meta?.setup?.family || null,
+              plannerPathUsed: plan?.meta?.plannerPathUsed || null,
+              readinessState: plan?.meta?.plannerTelemetry?.readinessState || null,
+              resolvedTriggerLevel:
+                plannerTelemetry.resolvedTriggerLevel ??
+                plan?.meta?.setup?.triggerLevel ??
+                null,
+              resolvedAnchorValue:
+                plannerTelemetry.resolvedAnchorValue ??
+                plan?.meta?.setup?.anchorValue ??
+                null,
+              authoritativePrimaryRrUsed:
+                Number(plan?.meta?.authoritativePrimaryRrUsed ?? plan?.authoritativePrimaryRrUsed) ||
+                null,
+              invalidTargetSources: Array.isArray(plannerTelemetry.invalidTargetSources)
+                ? plannerTelemetry.invalidTargetSources
+                : [],
+              chosenTargetSourceType: plan?.meta?.chosenTargetSourceType || null,
+              chosenStopSourceType: plan?.meta?.chosenStopSourceType || null,
+            },
+          );
+          return;
+        }
 
         if (plan?.ok) {
           stopLoss = plan.stopLoss;
@@ -15204,6 +17224,31 @@ class TradeManager {
       lastProtectedR: null,
       lastProtectedInr: null,
       lastExitPlanReason: null,
+      loserCompressionDesiredAction: "HOLD",
+      loserCompressionTargetState: "NONE",
+      loserCompressionSubmittedState: "NONE",
+      loserCompressionAppliedState: "NONE",
+      loserCompressionPendingAction: null,
+      loserCompressionPendingSince: null,
+      loserCompressionLastRequestedStop: null,
+      loserCompressionLastConfirmedStop: null,
+      loserCompressionLastAttemptAt: null,
+      loserCompressionLastConfirmedAt: null,
+      loserCompressionAppliedSource: null,
+      loserCompressionAppliedConfirmed: false,
+      loserCompressionAttributionConfidence: null,
+      loserCompressionRetryCount: 0,
+      loserCompressionState: "NONE",
+      loserCompressionLastActionAt: null,
+      loserCompressionActivatedAt: null,
+      loserCompressionEscalatedAt: null,
+      loserCompressionScoreAtLastAction: null,
+      loserCompressionReasonAtLastAction: null,
+      loserCompressionBlockedReason: null,
+      loserCompressionLastAction: null,
+      loserCompressionTriggeredAt: null,
+      loserExitTriggered: false,
+      loserExitReasonCode: null,
       trailSl: null,
       trailActive: false,
       desiredStopLoss: null,
@@ -15389,7 +17434,7 @@ class TradeManager {
       const out = await this._safePlaceOrder(
         env.DEFAULT_ORDER_VARIETY,
         entryParams,
-        { purpose: "ENTRY", tradeId },
+        { purpose: "ENTRY", tradeId, instrument },
       );
       entryOrderId = out.orderId;
     } catch (e) {
@@ -15627,8 +17672,8 @@ class TradeManager {
     return this._runTradeCommand(
       linkedTrade?.tradeId,
       EXEC_COMMAND.APPLY_ORDER_UPDATE,
-      async (freshTrade) => {
-        const trade = freshTrade || linkedTrade;
+      async (commandContext) => {
+        const trade = commandContext?.trade || linkedTrade;
         if (!trade?.tradeId) return;
 
         this._scheduleReconcile("order_update");
@@ -15676,6 +17721,10 @@ class TradeManager {
               (trade?.panicExitReason ? null : "PANIC_EXIT_ENGINE"),
           },
         );
+        const alcExitStateLive = isAlcExitStateLive(
+          trade,
+          exitLifecycle.exitReasonCode,
+        );
 
         await this._updateTrade(trade.tradeId, {
           status: STATUS.CLOSED,
@@ -15694,6 +17743,19 @@ class TradeManager {
             exitLifecycle.exitAuthority ??
             trade?.exitAuthority ??
             "PANIC_EXIT_ENGINE",
+          ...(alcExitStateLive
+            ? buildAlcAppliedStatePatch({
+                trade,
+                now: new Date(),
+                appliedState: "EXIT",
+                confirmedStop: toFiniteOrNull(
+                  trade?.loserCompressionLastConfirmedStop ??
+                    trade?.brokerStopLoss ??
+                    trade?.stopLoss,
+                ),
+                keepRetryCount: true,
+              })
+            : {}),
           exitAt: new Date(),
           closedAt: new Date(),
         });
@@ -15718,6 +17780,7 @@ class TradeManager {
       // OPEN / PARTIAL: track progress, but do not place SL/TARGET (panic exit is the protection)
       if (status === "OPEN" || status === "PARTIAL") {
         const filledNow = Number(order.filled_quantity ?? 0);
+        const alcExitStateLive = isAlcExitStateLive(trade);
         if (filledNow > 0) {
           await this._updateTrade(trade.tradeId, {
             panicExitPending: false,
@@ -15725,6 +17788,16 @@ class TradeManager {
             panicExitFilledQty: filledNow,
             panicExitAvgPrice: Number(order.average_price ?? 0) || null,
             panicExitLastUpdateAt: new Date(),
+            ...(alcExitStateLive
+              ? buildAlcSubmittedStatePatch({
+                  trade,
+                  now: new Date(),
+                  targetState: "EXIT",
+                  pendingAction: "EXIT_REQUEST",
+                  blockedReason: "ALC_REQUEST_SUBMITTED",
+                  retryCount: trade?.loserCompressionRetryCount ?? 0,
+                })
+              : {}),
           });
           alert("warn", "⚠️ PANIC EXIT partial/open (still exiting)", {
             tradeId: trade.tradeId,
@@ -15780,6 +17853,19 @@ class TradeManager {
           closeReason: `PANIC_EXIT_${status}${msg ? " | " + msg : ""}`,
           panicExitLastStatus: status,
           panicExitLastUpdateAt: new Date(),
+          ...(isAlcExitStateLive(trade)
+            ? buildAlcRetryStatePatch({
+                trade,
+                now: new Date(),
+                targetState: "EXIT",
+                requestedStop: toFiniteOrNull(
+                  trade?.loserCompressionLastRequestedStop ??
+                    trade?.brokerStopLoss ??
+                    trade?.stopLoss,
+                ),
+                blockedReason: "ALC_REQUEST_FAILED",
+              })
+            : {}),
         });
         return;
       }
@@ -16635,9 +18721,67 @@ class TradeManager {
 
     if (link.role === "SL") {
       try {
+        const brokerTriggerPrice = toFiniteOrNull(
+          order?.trigger_price ?? order?.triggerPrice,
+        );
+        const currentBrokerStopLoss = this._brokerStopLossFromTrade(trade);
+        const alcPendingState = normalizeLoserCompressionStateValue(
+          trade?.loserCompressionSubmittedState ??
+            trade?.loserCompressionTargetState ??
+            trade?.loserCompressionState,
+          "NONE",
+        );
+        const alcPendingSource = normalizeAlcAppliedSource(
+          trade?.shadowProtectionActiveReason ??
+            trade?.protectedStopSource ??
+            null,
+        );
+        const alcPendingLineageLive =
+          trade?.loserCompressionPendingAction === "STOP_MODIFY" &&
+          Boolean(trade?.protectionUpgradePending) &&
+          (
+            alcPendingSource === null ||
+            alcPendingSource === alcAppliedSourceForState(alcPendingState)
+          ) &&
+          !Boolean(trade?.loserCompressionAppliedConfirmed);
+        const lastRequestedAlcStop = toFiniteOrNull(
+          trade?.loserCompressionLastRequestedStop,
+        );
+        const alcBrokerMeetsRequest =
+          alcPendingLineageLive &&
+          alcPendingState !== "NONE" &&
+          alcPendingState !== "EXIT" &&
+          Number.isFinite(brokerTriggerPrice) &&
+          Number.isFinite(lastRequestedAlcStop) &&
+          !isBetterStopForTradeSide(
+            trade?.side,
+            lastRequestedAlcStop,
+            brokerTriggerPrice,
+          );
         await this._updateTrade(trade.tradeId, {
           slOrderStatus: status || null,
           slOrderStatusUpdatedAt: new Date(),
+          ...(Number.isFinite(brokerTriggerPrice) &&
+          (!Number.isFinite(currentBrokerStopLoss) ||
+            isBetterStopForTradeSide(
+              trade?.side,
+              brokerTriggerPrice,
+              currentBrokerStopLoss,
+            ))
+            ? { brokerStopLoss: brokerTriggerPrice }
+            : {}),
+          ...(alcBrokerMeetsRequest
+            ? {
+                ...buildAlcAppliedStatePatch({
+                  trade,
+                  now: new Date(),
+                  appliedState: alcPendingState,
+                  confirmedStop: brokerTriggerPrice,
+                  keepRetryCount: true,
+                }),
+                ...clearProtectionUpgradeStatePatch(),
+              }
+            : {}),
         });
       } catch (err) {
         reportFault({
@@ -19447,6 +21591,39 @@ class TradeManager {
 
     // Pro observability: aggregate fee-multiple by strategy and keep a ring of recent trades.
     try {
+      const alcAttribution = deriveAlcAttribution(t, {
+        side,
+        entryPrice: t?.entryPrice,
+        initialStopLoss:
+          t?.initialStopLoss ?? t?.strategyStopLoss ?? t?.sizingStopLoss,
+        riskInr: t?.executionRiskInr,
+        exitPrice: t?.exitPrice,
+        finalProtectionOwner:
+          t?.protectedStopSource ?? t?.exitReasonCode ?? t?.exitAuthority ?? null,
+      });
+      const alcTargetState = String(
+        t?.loserCompressionTargetState ??
+          t?.loserCompressionState ??
+          "NONE",
+      ).toUpperCase();
+      const alcAppliedState = String(
+        alcAttribution.alcAppliedLevel ??
+          t?.loserCompressionAppliedState ??
+          "NONE",
+      ).toUpperCase();
+      const entrySpreadForTelemetry = Number(
+        t?.quoteAtEntry?.bps ?? t?.entrySpread ?? t?.spreadAtEntry ?? 0,
+      );
+      const maxSpreadForTelemetry = Number(env.OPT_MAX_SPREAD_BPS ?? 35);
+      const spreadRegime =
+        !Number.isFinite(entrySpreadForTelemetry) || entrySpreadForTelemetry <= 0
+          ? "UNKNOWN"
+          : entrySpreadForTelemetry >= maxSpreadForTelemetry
+            ? "WIDE"
+            : entrySpreadForTelemetry >= maxSpreadForTelemetry * 0.6
+              ? "MID"
+              : "TIGHT";
+      const alcTriggered = Boolean(alcAttribution.alcRequested);
       tradeTelemetry.recordTradeClose({
         tradeId,
         strategyId: t.strategyId,
@@ -19456,6 +21633,30 @@ class TradeManager {
         estCostInr,
         netAfterEstCostsInr,
         feeMultiple,
+        alcAction: t?.loserCompressionLastAction ?? null,
+        alcDesiredAction: t?.loserCompressionDesiredAction ?? null,
+        alcTargetState,
+        alcAppliedState,
+        alcAppliedConfirmed: alcAttribution.alcAppliedConfirmed,
+        alcAppliedSource: alcAttribution.alcAppliedSource,
+        alcAttributionConfidence: alcAttribution.alcAttributionConfidence,
+        alcRequested: alcAttribution.alcRequested,
+        alcRequestedLevel: alcAttribution.alcRequestedLevel,
+        alcAppliedLevel: alcAttribution.alcAppliedLevel,
+        alcRequestedButNotApplied:
+          alcAttribution.alcRequestedButNotApplied,
+        alcAppliedButSuperseded:
+          alcAttribution.alcAppliedButSuperseded,
+        alcSupersededBy: alcAttribution.alcSupersededBy,
+        alcFinalProtectionOwner: alcAttribution.alcFinalProtectionOwner,
+        alcRetryCount: t?.loserCompressionRetryCount ?? 0,
+        alcSavedRiskR: alcAttribution.alcSavedRiskR,
+        alcSavedRiskInr: alcAttribution.alcSavedRiskInr,
+        alcBlockedReason: t?.loserCompressionBlockedReason ?? null,
+        alcFalsePositiveCandidate:
+          alcTriggered && Number(t?.peakR ?? 0) >= 1 && alcAppliedState !== "EXIT",
+        regime: t?.regime || null,
+        spreadRegime,
       });
 
       // Adaptive optimizer: update rolling fee-multiple stats per symbol×strategy×bucket and auto-block weak keys.
@@ -19659,6 +21860,9 @@ class TradeManager {
     const active = this.activeTradeId
       ? await getTrade(this.activeTradeId)
       : null;
+    const activeTradeRuntime = active
+      ? this._buildTradeNotificationRuntime(active)
+      : null;
     const risk = await getDailyRisk(todayKey());
     const livePreflight = await this._refreshKiteLayerPreflight("trade_manager_status");
     return {
@@ -19670,6 +21874,7 @@ class TradeManager {
       tradesToday: this.risk.tradesToday,
       activeTradeId: this.activeTradeId,
       activeTrade: active,
+      activeTradeRuntime,
       recoveredPosition: this.recoveredPosition,
       dailyRisk: risk,
       dailyRiskState: risk?.state || "RUNNING",
@@ -19966,10 +22171,10 @@ module.exports = {
   evaluatePreRouteTradability,
   evaluatePreRouteConfidenceGate,
   resolvePostRouteConfidenceDecision,
+  shouldAllowMultiTfTrendTransitionPass,
   resolveMinLotRiskPolicyDecision,
   resolvePreEntrySlFitDecision,
   resolvePreRouteConfidenceAllowance,
   resolveOptimizerAdmission,
   resolveOptimizerRrTarget,
 };
-

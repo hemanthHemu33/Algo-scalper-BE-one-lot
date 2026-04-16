@@ -321,6 +321,14 @@ Dynamic exits are optional and can be enabled to:
 - Tighten targets after profit is achieved (can be disabled for pro-style)
 - Scale out via TP1 + runner mode
 
+### 2026-04-09 exit upgrade
+
+- Added an early winner retention bridge for sub-1R winners so the engine no longer jumps straight from BE/min-green into late trail behavior.
+- The exit stack now uses BE confirmation, a progressive sub-1R MFE lock ladder, deterministic floor arbitration, a real structure-aware early winner floor, dynamic early-winner to trail handoff, and richer dyn-exit telemetry for source attribution and handoff debugging.
+- Protection-state writes now dedupe no-op patches, reject weaker stale protection, retry one safe version conflict, and dedupe duplicate broker modify intent for the same effective stop.
+- `npm test` now includes the main exit safety net (`test:proexit` + `test:runtime`), while `npm run test:proexit` remains the focused exit suite.
+- Legacy behavior is preserved when `EARLY_WINNER_RETENTION_ENABLED=false`.
+
 ---
 
 ## Optimizer

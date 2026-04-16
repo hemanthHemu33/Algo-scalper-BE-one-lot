@@ -97,6 +97,13 @@ function computeBps(entry, target) {
   return (Math.abs(target - entry) / entry) * 10000;
 }
 
+function isValidDirectionalTarget({ side, entry, price, minDistance = 0 }) {
+  const px = safeNum(price);
+  if (!(Number.isFinite(px) && px > 0)) return false;
+  if (!(Math.abs(px - entry) > Math.max(0, Number(minDistance) || 0))) return false;
+  return side === "BUY" ? px > entry : px < entry;
+}
+
 /**
  * Plan a runner target (TP2) using a priority list:
  * - PIVOT (prev day pivots)
@@ -145,7 +152,13 @@ function planRunnerTarget({ trade, candles }) {
     env.RUNNER_TARGET_PRIORITY || "PIVOT,SWING,ATR,RR"
   );
 
-  const inDir = (px) => (side === "BUY" ? px > entry : px < entry);
+  const inDir = (px) =>
+    isValidDirectionalTarget({
+      side,
+      entry,
+      price: px,
+      minDistance: tick * 2,
+    });
   const round = (px) => roundToTick(px, tick, side === "BUY" ? "up" : "down");
 
   const candidates = [];

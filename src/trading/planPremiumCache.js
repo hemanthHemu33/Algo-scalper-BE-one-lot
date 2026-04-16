@@ -25,6 +25,11 @@ function minPremiumPlanCandles(config = {}) {
   return Math.max(volLookback + 2, atrPeriod + 2, 24);
 }
 
+function premiumReadinessStaleAfterMs(intervalMin) {
+  const effectiveIntervalMin = Math.max(1, Number(intervalMin ?? 1) || 0);
+  return Math.max(2 * 60_000, effectiveIntervalMin * 3 * 60_000);
+}
+
 function normalizeReferenceTs(value) {
   const ts =
     value instanceof Date
@@ -43,7 +48,7 @@ function buildPremiumReadiness({
   const lastCandle = candleCount > 0 ? candles[candleCount - 1] : null;
   const lastCandleTs = candleTsMs(lastCandle);
   const referenceMs = normalizeReferenceTs(referenceTs);
-  const staleAfterMs = Math.max(2 * 60_000, Number(intervalMin ?? 1) * 3 * 60_000);
+  const staleAfterMs = premiumReadinessStaleAfterMs(intervalMin);
   const staleByMs =
     Number.isFinite(referenceMs) && Number.isFinite(lastCandleTs)
       ? Math.max(0, referenceMs - lastCandleTs)
@@ -173,5 +178,6 @@ async function resolvePlanPremiumCandles({
 module.exports = {
   buildPremiumReadiness,
   minPremiumPlanCandles,
+  premiumReadinessStaleAfterMs,
   resolvePlanPremiumCandles,
 };

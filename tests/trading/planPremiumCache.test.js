@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 
 const {
   minPremiumPlanCandles,
+  premiumReadinessStaleAfterMs,
   resolvePlanPremiumCandles,
 } = require("../../src/trading/planPremiumCache");
 
@@ -43,7 +44,13 @@ async function testPartialPremiumReadinessIsExplicit() {
   assert.equal(result.lastCandleTs, candles[candles.length - 1].ts);
 }
 
+function testPremiumStaleThresholdTracksInterval() {
+  assert.equal(premiumReadinessStaleAfterMs(1), 180_000);
+  assert.equal(premiumReadinessStaleAfterMs(3), 540_000);
+}
+
 async function main() {
+  testPremiumStaleThresholdTracksInterval();
   await testPartialPremiumReadinessIsExplicit();
   console.log("planPremiumCache.test.js passed");
 }

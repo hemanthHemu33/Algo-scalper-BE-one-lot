@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const { computeDynamicExitPlan } = require("../../src/trading/dynamicExitManager");
 const { BASE_NOW, makeTrade, makeEnv, flatCandles, applyPlanPatch } = require("./_helpers");
 
-const env = makeEnv();
+const env = makeEnv({ EARLY_WINNER_RETENTION_ENABLED: "false" });
 let trade = makeTrade();
 let previousFloorPrice = 0;
 

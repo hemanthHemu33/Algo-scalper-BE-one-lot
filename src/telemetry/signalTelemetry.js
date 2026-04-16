@@ -2,7 +2,12 @@ const { DateTime } = require("luxon");
 const { env } = require("../config");
 const { logger } = require("../logger");
 const { getDb } = require("../db");
-const { reportFault } = require("../runtime/errorBus");
+const { reportFault, reportWindowedFault } = require("../runtime/errorBus");
+const { isTransientMongoError } = require("../runtime/isTransientMongoError");
+const {
+  markMongoHealthy,
+  markMongoDegraded,
+} = require("../runtime/mongoRuntimeState");
 
 /**
  * Pro-level observability for signal->trade pipeline.
@@ -104,6 +109,9 @@ class SignalTelemetry {
 
     this._state = this._freshState(dayKey());
     this._timer = null;
+    this._mongoDegraded = false;
+    this._mongoBackoffMs = 0;
+    this._mongoNextFlushAt = 0;
   }
 
   _freshState(dk) {
@@ -316,9 +324,55 @@ class SignalTelemetry {
     };
   }
 
+  _nextMongoBackoffMs() {
+    this._mongoBackoffMs = this._mongoBackoffMs
+      ? Math.min(this._mongoBackoffMs * 2, 15_000)
+      : 1_000;
+    this._mongoNextFlushAt = Date.now() + this._mongoBackoffMs;
+    return this._mongoBackoffMs;
+  }
+
+  _markMongoFlushRecovered() {
+    if (!this._mongoDegraded) {
+      this._mongoBackoffMs = 0;
+      this._mongoNextFlushAt = 0;
+      return;
+    }
+    this._mongoDegraded = false;
+    this._mongoBackoffMs = 0;
+    this._mongoNextFlushAt = 0;
+    markMongoHealthy();
+    logger.info("[telemetry] mongo recovered; flush resumed");
+  }
+
+  _deferMongoFlush(error) {
+    const backoffMs = this._nextMongoBackoffMs();
+    this._mongoDegraded = true;
+    markMongoDegraded({
+      error,
+      reason: "signal_telemetry_flush",
+    });
+    reportWindowedFault({
+      windowKey: "signal_telemetry_mongo_degraded",
+      windowMs: 30_000,
+      code: "SIGNAL_TELEMETRY_MONGO_DEGRADED",
+      err: error,
+      message: "[telemetry] mongo degraded; flush deferred",
+      meta: { backoffMs },
+    });
+    return { ok: false, reason: "mongo_degraded", deferredMs: backoffMs };
+  }
+
   async flush() {
     if (!this._enabled) return { ok: false, reason: "disabled" };
     this._rotateIfNeeded(new Date());
+    if (this._mongoNextFlushAt && Date.now() < this._mongoNextFlushAt) {
+      return {
+        ok: false,
+        reason: "mongo_backoff",
+        deferredMs: Math.max(0, this._mongoNextFlushAt - Date.now()),
+      };
+    }
 
     let db;
     try {
@@ -341,8 +395,12 @@ class SignalTelemetry {
         { $set: doc, $setOnInsert: { createdAt: new Date() } },
         { upsert: true },
       );
+      this._markMongoFlushRecovered();
       return { ok: true, dayKey: doc.dayKey };
     } catch (e) {
+      if (isTransientMongoError(e)) {
+        return this._deferMongoFlush(e);
+      }
       logger.warn({ e: e?.message || String(e) }, "[telemetry] flush failed");
       return { ok: false, reason: "flush_failed", error: e?.message };
     }

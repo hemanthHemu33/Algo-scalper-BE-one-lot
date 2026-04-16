@@ -66,6 +66,42 @@ assert.equal(softPass.reasonCode, "POST_ROUTE_CONFIDENCE_SOFT_PASS");
 assert.equal(softPass.postRouteDecision, "SOFT_PASS");
 assert.equal(softPass.meta.confidenceGap, 3);
 
+const nearThresholdSoftPass = resolvePostRouteConfidenceDecision({
+  signal: {
+    ...healthySignal,
+    confidence: 70,
+    routeConfidence: {
+      ...healthySignal.routeConfidence,
+      routedScore: 70,
+      contractMetrics: {
+        ...healthySignal.routeConfidence.contractMetrics,
+        spreadBps: 18,
+        healthScore: 74,
+        depth: 42,
+        selectedByFallback: false,
+      },
+    },
+  },
+  conf: 70,
+  minConf: 75,
+  config: {
+    POST_ROUTE_CONFIDENCE_SOFT_BAND: 4,
+    OPT_MAX_SPREAD_BPS: 35,
+    OPT_HEALTH_SCORE_MIN: 45,
+  },
+});
+
+assert.equal(nearThresholdSoftPass.blocked, false);
+assert.equal(nearThresholdSoftPass.adjusted, true);
+assert.equal(
+  nearThresholdSoftPass.reasonCode,
+  "POST_ROUTE_CONFIDENCE_SOFT_PASS",
+);
+assert.equal(
+  nearThresholdSoftPass.meta.softPassReason,
+  "TREND_NEAR_THRESHOLD_CLEAN_CONTRACT",
+);
+
 const conversionSummary = buildSignalConversionSummary(healthySignal, {
   routeAttempted: true,
   postRouteDecision: softPass.postRouteDecision,
@@ -118,5 +154,40 @@ assert.equal(
   compatibilityPoorReject.reasonCode,
   "POST_ROUTE_LOW_CONFIDENCE",
 );
+
+const wideSpreadNearThresholdReject = resolvePostRouteConfidenceDecision({
+  signal: {
+    ...healthySignal,
+    confidence: 70,
+    option_meta: {
+      ...healthySignal.option_meta,
+      bps: 52,
+      health_score: 74,
+      depth: 42,
+    },
+    routeConfidence: {
+      ...healthySignal.routeConfidence,
+      routedScore: 70,
+      contractMetrics: {
+        ...healthySignal.routeConfidence.contractMetrics,
+        spreadBps: 52,
+        healthScore: 74,
+        depth: 42,
+        selectedByFallback: false,
+      },
+    },
+  },
+  conf: 70,
+  minConf: 75,
+  config: {
+    POST_ROUTE_CONFIDENCE_SOFT_BAND: 4,
+    OPT_MAX_SPREAD_BPS: 35,
+    OPT_HEALTH_SCORE_MIN: 45,
+  },
+});
+
+assert.equal(wideSpreadNearThresholdReject.blocked, true);
+assert.equal(wideSpreadNearThresholdReject.adjusted, false);
+assert.equal(wideSpreadNearThresholdReject.reasonCode, "POST_ROUTE_LOW_CONFIDENCE");
 
 console.log("postRouteSoftPass.test.js passed");

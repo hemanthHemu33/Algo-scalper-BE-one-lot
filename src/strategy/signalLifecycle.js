@@ -1615,6 +1615,72 @@ function buildSignalConversionSummary(signal, patch = {}) {
       patch.riskFitDecision ??
       current.riskFitDecision ??
       null,
+    family:
+      patch.family ??
+      current.family ??
+      signal?.strategyFamily ??
+      signal?.family ??
+      null,
+    style:
+      patch.style ??
+      current.style ??
+      signal?.strategyStyle ??
+      null,
+    readinessState:
+      patch.readinessState ??
+      current.readinessState ??
+      signal?.option_meta?.premiumContext?.readinessState ??
+      null,
+    plannerPathUsed:
+      patch.plannerPathUsed ??
+      current.plannerPathUsed ??
+      null,
+    triggerLevelResolved:
+      patch.triggerLevelResolved ??
+      current.triggerLevelResolved ??
+      signal?.meta?.triggerLevel ??
+      null,
+    anchorValueResolved:
+      patch.anchorValueResolved ??
+      current.anchorValueResolved ??
+      signal?.meta?.anchorValue ??
+      null,
+    finalAuthoritativeRr:
+      patch.finalAuthoritativeRr ??
+      current.finalAuthoritativeRr ??
+      null,
+    transitionPassSupported:
+      patch.transitionPassSupported ??
+      current.transitionPassSupported ??
+      null,
+    transitionPassUsed:
+      patch.transitionPassUsed ??
+      current.transitionPassUsed ??
+      null,
+    transitionPassProfile:
+      patch.transitionPassProfile ??
+      current.transitionPassProfile ??
+      null,
+    softPassSupported:
+      patch.softPassSupported ??
+      current.softPassSupported ??
+      null,
+    softPassUsed:
+      patch.softPassUsed ??
+      current.softPassUsed ??
+      null,
+    softPassProfile:
+      patch.softPassProfile ??
+      current.softPassProfile ??
+      null,
+    legacyFallbackSupported:
+      patch.legacyFallbackSupported ??
+      current.legacyFallbackSupported ??
+      null,
+    legacyFallbackUsed:
+      patch.legacyFallbackUsed ??
+      current.legacyFallbackUsed ??
+      null,
     finalReasonCode:
       patch.finalReasonCode ??
       current.finalReasonCode ??

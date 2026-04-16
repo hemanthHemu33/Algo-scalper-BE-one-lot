@@ -588,6 +588,8 @@ function applyMinGreenExitRules({
   const beArmR = Number(env.BE_ARM_R ?? 0.6);
   const beArmCostMult = Number(env.BE_ARM_COST_MULT ?? 2.0);
   const trailArmR = Number(env.TRAIL_ARM_R ?? 1.0);
+  const earlyWinnerEnabled =
+    String(env.EARLY_WINNER_RETENTION_ENABLED ?? "true") === "true";
   const pnlStepInr = Number.isFinite(qty) && qty > 0 && Number.isFinite(tick) && tick > 0
     ? qty * tick
     : 0;
@@ -808,7 +810,9 @@ function applyMinGreenExitRules({
     ? pickStopCandidate(side, [
         { price: trueBeFloor, source: "TRUE_BE" },
         { price: minGreenFloor, source: "MIN_GREEN" },
-        { price: beProfitLockFloor, source: "BE_PROFIT_LOCK" },
+        ...(!earlyWinnerEnabled && Number.isFinite(beProfitLockFloor)
+          ? [{ price: beProfitLockFloor, source: "BE_PROFIT_LOCK" }]
+          : []),
       ])
     : { price: null, source: null };
   const beFloor = Number.isFinite(beFloorCandidate?.price)
@@ -1206,6 +1210,8 @@ function applyMinGreenExitRules({
       beFloor,
       beFloorSource,
       beProfitLockFloor,
+      beProfitLockDeferredToEarlyWinner:
+        Boolean(earlyWinnerEnabled && Number.isFinite(beProfitLockFloor)),
       estCostInr: Number.isFinite(estCostInr) ? estCostInr : null,
       desiredStopLoss,
       finalStopLoss,
@@ -1302,21 +1308,30 @@ function mergeExplicitProtectionState({ trade, plan, state }) {
   if (Object.prototype.hasOwnProperty.call(state, "trailActive")) {
     tradePatch.trailActive = Boolean(state.trailActive);
   }
+  const mergedState = { ...state };
+  if (
+    Object.prototype.hasOwnProperty.call(mergedState, "protectedStopSource") &&
+    (mergedState.protectedStopSource === null ||
+      mergedState.protectedStopSource === undefined ||
+      mergedState.protectedStopSource === "")
+  ) {
+    delete mergedState.protectedStopSource;
+  }
   const meta = {
     ...(plan?.meta || {}),
-    ...state,
-    allowTrail: Boolean(state.trailAllowed),
+    ...mergedState,
+    allowTrail: Boolean(mergedState.trailAllowed),
     // Legacy compatibility aliases only; live consumers must use beApplied/trailAllowed/trailActive.
-    beLockHit: Boolean(state.beArmed),
-    trailHit: Boolean(state.trailArmed),
-    trailActive: Boolean(state.trailActive),
+    beLockHit: Boolean(mergedState.beArmed),
+    trailHit: Boolean(mergedState.trailArmed),
+    trailActive: Boolean(mergedState.trailActive),
   };
   return {
     ...plan,
     tradePatch,
-    beApplied: Boolean(state.beApplied),
-    trailAllowed: Boolean(state.trailAllowed),
-    trailActive: Boolean(state.trailActive),
+    beApplied: Boolean(mergedState.beApplied),
+    trailAllowed: Boolean(mergedState.trailAllowed),
+    trailActive: Boolean(mergedState.trailActive),
     meta,
   };
 }
@@ -1874,6 +1889,7 @@ function computeDynamicExitPlan({
     trade,
     plan: lossContainmentPlan,
     ltp,
+    candles,
     underlyingLtp,
     marketQuote,
     now,

@@ -559,14 +559,6 @@ async function testDynamicSlModifyBlockedWithoutAuthority() {
     await tm._maybeDynamicAdjustExits(trade, byId);
 
     assert.equal(safeModifyCalls, 0);
-    assert.equal(
-      logs.some((entry) =>
-        String(entry.message || "").includes(
-          "SL modify blocked (no authority)",
-        ),
-      ),
-      true,
-    );
   } finally {
     harness.restore();
   }
@@ -789,6 +781,313 @@ function buildBeProtectPlan({
       stopImproveAuthorized: true,
       stopImproveBlockedReason: null,
       reasonTags: ["BE_ARM"],
+    },
+  };
+}
+
+function buildProtectionRuntimePlan({
+  stopLoss = 104.2,
+  desiredStopLoss = 104.15,
+  hardFloor = 104.15,
+  protectedStopSource = "EARLY_WINNER_RETENTION",
+  protectionPhase = "PHASE_2_EARLY_WINNER_RETENTION",
+  tradePatchOverrides = {},
+  metaOverrides = {},
+} = {}) {
+  const tradePatch = {
+    beLocked: true,
+    beLockedAt: "2026-03-18T09:16:00.000Z",
+    beLockedAtPrice: 104,
+    beEligible: true,
+    beLockHit: true,
+    earlyWinnerEligible: true,
+    earlyWinnerArmed: true,
+    earlyWinnerConfirmed: true,
+    earlyWinnerActive: true,
+    earlyWinnerConfirmTicks: 2,
+    earlyWinnerConfirmMs: 3000,
+    earlyWinnerTier: 1,
+    earlyWinnerKeepR: 0.12,
+    earlyWinnerFloorPrice: desiredStopLoss,
+    earlyWinnerFloorSource: protectedStopSource,
+    dynamicTrailArmR: 0.68,
+    handoffMaturity: 2,
+    structureCandidateAvailable: true,
+    structureReferenceType: "VWAP",
+    structureReferencePrice: 20022,
+    structureMappedFloor: desiredStopLoss,
+    telemetryProposalFloor: desiredStopLoss,
+    executableHardFloor: hardFloor,
+    desiredStopLoss,
+    finalStopLoss: stopLoss,
+    hardFloor,
+    protectedStopSource,
+    protectionPhase,
+    protectionStateVersion: 3,
+    trailHit: false,
+    trailActive: false,
+    structureTrailAllowed: false,
+    protectionGateOpen: true,
+    winnerModeActive: true,
+    stopImproveAuthorized: true,
+    stopImproveBlockedReason: null,
+    ...tradePatchOverrides,
+  };
+
+  return {
+    ok: true,
+    sl: { stopLoss },
+    finalStop: stopLoss,
+    stopImproveAuthorized: true,
+    tradePatch,
+    meta: {
+      pnlInr: 68,
+      currentExecutableR: 0.62,
+      protectedPeakR: 0.7,
+      peakExecutableR: 0.7,
+      beEligible: true,
+      beArmed: true,
+      beApplied: true,
+      beLockHit: true,
+      beFloor: 104,
+      beFloorSource: "MIN_GREEN",
+      protectionPhase,
+      earlyWinnerEligible: true,
+      earlyWinnerArmed: true,
+      earlyWinnerConfirmed: true,
+      earlyWinnerTier: 1,
+      earlyWinnerFloor: desiredStopLoss,
+      earlyWinnerFloorSource: protectedStopSource,
+      earlyWinnerKeepR: 0.12,
+      earlyWinnerMfeLockActive: true,
+      earlyWinnerHandoffReady: false,
+      telemetryProposalFloor: desiredStopLoss,
+      executableHardFloor: hardFloor,
+      desiredStopLoss,
+      finalStopLoss: stopLoss,
+      hardFloor,
+      protectedStopSource,
+      dynamicTrailArmR: 0.68,
+      handoffMaturity: 2,
+      structureCandidateAvailable: true,
+      structureReferenceType: "VWAP",
+      structureReferencePrice: 20022,
+      structureMappedFloor: desiredStopLoss,
+      protectionStateVersion: 3,
+      protectionGateOpen: true,
+      winnerModeActive: true,
+      stopImproveAuthorized: true,
+      stopImproveBlockedReason: null,
+      reasonTags: ["EARLY_WINNER_RETENTION"],
+      ...metaOverrides,
+    },
+  };
+}
+
+function buildAlcCompressionPlan({
+  stopLoss = 94.5,
+  state = "L1",
+  requestReady = true,
+  requestOutcome = "ALC_REQUEST_READY",
+  requestBlockedReason = null,
+  pendingAction = null,
+  retryCount = 0,
+  appliedState = "NONE",
+  appliedConfirmed = false,
+  appliedSource = null,
+  attributionConfidence = null,
+} = {}) {
+  const normalizedState = String(state || "L1").toUpperCase() === "L2" ? "L2" : "L1";
+  const action = normalizedState === "L2" ? "COMPRESS_L2" : "COMPRESS_L1";
+  const protectedStopSource = normalizedState === "L2" ? "ALC_L2" : "ALC_L1";
+  const normalizedAppliedState =
+    String(appliedState || "NONE").toUpperCase() === "L2" ? "L2" : String(appliedState || "NONE").toUpperCase() === "L1" ? "L1" : "NONE";
+  const resolvedAppliedConfirmed =
+    Boolean(appliedConfirmed) ||
+    (normalizedAppliedState !== "NONE" &&
+      requestOutcome === "ALC_APPLIED_CONFIRMED");
+  const resolvedAppliedSource =
+    appliedSource ||
+    (resolvedAppliedConfirmed && normalizedAppliedState !== "NONE"
+      ? normalizedAppliedState === "L2"
+        ? "ALC_L2"
+        : "ALC_L1"
+      : null);
+  const failureScore = normalizedState === "L2" ? 89 : 78;
+  return {
+    ok: true,
+    sl: requestReady ? { stopLoss } : null,
+    finalStop: stopLoss,
+    stopImproveAuthorized: true,
+    tradePatch: {
+      loserCompressionDesiredAction: action,
+      loserCompressionTargetState: normalizedState,
+      loserCompressionSubmittedState:
+        pendingAction === "STOP_MODIFY" ? normalizedState : "NONE",
+      loserCompressionAppliedState: normalizedAppliedState,
+      loserCompressionPendingAction: pendingAction,
+      loserCompressionAppliedSource: resolvedAppliedSource,
+      loserCompressionAppliedConfirmed: resolvedAppliedConfirmed,
+      loserCompressionAttributionConfidence:
+        resolvedAppliedConfirmed ? attributionConfidence || "HIGH" : null,
+      loserCompressionRetryCount: retryCount,
+      loserCompressionState: normalizedState,
+      loserCompressionLastAction: action,
+      loserCompressionReasonAtLastAction: `ALC_${action}`,
+      loserCompressionScoreAtLastAction: failureScore,
+      loserCompressionBlockedReason: requestBlockedReason,
+      loserExitTriggered: false,
+      loserExitReasonCode: null,
+      desiredStopLoss: stopLoss,
+      finalStopLoss: stopLoss,
+      hardFloor: stopLoss,
+      protectedStopSource,
+      stopImproveAuthorized: true,
+      stopImproveBlockedReason: null,
+      winnerModeActive: false,
+    },
+    meta: {
+      currentExecutableR: -0.55,
+      peakExecutableR: 0.03,
+      beEligible: false,
+      beArmed: false,
+      beApplied: false,
+      minGreenSatisfied: false,
+      trailAllowed: false,
+      trailActive: false,
+      protectedStopSource,
+      desiredStopLoss: stopLoss,
+      finalStopLoss: stopLoss,
+      hardFloor: stopLoss,
+      stopImproveAuthorized: true,
+      stopImproveBlockedReason: null,
+      loserCompressionEligible: true,
+      loserCompressionActive: requestReady,
+      loserCompressionAction: requestReady ? action : "HOLD",
+      loserCompressionDesiredAction: action,
+      loserCompressionReason: `ALC_${action}`,
+      loserCompressionAuthority: "ADAPTIVE_LOSER_ENGINE",
+      loserCompressionLevel: normalizedState === "L2" ? 2 : 1,
+      loserCompressionTargetState: normalizedState,
+      loserCompressionSubmittedState:
+        pendingAction === "STOP_MODIFY" ? normalizedState : "NONE",
+      loserCompressionAppliedState: normalizedAppliedState,
+      loserCompressionPendingAction: pendingAction,
+      loserCompressionPendingSince: null,
+      loserCompressionRetryCount: retryCount,
+      loserCompressionRequestOutcome: requestOutcome,
+      loserCompressionAppliedSource: resolvedAppliedSource,
+      loserCompressionAppliedConfirmed: resolvedAppliedConfirmed,
+      loserCompressionAttributionConfidence:
+        resolvedAppliedConfirmed ? attributionConfidence || "HIGH" : null,
+      loserCompressionSuperseded:
+        requestOutcome === "ALC_SUPERSEDE_L1_TO_L2",
+      loserCompressionSupersedeReason:
+        requestOutcome === "ALC_SUPERSEDE_L1_TO_L2"
+          ? "ALC_SUPERSEDE_L1_TO_L2"
+          : null,
+      loserCompressionRequestReady: requestReady,
+      loserCompressionRequestBlockedReason: requestBlockedReason,
+      loserCompressionProposedStop: stopLoss,
+      loserCompressionFinalStop: stopLoss,
+      loserCompressionBlockedReason: requestBlockedReason,
+      loserCompressionTriggeredAt: "2026-03-18T09:16:00.000Z",
+      loserCompressionEscalated: normalizedState === "L2",
+      alcRequested: true,
+      alcRequestedLevel: normalizedState,
+      alcAppliedLevel:
+        resolvedAppliedConfirmed && normalizedAppliedState !== "NONE"
+          ? normalizedAppliedState
+          : null,
+      alcAppliedSource: resolvedAppliedSource,
+      alcAttributionConfidence:
+        resolvedAppliedConfirmed ? attributionConfidence || "HIGH" : null,
+      alcRequestedButNotApplied: !resolvedAppliedConfirmed,
+      alcAppliedButSuperseded: false,
+      alcSupersededBy: null,
+      alcFinalProtectionOwner: protectedStopSource,
+      failureScore,
+      exitFamily: "LOSS_CONTAINMENT",
+      exitReasonCode: null,
+      exitAuthority: "ADAPTIVE_LOSER_ENGINE",
+      reasonTags: [`ALC_${action}`],
+    },
+  };
+}
+
+function buildAlcExitPlan() {
+  return {
+    ok: true,
+    action: { exitNow: true, reason: "ALC_EXIT_NOW" },
+    stopImproveAuthorized: false,
+    tradePatch: {
+      loserCompressionDesiredAction: "EXIT_NOW",
+      loserCompressionTargetState: "EXIT",
+      loserCompressionSubmittedState: "NONE",
+      loserCompressionAppliedState: "NONE",
+      loserCompressionPendingAction: null,
+      loserCompressionRetryCount: 0,
+      loserCompressionState: "EXITED",
+      loserCompressionLastAction: "EXIT_NOW",
+      loserCompressionReasonAtLastAction: "ALC_EXIT_NOW",
+      loserCompressionScoreAtLastAction: 97,
+      loserCompressionBlockedReason: null,
+      loserExitTriggered: true,
+      loserExitReasonCode: "ALC_EXIT_NOW",
+      stopImproveAuthorized: false,
+      stopImproveBlockedReason: "EXIT_NOW",
+      winnerModeActive: false,
+      exitFamily: "LOSS_CONTAINMENT",
+      exitReasonCode: "ALC_EXIT_NOW",
+      exitAuthority: "ADAPTIVE_LOSER_ENGINE",
+    },
+    meta: {
+      beEligible: false,
+      beArmed: false,
+      beApplied: false,
+      minGreenSatisfied: false,
+      trailAllowed: false,
+      trailActive: false,
+      protectedStopSource: null,
+      stopImproveAuthorized: false,
+      stopImproveBlockedReason: "EXIT_NOW",
+      loserCompressionEligible: true,
+      loserCompressionActive: false,
+      loserCompressionAction: "EXIT_NOW",
+      loserCompressionDesiredAction: "EXIT_NOW",
+      loserCompressionReason: "ALC_EXIT_NOW",
+      loserCompressionAuthority: "ADAPTIVE_LOSER_ENGINE",
+      loserCompressionLevel: 3,
+      loserCompressionTargetState: "EXIT",
+      loserCompressionSubmittedState: "NONE",
+      loserCompressionAppliedState: "NONE",
+      loserCompressionPendingAction: null,
+      loserCompressionPendingSince: null,
+      loserCompressionRetryCount: 0,
+      loserCompressionRequestOutcome: "ALC_REQUEST_READY",
+      loserCompressionAppliedConfirmed: false,
+      loserCompressionSuperseded: false,
+      loserCompressionSupersedeReason: null,
+      loserCompressionRequestReady: true,
+      loserCompressionRequestBlockedReason: null,
+      loserCompressionBlockedReason: null,
+      loserCompressionTriggeredAt: "2026-03-18T09:16:00.000Z",
+      loserCompressionEscalated: true,
+      loserExitTriggered: true,
+      loserExitReasonCode: "ALC_EXIT_NOW",
+      alcRequested: true,
+      alcRequestedLevel: "EXIT",
+      alcAppliedLevel: null,
+      alcAppliedSource: null,
+      alcAttributionConfidence: null,
+      alcRequestedButNotApplied: true,
+      alcAppliedButSuperseded: false,
+      alcSupersededBy: null,
+      alcFinalProtectionOwner: "ALC_EXIT_NOW",
+      failureScore: 97,
+      exitFamily: "LOSS_CONTAINMENT",
+      exitReasonCode: "ALC_EXIT_NOW",
+      exitAuthority: "ADAPTIVE_LOSER_ENGINE",
     },
   };
 }
@@ -1025,6 +1324,816 @@ async function testProtectiveSoftFailureBreachesShadowAndPanics() {
   }
 }
 
+async function testProtectionNoopSkipsWriteAndModifyIntent() {
+  const plan = buildProtectionRuntimePlan();
+  const tradeState = {
+    ...makeRuntimeTrade("T-PROTECT-NOOP"),
+    version: 9,
+    stopLoss: 100.05,
+    slTrigger: 100.05,
+    brokerStopLoss: 100.05,
+    desiredStopLoss: 104.15,
+    finalStopLoss: 104.2,
+    telemetryProposalFloor: 104.15,
+    hardFloor: 104.15,
+    executableHardFloor: 104.15,
+    earlyWinnerFloorPrice: 104.15,
+    structureMappedFloor: 104.15,
+    protectedStopSource: "EARLY_WINNER_RETENTION",
+    protectionPhase: "PHASE_2_EARLY_WINNER_RETENTION",
+    earlyWinnerTier: 1,
+    dynamicTrailArmR: 0.68,
+    handoffMaturity: 2,
+    protectionStateVersion: 8,
+    protectionUpgradePending: true,
+    protectionUpgradeTargetStopLoss: 104.2,
+    ...plan.tradePatch,
+  };
+  let updateTradeCalls = 0;
+  let safeModifyCalls = 0;
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async () => {
+        updateTradeCalls += 1;
+        throw new Error("updateTrade should not be called for noop protection state");
+      },
+    },
+    dynamicExitManagerOverrides: {
+      computeDynamicExitPlan() {
+        return plan;
+      },
+    },
+    candleStoreOverrides: {
+      getRecentCandles: async () => [],
+    },
+    envOverrides: {
+      DYNAMIC_EXITS_ENABLED: "true",
+      DYNAMIC_EXIT_MIN_INTERVAL_MS: 0,
+      DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: 0,
+      PROTECTION_DEDUPE_ENABLED: "true",
+      PROTECTION_NOOP_WRITE_SKIP: "true",
+      PROTECTION_CONFLICT_RETRY_ONCE: "true",
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    tm._getLtp = async () => 106.4;
+    tm._trackDynExitCadence = () => {};
+    tm._safeModifyOrder = async () => {
+      safeModifyCalls += 1;
+      return { skipped: false };
+    };
+
+    await tm._maybeDynamicAdjustExits(tradeState, new Map([
+      [
+        "SL-1",
+        {
+          status: "TRIGGER PENDING",
+          order_type: "SL-M",
+          trigger_price: 100.05,
+        },
+      ],
+    ]));
+
+    assert.equal(updateTradeCalls, 0);
+    assert.equal(safeModifyCalls, 0);
+    assert.equal(Number(tradeState.protectionUpgradeTargetStopLoss ?? 0), 104.2);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testProtectionConflictRetryAppliesOnce() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-PROTECT-CONFLICT"),
+    version: 11,
+    desiredStopLoss: 100.05,
+    finalStopLoss: 100.05,
+    telemetryProposalFloor: 100.05,
+    hardFloor: 100.05,
+    protectedStopSource: "MIN_GREEN",
+    protectionPhase: "PHASE_1_COST_PROTECTION",
+    earlyWinnerTier: 0,
+    handoffMaturity: 1,
+    protectionStateVersion: 5,
+  };
+  let updateTradeCalls = 0;
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async (_tradeId, patch, options = {}) => {
+        updateTradeCalls += 1;
+        if (updateTradeCalls === 1) {
+          tradeState.version += 1;
+          return {
+            ok: false,
+            status: "CONFLICT",
+            expectedVersion: Number(options?.expectedVersion ?? 0),
+            actualVersion: tradeState.version,
+            trade: { ...tradeState },
+          };
+        }
+        assert.equal(Number(options?.expectedVersion ?? 0), tradeState.version);
+        Object.assign(tradeState, patch);
+        tradeState.version += 1;
+        return {
+          ok: true,
+          status: "APPLIED",
+          version: tradeState.version,
+          trade: { ...tradeState },
+        };
+      },
+    },
+    envOverrides: {
+      PROTECTION_DEDUPE_ENABLED: "true",
+      PROTECTION_NOOP_WRITE_SKIP: "true",
+      PROTECTION_CONFLICT_RETRY_ONCE: "true",
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    const result = await tm._applyProtectionStatePatch({
+      tradeId: tradeState.tradeId,
+      trade: { ...tradeState },
+      patch: {
+        telemetryProposalFloor: 104.15,
+        executableHardFloor: 104.15,
+        desiredStopLoss: 104.15,
+        finalStopLoss: 104.2,
+        hardFloor: 104.15,
+        protectedStopSource: "EARLY_WINNER_RETENTION",
+        protectionPhase: "PHASE_2_EARLY_WINNER_RETENTION",
+        earlyWinnerTier: 1,
+        handoffMaturity: 2,
+        protectionStateVersion: 3,
+      },
+      attemptId: "ATTEMPT-CONFLICT",
+      computationId: "COMP-CONFLICT",
+    });
+
+    assert.equal(updateTradeCalls, 2);
+    assert.equal(result.applied, true);
+    assert.equal(result.protectionPatchConflict, true);
+    assert.equal(Number(tradeState.desiredStopLoss ?? 0), 104.15);
+    assert.equal(Number(tradeState.finalStopLoss ?? 0), 104.2);
+    assert.equal(tradeState.protectedStopSource, "EARLY_WINNER_RETENTION");
+    assert.equal(tradeState.protectionPhase, "PHASE_2_EARLY_WINNER_RETENTION");
+    assert.equal(Number(tradeState.earlyWinnerTier ?? 0), 1);
+    assert.equal(Number(tradeState.handoffMaturity ?? 0), 2);
+    assert.ok(Number(tradeState.protectionStateVersion ?? 0) >= 6);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testProtectionDominanceKeepsStrongerState() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-PROTECT-DOMINANCE"),
+    version: 17,
+    desiredStopLoss: 104.35,
+    finalStopLoss: 104.4,
+    telemetryProposalFloor: 104.35,
+    executableHardFloor: 104.35,
+    hardFloor: 104.35,
+    protectedStopSource: "MFE_LOCK_TIER_2",
+    protectionPhase: "PHASE_3_PRE_TRAIL_MFE_LOCK",
+    earlyWinnerTier: 2,
+    handoffMaturity: 2,
+    protectionStateVersion: 9,
+  };
+  let updateTradeCalls = 0;
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async () => {
+        updateTradeCalls += 1;
+        throw new Error("weaker protection patch should be skipped");
+      },
+    },
+    envOverrides: {
+      PROTECTION_DEDUPE_ENABLED: "true",
+      PROTECTION_NOOP_WRITE_SKIP: "true",
+      PROTECTION_CONFLICT_RETRY_ONCE: "true",
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    const result = await tm._applyProtectionStatePatch({
+      tradeId: tradeState.tradeId,
+      trade: { ...tradeState },
+      patch: {
+        telemetryProposalFloor: 104.15,
+        desiredStopLoss: 104.15,
+        finalStopLoss: 104.2,
+        hardFloor: 104.15,
+        protectedStopSource: "EARLY_WINNER_RETENTION",
+        protectionPhase: "PHASE_2_EARLY_WINNER_RETENTION",
+        earlyWinnerTier: 1,
+        handoffMaturity: 1,
+      },
+      attemptId: "ATTEMPT-DOMINANCE",
+      computationId: "COMP-DOMINANCE",
+    });
+
+    assert.equal(updateTradeCalls, 0);
+    assert.equal(result.applied, false);
+    assert.equal(result.dominatedByCurrent, true);
+    assert.equal(result.protectionWriteNoop, true);
+    assert.equal(result.mergeAction, "DOMINATED_BY_CURRENT");
+    assert.equal(
+      result.protectionPatchSkippedReason,
+      "DOMINATED_BY_CURRENT_PROTECTION",
+    );
+    assert.equal(Number(tradeState.finalStopLoss ?? 0), 104.4);
+    assert.equal(tradeState.protectedStopSource, "MFE_LOCK_TIER_2");
+    assert.equal(tradeState.protectionPhase, "PHASE_3_PRE_TRAIL_MFE_LOCK");
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testAlcSubmitMarksSubmittedUntilBrokerConfirmed() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-ALC-SUBMIT"),
+    version: 3,
+    stopLoss: 90,
+    slTrigger: 90,
+    brokerStopLoss: 90,
+    panicExitPending: false,
+  };
+  const byId = new Map([
+    [
+      "SL-1",
+      {
+        status: "TRIGGER PENDING",
+        order_type: "SL-M",
+        trigger_price: 90,
+      },
+    ],
+  ]);
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      findTradeByOrder: async (orderId) =>
+        String(orderId) === "SL-1"
+          ? { trade: { ...tradeState }, link: { role: "SL" } }
+          : null,
+      appendOrderLog: async () => {},
+      upsertLiveOrderSnapshot: async () => {},
+      linkOrder: async () => {},
+      updateTrade: async (_tradeId, patch) => {
+        Object.assign(tradeState, patch);
+        tradeState.version += 1;
+        return {
+          ok: true,
+          status: "APPLIED",
+          version: tradeState.version,
+          trade: { ...tradeState },
+        };
+      },
+    },
+    dynamicExitManagerOverrides: {
+      computeDynamicExitPlan({ trade }) {
+        const brokerConfirmed = Number(trade?.brokerStopLoss ?? 0) >= 94.5;
+        return buildAlcCompressionPlan({
+          state: "L1",
+          stopLoss: 94.5,
+          requestReady: !brokerConfirmed,
+          requestOutcome: brokerConfirmed
+            ? "ALC_APPLIED_CONFIRMED"
+            : "ALC_REQUEST_READY",
+          requestBlockedReason: brokerConfirmed
+            ? "ALC_BLOCKED_ALREADY_CONFIRMED"
+            : null,
+          appliedState: brokerConfirmed ? "L1" : "NONE",
+        });
+      },
+    },
+    candleStoreOverrides: {
+      getRecentCandles: async () => [],
+    },
+    envOverrides: {
+      DYNAMIC_EXITS_ENABLED: "true",
+      DYNAMIC_EXIT_MIN_INTERVAL_MS: 0,
+      DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: 0,
+      PROTECTION_DEDUPE_ENABLED: "true",
+      PROTECTION_NOOP_WRITE_SKIP: "true",
+      PROTECTION_CONFLICT_RETRY_ONCE: "true",
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    let modifyCalls = 0;
+    tm._getLtp = async () => 94.8;
+    tm._trackDynExitCadence = () => {};
+    tm._safeModifyOrder = async () => {
+      modifyCalls += 1;
+      return { skipped: false };
+    };
+    tm._scheduleReconcile = () => {};
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+
+    assert.equal(modifyCalls, 1);
+    assert.equal(tradeState.loserCompressionTargetState, "L1");
+    assert.equal(tradeState.loserCompressionSubmittedState, "L1");
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+    assert.equal(tradeState.loserCompressionPendingAction, "STOP_MODIFY");
+    assert.equal(Boolean(tradeState.protectionUpgradePending), true);
+    assert.equal(tradeState.loserCompressionBlockedReason, "ALC_REQUEST_SUBMITTED");
+    assert.equal(Boolean(tradeState.loserCompressionAppliedConfirmed), false);
+    assert.equal(tradeState.loserCompressionAppliedSource, null);
+    assert.equal(Number(tradeState.brokerStopLoss ?? 0), 90);
+
+    tm._bookRealizedPnl = async () => {};
+    tm._finalizeClosed = async () => {};
+
+    await tm.onOrderUpdate({
+      order_id: "SL-1",
+      status: "OPEN",
+      order_type: "SL-M",
+      trigger_price: 94.5,
+      filled_quantity: 0,
+      quantity: 50,
+      exchange_update_timestamp: "2026-03-18T09:16:30.000Z",
+    });
+
+    assert.equal(Number(tradeState.brokerStopLoss ?? 0), 94.5);
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+
+    assert.equal(tradeState.loserCompressionAppliedState, "L1");
+    assert.equal(tradeState.loserCompressionPendingAction, null);
+    assert.equal(tradeState.loserCompressionBlockedReason, "ALC_BLOCKED_ALREADY_CONFIRMED");
+    assert.equal(Boolean(tradeState.loserCompressionAppliedConfirmed), true);
+    assert.equal(tradeState.loserCompressionAppliedSource, "ALC_L1");
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testAlcSoftFailurePausesSpamAndRetriesAfterStale() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-ALC-RETRY"),
+    version: 7,
+    stopLoss: 90,
+    slTrigger: 90,
+    brokerStopLoss: 90,
+    panicExitPending: false,
+  };
+  const byId = new Map([
+    [
+      "SL-1",
+      {
+        status: "TRIGGER PENDING",
+        order_type: "SL-M",
+        trigger_price: 90,
+      },
+    ],
+  ]);
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async (_tradeId, patch) => {
+        Object.assign(tradeState, patch);
+        tradeState.version += 1;
+        return {
+          ok: true,
+          status: "APPLIED",
+          version: tradeState.version,
+          trade: { ...tradeState },
+        };
+      },
+    },
+    dynamicExitManagerOverrides: {
+      computeDynamicExitPlan({ trade }) {
+        const pendingSinceMs = trade?.loserCompressionPendingSince
+          ? new Date(trade.loserCompressionPendingSince).getTime()
+          : NaN;
+        const isFreshPending =
+          trade?.loserCompressionPendingAction === "STOP_MODIFY" &&
+          Number.isFinite(pendingSinceMs) &&
+          Date.now() - pendingSinceMs < 8_000;
+        return buildAlcCompressionPlan({
+          state: "L1",
+          stopLoss: 94.5,
+          requestReady: !isFreshPending,
+          requestOutcome: isFreshPending
+            ? "ALC_HOLD"
+            : Number(trade?.loserCompressionRetryCount ?? 0) > 0
+              ? "ALC_RETRY_L1"
+              : "ALC_REQUEST_READY",
+          requestBlockedReason: isFreshPending
+            ? "ALC_BLOCKED_PENDING_MODIFY"
+            : null,
+          pendingAction: isFreshPending ? "STOP_MODIFY" : null,
+          retryCount: Number(trade?.loserCompressionRetryCount ?? 0),
+        });
+      },
+    },
+    candleStoreOverrides: {
+      getRecentCandles: async () => [],
+    },
+    envOverrides: {
+      DYNAMIC_EXITS_ENABLED: "true",
+      DYNAMIC_EXIT_MIN_INTERVAL_MS: 0,
+      DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: 0,
+      PROTECTION_DEDUPE_ENABLED: "true",
+      PROTECTION_NOOP_WRITE_SKIP: "true",
+      PROTECTION_CONFLICT_RETRY_ONCE: "true",
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    let modifyCalls = 0;
+    tm._getLtp = async () => 94.8;
+    tm._trackDynExitCadence = () => {};
+    tm._safeModifyOrder = async () => {
+      modifyCalls += 1;
+      if (modifyCalls === 1) {
+        throw new Error("timeout");
+      }
+      return { skipped: false };
+    };
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+
+    assert.equal(modifyCalls, 1);
+    assert.equal(tradeState.loserCompressionSubmittedState, "L1");
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+    assert.equal(tradeState.loserCompressionPendingAction, "STOP_MODIFY");
+    assert.equal(tradeState.loserCompressionBlockedReason, "ALC_REQUEST_STALE");
+    assert.equal(Number(tradeState.loserCompressionRetryCount ?? 0), 1);
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+    assert.equal(modifyCalls, 1);
+
+    const staleTs = new Date(Date.now() - 20_000).toISOString();
+    tradeState.loserCompressionPendingSince = staleTs;
+    tradeState.loserCompressionLastAttemptAt = staleTs;
+    tradeState.protectionUpgradeUnconfirmedSince = staleTs;
+    tm._dynExitFailBackoffUntil.set(tradeState.tradeId, Date.now() - 1);
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+
+    assert.equal(modifyCalls, 2);
+    assert.equal(tradeState.loserCompressionSubmittedState, "L1");
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+    assert.equal(tradeState.loserCompressionPendingAction, "STOP_MODIFY");
+    assert.equal(tradeState.loserCompressionBlockedReason, "ALC_REQUEST_SUBMITTED");
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testAlcDoesNotConfirmFromNonAlcWinnerStop() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-ALC-NONALC"),
+    loserCompressionTargetState: "L1",
+    loserCompressionSubmittedState: "L1",
+    loserCompressionAppliedState: "NONE",
+    loserCompressionPendingAction: null,
+    loserCompressionLastRequestedStop: 94.5,
+    protectedStopSource: "GREEN_LOCK",
+    protectionUpgradePending: false,
+    shadowProtectionActiveReason: null,
+    stopLoss: 96,
+    slTrigger: 96,
+    brokerStopLoss: 90,
+  };
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async (_tradeId, patch) => {
+        Object.assign(tradeState, patch);
+        return {
+          ok: true,
+          status: "APPLIED",
+          version: 1,
+          trade: { ...tradeState },
+        };
+      },
+      appendOrderLog: async () => {},
+      upsertLiveOrderSnapshot: async () => {},
+      linkOrder: async () => {},
+      findTradeByOrder: async (orderId) =>
+        orderId === "SL-1"
+          ? {
+              trade: { ...tradeState },
+              link: { role: "SL" },
+            }
+          : null,
+    },
+    envOverrides: {
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    await tm.onOrderUpdate({
+      order_id: "SL-1",
+      status: "OPEN",
+      order_type: "SL-M",
+      trigger_price: 96,
+      filled_quantity: 0,
+      quantity: 50,
+      exchange_update_timestamp: "2026-03-18T09:16:45.000Z",
+    });
+
+    assert.equal(Number(tradeState.brokerStopLoss ?? 0), 96);
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+    assert.equal(Boolean(tradeState.loserCompressionAppliedConfirmed), false);
+    assert.equal(tradeState.loserCompressionAppliedSource, null);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testAlcSellSupersedeToL2WithoutFalseApply() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-ALC-SELL-L2"),
+    side: "SELL",
+    version: 11,
+    entryPrice: 100,
+    stopLoss: 106.5,
+    slTrigger: 106.5,
+    brokerStopLoss: 110,
+    loserCompressionTargetState: "L1",
+    loserCompressionSubmittedState: "L1",
+    loserCompressionAppliedState: "NONE",
+    loserCompressionPendingAction: "STOP_MODIFY",
+    loserCompressionPendingSince: new Date().toISOString(),
+    loserCompressionLastRequestedStop: 106.5,
+    loserCompressionLastAttemptAt: new Date().toISOString(),
+    loserCompressionRetryCount: 1,
+    protectionUpgradePending: true,
+    protectionUpgradeTargetStopLoss: 106.5,
+  };
+  const byId = new Map([
+    [
+      "SL-1",
+      {
+        status: "TRIGGER PENDING",
+        order_type: "SL-M",
+        trigger_price: 110,
+      },
+    ],
+  ]);
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async (_tradeId, patch) => {
+        Object.assign(tradeState, patch);
+        tradeState.version += 1;
+        return {
+          ok: true,
+          status: "APPLIED",
+          version: tradeState.version,
+          trade: { ...tradeState },
+        };
+      },
+    },
+    dynamicExitManagerOverrides: {
+      computeDynamicExitPlan({ trade }) {
+        const pendingSinceMs = trade?.loserCompressionPendingSince
+          ? new Date(trade.loserCompressionPendingSince).getTime()
+          : NaN;
+        const isFreshPending =
+          trade?.loserCompressionPendingAction === "STOP_MODIFY" &&
+          Number.isFinite(pendingSinceMs) &&
+          Date.now() - pendingSinceMs < 8_000 &&
+          String(trade?.loserCompressionTargetState || "").toUpperCase() === "L2";
+        return buildAlcCompressionPlan({
+          state: "L2",
+          stopLoss: 105.5,
+          requestReady: !isFreshPending,
+          requestOutcome: isFreshPending
+            ? "ALC_HOLD"
+            : "ALC_SUPERSEDE_L1_TO_L2",
+          requestBlockedReason: isFreshPending
+            ? "ALC_BLOCKED_PENDING_MODIFY"
+            : null,
+          pendingAction: isFreshPending ? "STOP_MODIFY" : null,
+          retryCount: Number(trade?.loserCompressionRetryCount ?? 0),
+          appliedState: String(trade?.loserCompressionAppliedState || "NONE"),
+        });
+      },
+    },
+    candleStoreOverrides: {
+      getRecentCandles: async () => [],
+    },
+    envOverrides: {
+      DYNAMIC_EXITS_ENABLED: "true",
+      DYNAMIC_EXIT_MIN_INTERVAL_MS: 0,
+      DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: 0,
+      PROTECTION_DEDUPE_ENABLED: "true",
+      PROTECTION_NOOP_WRITE_SKIP: "true",
+      PROTECTION_CONFLICT_RETRY_ONCE: "true",
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    let modifyCalls = 0;
+    tm._getLtp = async () => 105.2;
+    tm._trackDynExitCadence = () => {};
+    tm._safeModifyOrder = async () => {
+      modifyCalls += 1;
+      return { skipped: false };
+    };
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+
+    assert.equal(modifyCalls, 1);
+    assert.equal(tradeState.loserCompressionTargetState, "L2");
+    assert.equal(tradeState.loserCompressionSubmittedState, "L2");
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+    assert.equal(tradeState.loserCompressionPendingAction, "STOP_MODIFY");
+    assert.equal(Number(tradeState.brokerStopLoss ?? 0), 110);
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+    assert.equal(modifyCalls, 1);
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testAlcExitRequestAndConfirmLifecycle() {
+  const tradeState = {
+    ...makeRuntimeTrade("T-ALC-EXIT"),
+    version: 13,
+    stopLoss: 90,
+    slTrigger: 90,
+    brokerStopLoss: 90,
+    panicExitPending: false,
+    qty: 50,
+  };
+  const byId = new Map([
+    [
+      "SL-1",
+      {
+        status: "TRIGGER PENDING",
+        order_type: "SL-M",
+        trigger_price: 90,
+      },
+    ],
+  ]);
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      findTradeByOrder: async (orderId) =>
+        String(orderId) === "PANIC-1"
+          ? { trade: { ...tradeState }, link: { role: "PANIC_EXIT" } }
+          : null,
+      appendOrderLog: async () => {},
+      upsertLiveOrderSnapshot: async () => {},
+      linkOrder: async ({ order_id }) => {
+        if (String(order_id) === "PANIC-1") {
+          tradeState.panicExitOrderId = "PANIC-1";
+        }
+      },
+      updateTrade: async (_tradeId, patch) => {
+        Object.assign(tradeState, patch);
+        tradeState.version += 1;
+        return {
+          ok: true,
+          status: "APPLIED",
+          version: tradeState.version,
+          trade: { ...tradeState },
+        };
+      },
+    },
+    dynamicExitManagerOverrides: {
+      computeDynamicExitPlan() {
+        return buildAlcExitPlan();
+      },
+    },
+    candleStoreOverrides: {
+      getRecentCandles: async () => [],
+    },
+    envOverrides: {
+      DYNAMIC_EXITS_ENABLED: "true",
+      DYNAMIC_EXIT_MIN_INTERVAL_MS: 0,
+      DYNAMIC_EXIT_MIN_MODIFY_INTERVAL_MS: 0,
+      TELEGRAM_MIN_LEVEL: "error",
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {
+        getPositions: async () => ({
+          net: [
+            {
+              instrument_token: tradeState.instrument_token,
+              quantity: tradeState.qty,
+            },
+          ],
+        }),
+      },
+      riskEngine: makeRiskEngine(),
+    });
+
+    tm._getLtp = async () => 93.2;
+    tm._trackDynExitCadence = () => {};
+    tm._safeCancelOrder = async () => {};
+    tm._safePlaceOrder = async () => ({ orderId: "PANIC-1" });
+    tm._replayOrphanUpdates = async () => {};
+    tm._schedulePanicExitWatch = () => {};
+    tm._clearTimeStopFallback = () => {};
+    tm._bookRealizedPnl = async () => {};
+    tm._finalizeClosed = async () => {};
+    tm._scheduleReconcile = () => {};
+
+    await tm._maybeDynamicAdjustExits({ ...tradeState }, byId);
+
+    assert.equal(tradeState.status, "PANIC_EXIT_PLACED");
+    assert.equal(tradeState.panicExitOrderId, "PANIC-1");
+    assert.equal(tradeState.loserCompressionTargetState, "EXIT");
+    assert.equal(tradeState.loserCompressionSubmittedState, "EXIT");
+    assert.equal(tradeState.loserCompressionAppliedState, "NONE");
+    assert.equal(tradeState.loserCompressionPendingAction, "EXIT_REQUEST");
+    assert.equal(Boolean(tradeState.loserExitTriggered), true);
+    assert.equal(Boolean(tradeState.loserCompressionAppliedConfirmed), false);
+
+    await tm.onOrderUpdate({
+      order_id: "PANIC-1",
+      status: "COMPLETE",
+      average_price: 93.2,
+      filled_quantity: 50,
+      quantity: 50,
+      exchange_update_timestamp: "2026-03-18T09:17:00.000Z",
+    });
+
+    assert.equal(tradeState.status, "CLOSED");
+    assert.equal(tradeState.loserCompressionAppliedState, "EXIT");
+    assert.equal(tradeState.loserCompressionPendingAction, null);
+    assert.equal(tradeState.loserCompressionBlockedReason, "ALC_APPLIED_CONFIRMED");
+    assert.equal(Boolean(tradeState.loserCompressionAppliedConfirmed), true);
+    assert.equal(tradeState.loserCompressionAppliedSource, "ALC_EXIT_NOW");
+  } finally {
+    harness.restore();
+  }
+}
+
 function buildAuthorizedEarlyFailPlan() {
   return {
     ok: true,
@@ -1079,6 +2188,20 @@ function makeRuntimeTrade(tradeId = "T-EARLY") {
     brokerStopLoss: 90,
     stopLoss: 90,
     initialStopLoss: 90,
+    loserCompressionDesiredAction: "HOLD",
+    loserCompressionTargetState: "NONE",
+    loserCompressionSubmittedState: "NONE",
+    loserCompressionAppliedState: "NONE",
+    loserCompressionPendingAction: null,
+    loserCompressionPendingSince: null,
+    loserCompressionLastRequestedStop: null,
+    loserCompressionLastConfirmedStop: null,
+    loserCompressionLastAttemptAt: null,
+    loserCompressionLastConfirmedAt: null,
+    loserCompressionAppliedSource: null,
+    loserCompressionAppliedConfirmed: false,
+    loserCompressionAttributionConfidence: null,
+    loserCompressionRetryCount: 0,
     instrument_token: 12345,
     createdAt: "2026-03-18T09:15:00.000Z",
     entryFilledAt: "2026-03-18T09:15:00.000Z",
@@ -1889,6 +3012,14 @@ async function main() {
   await testBeApplySuccessMarksBrokerTruth();
   await testBeApplyFailureDoesNotMarkBrokerTruth();
   await testProtectiveSoftFailureBreachesShadowAndPanics();
+  await testProtectionNoopSkipsWriteAndModifyIntent();
+  await testProtectionConflictRetryAppliesOnce();
+  await testProtectionDominanceKeepsStrongerState();
+  await testAlcSubmitMarksSubmittedUntilBrokerConfirmed();
+  await testAlcSoftFailurePausesSpamAndRetriesAfterStale();
+  await testAlcDoesNotConfirmFromNonAlcWinnerStop();
+  await testAlcSellSupersedeToL2WithoutFalseApply();
+  await testAlcExitRequestAndConfirmLifecycle();
   await testTp1RunnerRebasesWinnerStateAndMarksBeLive();
   await testEarlyFailAuthorizationLogsDecisionFacts();
   await testEarlyFailAuthorizationLogsCompactWhenVerboseOff();

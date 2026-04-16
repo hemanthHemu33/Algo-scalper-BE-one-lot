@@ -1,3 +1,5 @@
+const { deriveAlcAttribution } = require("./alcAttribution");
+
 function n(v, fb = null) {
   const x = Number(v);
   return Number.isFinite(x) ? x : fb;
@@ -132,6 +134,11 @@ function resolveExitLifecycle(reasonCode, overrides = {}) {
       exitReasonCode: "POST_FILL_RISK_REDUCE_FULL",
       exitAuthority: "POST_FILL_RISK_ENGINE",
     },
+    ALC_EXIT_NOW: {
+      exitFamily: "LOSS_CONTAINMENT",
+      exitReasonCode: "ALC_EXIT_NOW",
+      exitAuthority: "ADAPTIVE_LOSER_ENGINE",
+    },
   };
 
   const base = normalized ? mapping[normalized] || null : null;
@@ -140,6 +147,30 @@ function resolveExitLifecycle(reasonCode, overrides = {}) {
     exitReasonCode: overrides.exitReasonCode ?? base?.exitReasonCode ?? normalized ?? null,
     exitAuthority: overrides.exitAuthority ?? base?.exitAuthority ?? null,
   };
+}
+
+function resolveAlcDerived(row = {}) {
+  return deriveAlcAttribution(row, {
+    side: row?.side ?? row?.transaction_type,
+    entryPrice: row?.entryPrice ?? row?.entry_price,
+    initialStopLoss:
+      row?.initialStopLoss ??
+      row?.initial_stop_loss ??
+      row?.strategyStopLoss ??
+      row?.strategy_stop_loss ??
+      row?.sizingStopLoss ??
+      row?.sizing_stop_loss,
+    riskInr: row?.executionRiskInr ?? row?.execution_risk_inr,
+    exitPrice: row?.exitPrice ?? row?.exit_price,
+    finalProtectionOwner:
+      row?.protectedStopSource ??
+      row?.protected_stop_source ??
+      row?.exitReasonCode ??
+      row?.exit_reason_code ??
+      row?.exitAuthority ??
+      row?.exit_authority ??
+      null,
+  });
 }
 
 function hasBeProtectionLive(source = {}) {
@@ -185,6 +216,8 @@ function deriveStopExitReasonCode(trade = {}) {
   if (bool(trade?.givebackActive) || bool(trade?.hardGivebackExitArmed)) {
     return "GIVEBACK_CAP";
   }
+  if (n(trade?.earlyWinnerTier, 0) > 0) return "MFE_LOCK";
+  if (bool(trade?.earlyWinnerActive)) return "EARLY_WINNER";
   if (n(trade?.mfeLockTier, 0) > 0) return "MFE_LOCK";
   if (bool(trade?.greenLockActive)) return "GREEN_LOCK";
   if (hasBeProtectionLive(trade)) {
@@ -197,6 +230,10 @@ function isWinnerProtectionActive(source = {}) {
   return Boolean(
     hasBeProtectionLive(source) ||
       hasTrailProtectionLive(source) ||
+      bool(source?.earlyWinnerActive) ||
+      bool(source?.earlyWinnerConfirmed) ||
+      bool(source?.earlyWinnerHandoffReady) ||
+      n(source?.earlyWinnerTier, 0) > 0 ||
       bool(source?.greenLockActive) ||
       bool(source?.profitLockArmed) ||
       n(source?.mfeLockTier, 0) > 0 ||
@@ -423,6 +460,55 @@ function resolveLifecycleField(source = {}, key) {
         found: row.mfeLockTier !== undefined || row.mfe_lock_tier !== undefined,
         value: n(row.mfeLockTier ?? row.mfe_lock_tier, 0),
       };
+    case "dynamicTrailArmR":
+      return {
+        found:
+          row.dynamicTrailArmR !== undefined ||
+          row.dynamic_trail_arm_r !== undefined,
+        value: n(row.dynamicTrailArmR ?? row.dynamic_trail_arm_r, null),
+      };
+    case "handoffMaturity":
+      return {
+        found:
+          row.handoffMaturity !== undefined ||
+          row.handoff_maturity !== undefined,
+        value: n(row.handoffMaturity ?? row.handoff_maturity, 0),
+      };
+    case "structureCandidateAvailable":
+      return {
+        found:
+          row.structureCandidateAvailable !== undefined ||
+          row.structure_candidate_available !== undefined,
+        value: bool(
+          row.structureCandidateAvailable ?? row.structure_candidate_available,
+          false,
+        ),
+      };
+    case "structureReferenceType":
+      return {
+        found:
+          row.structureReferenceType !== undefined ||
+          row.structure_reference_type !== undefined,
+        value:
+          row.structureReferenceType ?? row.structure_reference_type ?? null,
+      };
+    case "structureReferencePrice":
+      return {
+        found:
+          row.structureReferencePrice !== undefined ||
+          row.structure_reference_price !== undefined,
+        value: n(
+          row.structureReferencePrice ?? row.structure_reference_price,
+          null,
+        ),
+      };
+    case "structureMappedFloor":
+      return {
+        found:
+          row.structureMappedFloor !== undefined ||
+          row.structure_mapped_floor !== undefined,
+        value: n(row.structureMappedFloor ?? row.structure_mapped_floor, null),
+      };
     case "desiredStopLoss":
       return {
         found:
@@ -500,6 +586,396 @@ function resolveLifecycleField(source = {}, key) {
           row.winnerModeActive !== undefined ||
           row.winner_mode_active !== undefined,
         value: bool(row.winnerModeActive ?? row.winner_mode_active, false),
+      };
+    case "loserCompressionDesiredAction":
+      return {
+        found:
+          row.loserCompressionDesiredAction !== undefined ||
+          row.loser_compression_desired_action !== undefined,
+        value:
+          row.loserCompressionDesiredAction ??
+          row.loser_compression_desired_action ??
+          "HOLD",
+      };
+    case "loserCompressionTargetState":
+      return {
+        found:
+          row.loserCompressionTargetState !== undefined ||
+          row.loser_compression_target_state !== undefined,
+        value:
+          row.loserCompressionTargetState ??
+          row.loser_compression_target_state ??
+          "NONE",
+      };
+    case "loserCompressionSubmittedState":
+      return {
+        found:
+          row.loserCompressionSubmittedState !== undefined ||
+          row.loser_compression_submitted_state !== undefined,
+        value:
+          row.loserCompressionSubmittedState ??
+          row.loser_compression_submitted_state ??
+          "NONE",
+      };
+    case "loserCompressionAppliedState":
+      return {
+        found:
+          row.loserCompressionAppliedState !== undefined ||
+          row.loser_compression_applied_state !== undefined,
+        value:
+          row.loserCompressionAppliedState ??
+          row.loser_compression_applied_state ??
+          "NONE",
+      };
+    case "loserCompressionPendingAction":
+      return {
+        found:
+          row.loserCompressionPendingAction !== undefined ||
+          row.loser_compression_pending_action !== undefined,
+        value:
+          row.loserCompressionPendingAction ??
+          row.loser_compression_pending_action ??
+          null,
+      };
+    case "loserCompressionPendingSince":
+      return {
+        found:
+          row.loserCompressionPendingSince !== undefined ||
+          row.loser_compression_pending_since !== undefined,
+        value: isoOrNull(
+          row.loserCompressionPendingSince ??
+            row.loser_compression_pending_since,
+        ),
+      };
+    case "loserCompressionLastRequestedStop":
+      return {
+        found:
+          row.loserCompressionLastRequestedStop !== undefined ||
+          row.loser_compression_last_requested_stop !== undefined,
+        value: n(
+          row.loserCompressionLastRequestedStop ??
+            row.loser_compression_last_requested_stop,
+          null,
+        ),
+      };
+    case "loserCompressionLastConfirmedStop":
+      return {
+        found:
+          row.loserCompressionLastConfirmedStop !== undefined ||
+          row.loser_compression_last_confirmed_stop !== undefined,
+        value: n(
+          row.loserCompressionLastConfirmedStop ??
+            row.loser_compression_last_confirmed_stop,
+          null,
+        ),
+      };
+    case "loserCompressionLastAttemptAt":
+      return {
+        found:
+          row.loserCompressionLastAttemptAt !== undefined ||
+          row.loser_compression_last_attempt_at !== undefined,
+        value: isoOrNull(
+          row.loserCompressionLastAttemptAt ??
+            row.loser_compression_last_attempt_at,
+        ),
+      };
+    case "loserCompressionLastConfirmedAt":
+      return {
+        found:
+          row.loserCompressionLastConfirmedAt !== undefined ||
+          row.loser_compression_last_confirmed_at !== undefined,
+        value: isoOrNull(
+          row.loserCompressionLastConfirmedAt ??
+            row.loser_compression_last_confirmed_at,
+        ),
+      };
+    case "loserCompressionAppliedSource":
+      return {
+        found:
+          row.loserCompressionAppliedSource !== undefined ||
+          row.loser_compression_applied_source !== undefined,
+        value:
+          row.loserCompressionAppliedSource ??
+          row.loser_compression_applied_source ??
+          resolveAlcDerived(row).alcAppliedSource ??
+          null,
+      };
+    case "loserCompressionAppliedConfirmed":
+      return {
+        found:
+          row.loserCompressionAppliedConfirmed !== undefined ||
+          row.loser_compression_applied_confirmed !== undefined,
+        value: bool(
+          row.loserCompressionAppliedConfirmed ??
+            row.loser_compression_applied_confirmed ??
+            resolveAlcDerived(row).alcAppliedConfirmed,
+          false,
+        ),
+      };
+    case "loserCompressionAttributionConfidence":
+      return {
+        found:
+          row.loserCompressionAttributionConfidence !== undefined ||
+          row.loser_compression_attribution_confidence !== undefined,
+        value:
+          row.loserCompressionAttributionConfidence ??
+          row.loser_compression_attribution_confidence ??
+          resolveAlcDerived(row).alcAttributionConfidence ??
+          null,
+      };
+    case "loserCompressionRetryCount":
+      return {
+        found:
+          row.loserCompressionRetryCount !== undefined ||
+          row.loser_compression_retry_count !== undefined,
+        value: n(
+          row.loserCompressionRetryCount ??
+            row.loser_compression_retry_count,
+          0,
+        ),
+      };
+    case "loserCompressionState":
+      return {
+        found:
+          row.loserCompressionState !== undefined ||
+          row.loser_compression_state !== undefined,
+        value:
+          row.loserCompressionState ?? row.loser_compression_state ?? "NONE",
+      };
+    case "loserCompressionLastActionAt":
+      return {
+        found:
+          row.loserCompressionLastActionAt !== undefined ||
+          row.loser_compression_last_action_at !== undefined,
+        value: isoOrNull(
+          row.loserCompressionLastActionAt ??
+            row.loser_compression_last_action_at,
+        ),
+      };
+    case "loserCompressionActivatedAt":
+      return {
+        found:
+          row.loserCompressionActivatedAt !== undefined ||
+          row.loser_compression_activated_at !== undefined,
+        value: isoOrNull(
+          row.loserCompressionActivatedAt ??
+            row.loser_compression_activated_at,
+        ),
+      };
+    case "loserCompressionEscalatedAt":
+      return {
+        found:
+          row.loserCompressionEscalatedAt !== undefined ||
+          row.loser_compression_escalated_at !== undefined,
+        value: isoOrNull(
+          row.loserCompressionEscalatedAt ??
+            row.loser_compression_escalated_at,
+        ),
+      };
+    case "loserCompressionScoreAtLastAction":
+      return {
+        found:
+          row.loserCompressionScoreAtLastAction !== undefined ||
+          row.loser_compression_score_at_last_action !== undefined,
+        value: n(
+          row.loserCompressionScoreAtLastAction ??
+            row.loser_compression_score_at_last_action,
+          null,
+        ),
+      };
+    case "loserCompressionReasonAtLastAction":
+      return {
+        found:
+          row.loserCompressionReasonAtLastAction !== undefined ||
+          row.loser_compression_reason_at_last_action !== undefined,
+        value:
+          row.loserCompressionReasonAtLastAction ??
+          row.loser_compression_reason_at_last_action ??
+          null,
+      };
+    case "loserCompressionBlockedReason":
+      return {
+        found:
+          row.loserCompressionBlockedReason !== undefined ||
+          row.loser_compression_blocked_reason !== undefined,
+        value:
+          row.loserCompressionBlockedReason ??
+          row.loser_compression_blocked_reason ??
+          null,
+      };
+    case "loserCompressionLastAction":
+      return {
+        found:
+          row.loserCompressionLastAction !== undefined ||
+          row.loser_compression_last_action !== undefined,
+        value:
+          row.loserCompressionLastAction ??
+          row.loser_compression_last_action ??
+          null,
+      };
+    case "loserCompressionTriggeredAt":
+      return {
+        found:
+          row.loserCompressionTriggeredAt !== undefined ||
+          row.loser_compression_triggered_at !== undefined,
+        value: isoOrNull(
+          row.loserCompressionTriggeredAt ??
+            row.loser_compression_triggered_at,
+        ),
+      };
+    case "loserExitTriggered":
+      return {
+        found:
+          row.loserExitTriggered !== undefined ||
+          row.loser_exit_triggered !== undefined,
+        value: bool(row.loserExitTriggered ?? row.loser_exit_triggered, false),
+      };
+    case "loserExitReasonCode":
+      return {
+        found:
+          row.loserExitReasonCode !== undefined ||
+          row.loser_exit_reason_code !== undefined,
+        value:
+          row.loserExitReasonCode ??
+          row.loser_exit_reason_code ??
+          null,
+      };
+    case "alcRequested":
+      return {
+        found:
+          row.alcRequested !== undefined || row.alc_requested !== undefined,
+        value: bool(
+          row.alcRequested ?? row.alc_requested ?? resolveAlcDerived(row).alcRequested,
+          false,
+        ),
+      };
+    case "alcAppliedConfirmed":
+      return {
+        found:
+          row.alcAppliedConfirmed !== undefined ||
+          row.alc_applied_confirmed !== undefined,
+        value: bool(
+          row.alcAppliedConfirmed ??
+            row.alc_applied_confirmed ??
+            row.loserCompressionAppliedConfirmed ??
+            row.loser_compression_applied_confirmed ??
+            resolveAlcDerived(row).alcAppliedConfirmed,
+          false,
+        ),
+      };
+    case "alcRequestedLevel":
+      return {
+        found:
+          row.alcRequestedLevel !== undefined ||
+          row.alc_requested_level !== undefined,
+        value:
+          row.alcRequestedLevel ??
+          row.alc_requested_level ??
+          resolveAlcDerived(row).alcRequestedLevel ??
+          null,
+      };
+    case "alcAppliedLevel":
+      return {
+        found:
+          row.alcAppliedLevel !== undefined ||
+          row.alc_applied_level !== undefined,
+        value:
+          row.alcAppliedLevel ??
+          row.alc_applied_level ??
+          resolveAlcDerived(row).alcAppliedLevel ??
+          null,
+      };
+    case "alcAppliedSource":
+      return {
+        found:
+          row.alcAppliedSource !== undefined ||
+          row.alc_applied_source !== undefined,
+        value:
+          row.alcAppliedSource ??
+          row.alc_applied_source ??
+          resolveAlcDerived(row).alcAppliedSource ??
+          null,
+      };
+    case "alcAttributionConfidence":
+      return {
+        found:
+          row.alcAttributionConfidence !== undefined ||
+          row.alc_attribution_confidence !== undefined,
+        value:
+          row.alcAttributionConfidence ??
+          row.alc_attribution_confidence ??
+          resolveAlcDerived(row).alcAttributionConfidence ??
+          null,
+      };
+    case "alcRequestedButNotApplied":
+      return {
+        found:
+          row.alcRequestedButNotApplied !== undefined ||
+          row.alc_requested_but_not_applied !== undefined,
+        value: bool(
+          row.alcRequestedButNotApplied ??
+            row.alc_requested_but_not_applied ??
+            resolveAlcDerived(row).alcRequestedButNotApplied,
+          false,
+        ),
+      };
+    case "alcAppliedButSuperseded":
+      return {
+        found:
+          row.alcAppliedButSuperseded !== undefined ||
+          row.alc_applied_but_superseded !== undefined,
+        value: bool(
+          row.alcAppliedButSuperseded ??
+            row.alc_applied_but_superseded ??
+            resolveAlcDerived(row).alcAppliedButSuperseded,
+          false,
+        ),
+      };
+    case "alcSupersededBy":
+      return {
+        found:
+          row.alcSupersededBy !== undefined ||
+          row.alc_superseded_by !== undefined,
+        value:
+          row.alcSupersededBy ??
+          row.alc_superseded_by ??
+          resolveAlcDerived(row).alcSupersededBy ??
+          null,
+      };
+    case "alcFinalProtectionOwner":
+      return {
+        found:
+          row.alcFinalProtectionOwner !== undefined ||
+          row.alc_final_protection_owner !== undefined,
+        value:
+          row.alcFinalProtectionOwner ??
+          row.alc_final_protection_owner ??
+          resolveAlcDerived(row).alcFinalProtectionOwner ??
+          null,
+      };
+    case "alcSavedRiskR":
+      return {
+        found:
+          row.alcSavedRiskR !== undefined ||
+          row.alc_saved_risk_r !== undefined,
+        value: n(
+          row.alcSavedRiskR ??
+            row.alc_saved_risk_r ??
+            resolveAlcDerived(row).alcSavedRiskR,
+          null,
+        ),
+      };
+    case "alcSavedRiskInr":
+      return {
+        found:
+          row.alcSavedRiskInr !== undefined ||
+          row.alc_saved_risk_inr !== undefined,
+        value: n(
+          row.alcSavedRiskInr ??
+            row.alc_saved_risk_inr ??
+            resolveAlcDerived(row).alcSavedRiskInr,
+          null,
+        ),
       };
     case "stopImproveAuthorized":
       return {
@@ -594,6 +1070,19 @@ const TRADE_LIFECYCLE_FIELDS = Object.freeze([
   { key: "trailHit", defaultValue: false },
   { key: "profitLockArmed", defaultValue: false },
   { key: "greenLockActive", defaultValue: false },
+  { key: "earlyWinnerActive", defaultValue: false },
+  { key: "earlyWinnerConfirmed", defaultValue: false },
+  { key: "earlyWinnerHandoffReady", defaultValue: false },
+  { key: "earlyWinnerTier", defaultValue: 0 },
+  { key: "dynamicTrailArmR", defaultValue: null },
+  { key: "handoffMaturity", defaultValue: 0 },
+  { key: "structureCandidateAvailable", defaultValue: false },
+  { key: "structureReferenceType", defaultValue: null },
+  { key: "structureReferencePrice", defaultValue: null },
+  { key: "structureMappedFloor", defaultValue: null },
+  { key: "protectionPhase", defaultValue: "PHASE_0_NO_PROTECTION" },
+  { key: "protectedStopSource", defaultValue: null },
+  { key: "protectionStateVersion", defaultValue: 0 },
   { key: "mfeLockTier", defaultValue: 0 },
   { key: "desiredStopLoss", defaultValue: null },
   { key: "telemetryProposalFloor", defaultValue: null },
@@ -605,6 +1094,43 @@ const TRADE_LIFECYCLE_FIELDS = Object.freeze([
   { key: "structureTrailAllowed", defaultValue: false },
   { key: "protectionGateOpen", defaultValue: false },
   { key: "winnerModeActive", defaultValue: false },
+  { key: "loserCompressionDesiredAction", defaultValue: "HOLD" },
+  { key: "loserCompressionTargetState", defaultValue: "NONE" },
+  { key: "loserCompressionSubmittedState", defaultValue: "NONE" },
+  { key: "loserCompressionAppliedState", defaultValue: "NONE" },
+  { key: "loserCompressionPendingAction", defaultValue: null },
+  { key: "loserCompressionPendingSince", defaultValue: null },
+  { key: "loserCompressionLastRequestedStop", defaultValue: null },
+  { key: "loserCompressionLastConfirmedStop", defaultValue: null },
+  { key: "loserCompressionLastAttemptAt", defaultValue: null },
+  { key: "loserCompressionLastConfirmedAt", defaultValue: null },
+  { key: "loserCompressionAppliedSource", defaultValue: null },
+  { key: "loserCompressionAppliedConfirmed", defaultValue: false },
+  { key: "loserCompressionAttributionConfidence", defaultValue: null },
+  { key: "loserCompressionRetryCount", defaultValue: 0 },
+  { key: "loserCompressionState", defaultValue: "NONE" },
+  { key: "loserCompressionLastActionAt", defaultValue: null },
+  { key: "loserCompressionActivatedAt", defaultValue: null },
+  { key: "loserCompressionEscalatedAt", defaultValue: null },
+  { key: "loserCompressionScoreAtLastAction", defaultValue: null },
+  { key: "loserCompressionReasonAtLastAction", defaultValue: null },
+  { key: "loserCompressionBlockedReason", defaultValue: null },
+  { key: "loserCompressionLastAction", defaultValue: null },
+  { key: "loserCompressionTriggeredAt", defaultValue: null },
+  { key: "loserExitTriggered", defaultValue: false },
+  { key: "loserExitReasonCode", defaultValue: null },
+  { key: "alcRequested", defaultValue: false },
+  { key: "alcAppliedConfirmed", defaultValue: false },
+  { key: "alcRequestedLevel", defaultValue: null },
+  { key: "alcAppliedLevel", defaultValue: null },
+  { key: "alcAppliedSource", defaultValue: null },
+  { key: "alcAttributionConfidence", defaultValue: null },
+  { key: "alcRequestedButNotApplied", defaultValue: false },
+  { key: "alcAppliedButSuperseded", defaultValue: false },
+  { key: "alcSupersededBy", defaultValue: null },
+  { key: "alcFinalProtectionOwner", defaultValue: null },
+  { key: "alcSavedRiskR", defaultValue: null },
+  { key: "alcSavedRiskInr", defaultValue: null },
   { key: "stopImproveAuthorized", defaultValue: false },
   { key: "stopImproveBlockedReason", defaultValue: null },
   { key: "trailActive", defaultValue: false },

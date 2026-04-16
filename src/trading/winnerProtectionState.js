@@ -3,6 +3,116 @@ const WINNER_PROTECTION_FIELDS = Object.freeze([
   { key: "currentExecutableR", aliases: ["current_executable_r"], defaultValue: 0 },
   { key: "protectedPeakR", aliases: ["protected_peak_r"], defaultValue: 0 },
   { key: "protectedCurrentR", aliases: ["protected_current_r"], defaultValue: 0 },
+  {
+    key: "earlyWinnerEligible",
+    aliases: ["early_winner_eligible"],
+    defaultValue: false,
+  },
+  {
+    key: "earlyWinnerArmed",
+    aliases: ["early_winner_armed"],
+    defaultValue: false,
+  },
+  {
+    key: "earlyWinnerConfirmed",
+    aliases: ["early_winner_confirmed"],
+    defaultValue: false,
+  },
+  {
+    key: "earlyWinnerArmAt",
+    aliases: ["early_winner_arm_at"],
+    defaultValue: null,
+  },
+  {
+    key: "earlyWinnerConfirmedAt",
+    aliases: ["early_winner_confirmed_at"],
+    defaultValue: null,
+  },
+  {
+    key: "earlyWinnerConfirmTicks",
+    aliases: ["early_winner_confirm_ticks"],
+    defaultValue: 0,
+  },
+  {
+    key: "earlyWinnerConfirmMs",
+    aliases: ["early_winner_confirm_ms"],
+    defaultValue: 0,
+  },
+  {
+    key: "earlyWinnerTier",
+    aliases: ["early_winner_tier"],
+    defaultValue: 0,
+  },
+  {
+    key: "earlyWinnerKeepR",
+    aliases: ["early_winner_keep_r"],
+    defaultValue: 0,
+  },
+  {
+    key: "earlyWinnerFloorPrice",
+    aliases: ["early_winner_floor_price"],
+    defaultValue: null,
+  },
+  {
+    key: "earlyWinnerFloorSource",
+    aliases: ["early_winner_floor_source"],
+    defaultValue: null,
+  },
+  {
+    key: "earlyWinnerActive",
+    aliases: ["early_winner_active"],
+    defaultValue: false,
+  },
+  {
+    key: "earlyWinnerMfeLockActive",
+    aliases: ["early_winner_mfe_lock_active"],
+    defaultValue: false,
+  },
+  {
+    key: "earlyWinnerHandoffReady",
+    aliases: ["early_winner_handoff_ready"],
+    defaultValue: false,
+  },
+  {
+    key: "dynamicTrailArmR",
+    aliases: ["dynamic_trail_arm_r"],
+    defaultValue: null,
+  },
+  {
+    key: "handoffMaturity",
+    aliases: ["handoff_maturity"],
+    defaultValue: 0,
+  },
+  {
+    key: "structureCandidateAvailable",
+    aliases: ["structure_candidate_available"],
+    defaultValue: false,
+  },
+  {
+    key: "structureReferenceType",
+    aliases: ["structure_reference_type"],
+    defaultValue: null,
+  },
+  {
+    key: "structureReferencePrice",
+    aliases: ["structure_reference_price"],
+    defaultValue: null,
+  },
+  {
+    key: "structureMappedFloor",
+    aliases: ["structure_mapped_floor"],
+    defaultValue: null,
+  },
+  {
+    key: "protectionPhase",
+    aliases: ["protection_phase"],
+    defaultValue: "PHASE_0_NO_PROTECTION",
+  },
+  {
+    key: "protectionStateVersion",
+    aliases: ["protection_state_version"],
+    defaultValue: 0,
+  },
   { key: "mfeLockTier", aliases: ["mfe_lock_tier"], defaultValue: 0 },
   { key: "mfeLockFloorR", aliases: ["mfe_lock_floor_r"], defaultValue: 0 },
   {

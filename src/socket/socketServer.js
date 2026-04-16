@@ -8,7 +8,7 @@ const {
 } = require("../kite/tickerManager");
 const { isHalted, getHaltInfo } = require("../runtime/halt");
 const { getTradingEnabled } = require("../runtime/tradingEnabled");
-const { getDb } = require("../db");
+const { getDb, getMongoRuntimeState } = require("../db");
 const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
@@ -26,12 +26,31 @@ const { getMarketCalendarMeta } = require("../market/marketCalendar");
 const { getLastFnoUniverse } = require("../fno/fnoUniverse");
 const { getQuoteGuardStats } = require("../kite/quoteGuard");
 const { getRecentCandles, getCandlesSince } = require("../market/candleStore");
-const { reportFault } = require("../runtime/errorBus");
+const { reportFault, reportWindowedFault } = require("../runtime/errorBus");
 const { ltpStream, getLatestLtp } = require("../market/ltpStream");
 const {
   normalizeActiveTrade,
   normalizeTradeRow,
 } = require("../trading/tradeNormalization");
+const { isTransientMongoError } = require("../runtime/isTransientMongoError");
+
+const pipelineStatusCache = {
+  snapshot: null,
+  atMs: 0,
+};
+
+function mongoStatusFields() {
+  const state = getMongoRuntimeState();
+  return {
+    mongoConnected: !!state?.connected,
+    mongoDegraded: !!state?.degraded,
+    mongoLastHealthyAt: state?.lastHealthyAt || null,
+    mongoLastErrorAt: state?.lastErrorAt || null,
+    mongoLastErrorMessage: state?.lastErrorMessage || null,
+    mongoPoolClearedCount: Number(state?.poolClearedCount || 0),
+    mongoState: state,
+  };
+}
 
 function parseCorsAllowList() {
   const raw = String(env.CORS_ORIGIN || "*").trim();
@@ -89,18 +108,51 @@ function assertAdminKey(socket) {
 async function buildStatusSnapshot() {
   let pipeline = null;
   let s = null;
+  let dbDegraded = false;
+  let dbStatusStaleMs = null;
   try {
     pipeline = getPipeline();
-    if (pipeline?.status) s = await pipeline.status();
+    if (pipeline?.status) {
+      s = await pipeline.status();
+      if (s && typeof s === "object") {
+        pipelineStatusCache.snapshot = { ...s };
+        pipelineStatusCache.atMs = Date.now();
+      }
+    }
   } catch (e) {
-    logger.warn(
-      { err: e?.message || String(e) },
-      "[socket] pipeline status unavailable",
-    );
+    const transientMongo = isTransientMongoError(e);
+    if (transientMongo && pipelineStatusCache.snapshot) {
+      s = { ...pipelineStatusCache.snapshot };
+      dbDegraded = true;
+      dbStatusStaleMs = Math.max(0, Date.now() - pipelineStatusCache.atMs);
+      reportWindowedFault({
+        windowKey: "socket_pipeline_status_cached_mongo",
+        windowMs: 30_000,
+        code: "SOCKET_STATUS_MONGO_CACHED",
+        err: e,
+        message: "[socket] serving cached pipeline status during mongo degradation",
+        meta: { dbStatusStaleMs },
+      });
+    } else if (transientMongo) {
+      dbDegraded = true;
+      reportWindowedFault({
+        windowKey: "socket_pipeline_status_unavailable_mongo",
+        windowMs: 30_000,
+        code: "SOCKET_STATUS_MONGO_UNAVAILABLE",
+        err: e,
+        message: "[socket] pipeline status unavailable",
+      });
+    } else {
+      logger.warn(
+        { err: e?.message || String(e) },
+        "[socket] pipeline status unavailable",
+      );
+    }
   }
   const status = s && typeof s === "object" ? s : {};
   const ticker = getTickerStatus();
   const halted = isHalted();
+  const mongoStatus = mongoStatusFields();
   const normalizedTicker = {
     connected: false,
     lastDisconnect: null,
@@ -147,6 +199,7 @@ async function buildStatusSnapshot() {
       status?.dailyRisk?.rejectedTrades ??
       status?.dailyRisk?.rejections ??
       null,
+    mongoDegraded: mongoStatus.mongoDegraded,
   };
   return {
     ok: status?.ok ?? !!pipeline,
@@ -166,6 +219,9 @@ async function buildStatusSnapshot() {
     activeTrade,
     tradeTracking,
     systemHealth,
+    dbDegraded: dbDegraded || mongoStatus.mongoDegraded,
+    dbStatusStaleMs,
+    ...mongoStatus,
   };
 }
 
@@ -379,6 +435,9 @@ function attachSocketServer(httpServer) {
     const defaultSnapshotIntervalMs = Number(
       env.WS_ADMIN_SNAPSHOT_INTERVAL_MS ?? 5000,
     );
+    let requestedStatusIntervalMs = Number(env.WS_STATUS_INTERVAL_MS ?? 2000);
+    let activeStatusIntervalMs = null;
+    let statusSubscribed = true;
 
     // ---- helpers
     const stopTimer = (key) => {
@@ -416,9 +475,24 @@ function attachSocketServer(httpServer) {
       emitSnapshot(names, payload);
     };
 
+    const resolveStatusIntervalMs = () => {
+      const base = Math.max(200, Number(requestedStatusIntervalMs) || 2000);
+      if (!getMongoRuntimeState()?.degraded) return base;
+      return Math.min(Math.max(base, 2000) * 3, 15_000);
+    };
+
+    const ensureStatusTimer = () => {
+      if (!statusSubscribed) return;
+      const nextMs = resolveStatusIntervalMs();
+      if (activeStatusIntervalMs === nextMs) return;
+      activeStatusIntervalMs = nextMs;
+      startTimer("status", nextMs, sendStatus);
+    };
+
     const sendStatus = async () => {
       const snap = await buildStatusSnapshot();
       emitIfChanged("status", ["status:update", "status"], snap);
+      if (statusSubscribed) ensureStatusTimer();
     };
 
     const sendSubs = async () => {
@@ -706,11 +780,7 @@ function attachSocketServer(httpServer) {
 
     bootstrapSnapshots();
 
-    startTimer(
-      "status",
-      Number(env.WS_STATUS_INTERVAL_MS ?? 2000),
-      sendStatus,
-    );
+    ensureStatusTimer();
     startTimer(
       "subs",
       Number(env.WS_SUBS_INTERVAL_MS ?? 5000),
@@ -832,9 +902,13 @@ function attachSocketServer(httpServer) {
     // ---- events from client (FE -> BE)
 
     socket.on("status:subscribe", (payload = {}) => {
-      const intervalMs = Number(payload.intervalMs ?? env.WS_STATUS_INTERVAL_MS ?? 2000);
+      statusSubscribed = true;
+      requestedStatusIntervalMs = Number(
+        payload.intervalMs ?? env.WS_STATUS_INTERVAL_MS ?? 2000,
+      );
       sendStatus().catch((err) => { reportFault({ code: "SOCKET_SOCKETSERVER_ASYNC", err, message: "[src/socket/socketServer.js] async task failed" }); });
-      startTimer("status", intervalMs, sendStatus);
+      activeStatusIntervalMs = null;
+      ensureStatusTimer();
     });
 
     socket.on("status:request", () => {
@@ -842,7 +916,9 @@ function attachSocketServer(httpServer) {
     });
 
     socket.on("status:unsubscribe", () => {
+      statusSubscribed = false;
       stopTimer("status");
+      activeStatusIntervalMs = null;
     });
 
     socket.on("subs:subscribe", (payload = {}) => {

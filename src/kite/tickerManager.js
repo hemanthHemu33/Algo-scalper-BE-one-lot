@@ -1,5 +1,5 @@
 const { env, subscribeTokens, subscribeSymbols } = require("../config");
-const { reportFault } = require("../runtime/errorBus");
+const { reportFault, reportWindowedFault } = require("../runtime/errorBus");
 const {
   resolveSubscribeTokens,
   ensureInstrument,
@@ -14,6 +14,7 @@ const { buildPipeline } = require("../pipeline");
 const { updateFromTicks } = require("../market/ltpStream");
 const { MarketGate } = require("../market/marketGate");
 const { isMarketOpenNow } = require("../market/isMarketOpenNow");
+const { isTransientMongoError } = require("../runtime/isTransientMongoError");
 
 let kite = null;
 let ticker = null;
@@ -41,6 +42,11 @@ let subscribedTokens = new Set();
 let tokenModeByToken = new Map();
 let _lastPosResubAt = 0;
 let _lastUniverseRebuildAt = 0;
+let runtimeInitRetryTimer = null;
+let runtimeInitRetryAttempt = 0;
+let runtimeInitInFlight = false;
+let runtimeInitDegraded = false;
+let runtimeInitContext = null;
 
 function _bool(v, def = false) {
   if (v === undefined || v === null) return def;
@@ -536,6 +542,254 @@ function startReconcileLoop() {
   }, sec * 1000);
 }
 
+function clearRuntimeInitRetry() {
+  if (runtimeInitRetryTimer) {
+    clearTimeout(runtimeInitRetryTimer);
+    runtimeInitRetryTimer = null;
+  }
+}
+
+function resetRuntimeInitState() {
+  clearRuntimeInitRetry();
+  runtimeInitRetryAttempt = 0;
+  runtimeInitInFlight = false;
+  runtimeInitDegraded = false;
+  runtimeInitContext = null;
+}
+
+function nextRuntimeInitBackoffMs() {
+  const delay = Math.min(
+    15_000,
+    1_000 * Math.pow(2, Math.max(0, runtimeInitRetryAttempt)),
+  );
+  runtimeInitRetryAttempt += 1;
+  return delay;
+}
+
+function buildResolvedSignalTokens({
+  resolved = [],
+  signalTokensIn = [],
+  mergeCashUniverse = false,
+  fnoUniverseTokens = [],
+} = {}) {
+  return signalTokensIn?.length
+    ? _uniqNumeric(
+        mergeCashUniverse
+          ? [
+              ...resolved.filter(
+                (token) => !fnoUniverseTokens.includes(Number(token)),
+              ),
+              ...signalTokensIn,
+            ]
+          : signalTokensIn,
+      )
+    : _uniqNumeric(resolved);
+}
+
+function subscribeBrokerBootstrapTokens(tokens = []) {
+  const allTokens = _uniqNumeric(tokens);
+  if (!allTokens.length) return { ok: true, allTokens };
+
+  ticker.subscribe(allTokens);
+  _applyMode(allTokens, _modeStrSafe(env.TICK_MODE_UNDERLYING, "quote"));
+  subscribedTokens = new Set(allTokens);
+
+  logger.info(
+    {
+      subscribeTokens: allTokens,
+      fromSymbols: subscribeSymbols,
+    },
+    "[kite] subscribed",
+  );
+
+  alertWithCooldown(
+    "kite_subscribed",
+    60_000,
+    "info",
+    "ðŸ“¡ Kite subscriptions active",
+    {
+      subscribedTokens: allTokens.length,
+      posTokensAdded: 0,
+    },
+  );
+
+  return { ok: true, allTokens };
+}
+
+async function buildConnectBootstrapContext() {
+  let tokensIn = subscribeTokens;
+  let symbolsIn = subscribeSymbols;
+  let signalTokensIn = null;
+  let fnoUniverseTokens = [];
+  let mergeCashUniverse = false;
+
+  if (_bool(env.FNO_ENABLED, false)) {
+    try {
+      const uni = await buildFnoUniverse({ kite });
+      const u = uni?.universe;
+      if (u?.tokens?.length) {
+        mergeCashUniverse = _bool(env.FNO_MERGE_CASH_UNIVERSE, false);
+        fnoUniverseTokens = _uniqNumeric(u.tokens);
+        signalTokensIn = _uniqNumeric(
+          Array.isArray(u.signalTokens) ? u.signalTokens : u.tokens,
+        );
+        tokensIn = mergeCashUniverse
+          ? Array.from(new Set([...(tokensIn || []), ...u.tokens]))
+          : u.tokens;
+        symbolsIn = mergeCashUniverse ? symbolsIn : [];
+        logger.info(
+          {
+            mode: u.mode,
+            underlyings: u.underlyings,
+            tokens: u.tokens,
+            signalTokens: signalTokensIn,
+            symbols: u.symbols,
+          },
+          "[fno] universe active",
+        );
+        alertWithCooldown(
+          "fno_universe_active",
+          60_000,
+          "info",
+          "ðŸ§­ F&O universe activated",
+          {
+            mode: u.mode,
+            underlyings: u.underlyings,
+            tokens: (u.tokens || []).length,
+            symbols: u.symbols,
+          },
+        );
+      }
+    } catch (e) {
+      logger.error(
+        { e: e?.message || String(e) },
+        "[fno] universe build failed",
+      );
+    }
+  }
+
+  return {
+    tokensIn: _uniqNumeric(tokensIn),
+    symbolsIn: Array.isArray(symbolsIn) ? symbolsIn.slice() : [],
+    signalTokensIn: _uniqNumeric(signalTokensIn || []),
+    fnoUniverseTokens,
+    mergeCashUniverse,
+  };
+}
+
+function scheduleRuntimeInitRetry() {
+  if (runtimeInitRetryTimer || runtimeInitInFlight) return;
+  if (!runtimeInitContext || !tickerConnected || !pipeline) return;
+
+  const backoffMs = nextRuntimeInitBackoffMs();
+  runtimeInitRetryTimer = setTimeout(() => {
+    runtimeInitRetryTimer = null;
+    if (!runtimeInitContext || !tickerConnected || !pipeline) return;
+    void runPostConnectRuntimeInit(runtimeInitContext, {
+      reason: "connect_retry",
+    }).catch((err) => {
+      reportFault({
+        code: "KITE_TICKERMANAGER_ASYNC",
+        err,
+        message: "[src/kite/tickerManager.js] async task failed",
+      });
+    });
+  }, backoffMs);
+  runtimeInitRetryTimer.unref?.();
+}
+
+async function runPostConnectRuntimeInit(
+  context,
+  { reason = "connect" } = {},
+) {
+  if (!context || !pipeline || !tickerConnected) {
+    return { ok: false, skipped: true };
+  }
+  if (runtimeInitInFlight) {
+    return { ok: false, skipped: true, reason: "in_flight" };
+  }
+
+  runtimeInitInFlight = true;
+  clearRuntimeInitRetry();
+
+  try {
+    const resolved = await resolveSubscribeTokens(kite, {
+      tokens: context.tokensIn,
+      symbols: context.symbolsIn,
+    });
+    const allTokens = _uniqNumeric(resolved);
+    const resolvedSignalTokens = buildResolvedSignalTokens({
+      resolved,
+      signalTokensIn: context.signalTokensIn,
+      mergeCashUniverse: context.mergeCashUniverse,
+      fnoUniverseTokens: context.fnoUniverseTokens,
+    });
+    const missing = allTokens.filter((token) => !subscribedTokens.has(token));
+
+    if (missing.length) {
+      await _subscribeTokens(missing, { reason: `runtime_init:${reason}` });
+    }
+
+    if (!allTokens.length) {
+      logger.warn(
+        { subscribeTokens, subscribeSymbols },
+        "[kite] nothing to subscribe (set SUBSCRIBE_SYMBOLS or SUBSCRIBE_TOKENS)",
+      );
+      runtimeInitRetryAttempt = 0;
+      if (runtimeInitDegraded) {
+        runtimeInitDegraded = false;
+        logger.info({ reason }, "[kite] runtime init recovered after connect");
+      }
+      return { ok: true, allTokens, resolvedSignalTokens, skipped: true };
+    }
+
+    await pipeline.initForTokens(allTokens, {
+      signalTokens: resolvedSignalTokens,
+    });
+    await pipeline.reconcile();
+    await ensureActivePositionSubscriptions({
+      force: true,
+      reason,
+    });
+    startReconcileLoop();
+
+    runtimeInitRetryAttempt = 0;
+    runtimeInitContext = {
+      ...context,
+      allTokens,
+      resolvedSignalTokens,
+    };
+
+    if (runtimeInitDegraded) {
+      runtimeInitDegraded = false;
+      logger.info({ reason }, "[kite] runtime init recovered after connect");
+    }
+
+    return { ok: true, allTokens, resolvedSignalTokens };
+  } catch (e) {
+    if (isTransientMongoError(e)) {
+      runtimeInitDegraded = true;
+      reportWindowedFault({
+        windowKey: "kite_runtime_init_degraded",
+        windowMs: 30_000,
+        code: "KITE_RUNTIME_INIT_DEGRADED",
+        err: e,
+        message: "[kite] runtime init degraded after connect",
+        meta: {
+          reason,
+          connected: tickerConnected,
+          retryAttempt: runtimeInitRetryAttempt,
+        },
+      });
+      scheduleRuntimeInitRetry();
+      return { ok: false, degraded: true, reason };
+    }
+    throw e;
+  } finally {
+    runtimeInitInFlight = false;
+  }
+}
+
 async function drainTicks() {
   if (draining) return;
   draining = true;
@@ -566,6 +820,7 @@ async function cleanupSessionRuntime({
   const prevTicker = ticker;
 
   stopReconcileLoop();
+  resetRuntimeInitState();
   stopTickWatchdog();
   stopTickTapLogger();
   tickQueue = [];
@@ -650,14 +905,34 @@ function wireEvents() {
     logger.info("[kite] ticker connected");
 
     try {
-      let tokensIn = subscribeTokens;
-      let symbolsIn = subscribeSymbols;
-      let signalTokensIn = null;
-      let fnoUniverseTokens = [];
-      let mergeCashUniverse = false;
+      const context = await buildConnectBootstrapContext();
+      runtimeInitContext = context;
 
-      // F&O mode: dynamically build derivative universe (futures or underlying tokens for options)
-      if (_bool(env.FNO_ENABLED, false)) {
+      if (context.tokensIn.length) {
+        subscribeBrokerBootstrapTokens(context.tokensIn);
+      }
+
+      if (!context.tokensIn.length && !context.symbolsIn.length) {
+        logger.warn(
+          { subscribeTokens, subscribeSymbols },
+          "[kite] nothing to subscribe (set SUBSCRIBE_SYMBOLS or SUBSCRIBE_TOKENS)",
+        );
+      }
+
+      try {
+        await runPostConnectRuntimeInit(context, { reason: "connect" });
+      } catch (e) {
+        logger.error(
+          { e: e?.message || String(e) },
+          "[kite] runtime init failed after connect",
+        );
+        alert("error", "âŒ Kite runtime init failed after connect", {
+          message: e?.message || String(e),
+        }).catch((err) => { reportFault({ code: "KITE_TICKERMANAGER_ASYNC", err, message: "[src/kite/tickerManager.js] async task failed" }); });
+      }
+      return;
+
+      if (context.tokensIn.length) {
         try {
           const uni = await buildFnoUniverse({ kite });
           const u = uni?.universe;
@@ -773,6 +1048,7 @@ function wireEvents() {
     } catch (e) {
       tickerConnected = false;
       stopReconcileLoop();
+      resetRuntimeInitState();
       logger.error(
         { e: e?.message || String(e) },
         "[kite] connect handler failed",

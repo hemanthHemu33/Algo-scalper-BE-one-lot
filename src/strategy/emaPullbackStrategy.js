@@ -31,6 +31,7 @@ function buildEmaPullbackCandidate({
     meta: {
       anchor: `EMA${fast}`,
       anchorValue: curFast,
+      triggerLevel: curFast,
       fast,
       slow,
       pullbackBars: pullbackWindow,
