@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..", "..");
+const BASE_TS = Date.parse("2026-01-01T09:15:00.000Z");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -11,6 +12,9 @@ function sleep(ms) {
 function loadPipelineHarness({
   envOverrides = {},
   tradeManagerOverrides = {},
+  candleBuilderOverrides = {},
+  strategyEngineOverrides = {},
+  loggerOverrides = {},
 } = {}) {
   const pipelinePath = path.join(ROOT, "src", "pipeline.js");
   const configPath = path.join(ROOT, "src", "config.js");
@@ -24,6 +28,19 @@ function loadPipelineHarness({
   );
   const riskEnginePath = path.join(ROOT, "src", "risk", "riskEngine.js");
   const tradeManagerPath = path.join(ROOT, "src", "trading", "tradeManager.js");
+  const strategyEnginePath = path.join(
+    ROOT,
+    "src",
+    "strategy",
+    "strategyEngine.js",
+  );
+  const loggerPath = path.join(ROOT, "src", "logger.js");
+  const mongoStatePath = path.join(
+    ROOT,
+    "src",
+    "runtime",
+    "mongoRuntimeState.js",
+  );
 
   delete require.cache[require.resolve(pipelinePath)];
 
@@ -33,6 +50,12 @@ function loadPipelineHarness({
   const candleWriteBufferModule = require(candleWriteBufferPath);
   const riskEngineModule = require(riskEnginePath);
   const tradeManagerModule = require(tradeManagerPath);
+  const strategyEngineModule = require(strategyEnginePath);
+  const { logger } = require(loggerPath);
+  const mongoStateModule = require(mongoStatePath);
+  if (typeof mongoStateModule.resetMongoRuntimeStateForTests === "function") {
+    mongoStateModule.resetMongoRuntimeStateForTests();
+  }
 
   const stats = {
     finalizerTicks: 0,
@@ -140,6 +163,7 @@ function loadPipelineHarness({
     }
   }
 
+  patchObject(StubCandleBuilder.prototype, candleBuilderOverrides);
   patchObject(StubTradeManager.prototype, tradeManagerOverrides);
 
   patchObject(candleBuilderModule, { CandleBuilder: StubCandleBuilder });
@@ -149,6 +173,8 @@ function loadPipelineHarness({
   });
   patchObject(riskEngineModule, { RiskEngine: StubRiskEngine });
   patchObject(tradeManagerModule, { TradeManager: StubTradeManager });
+  patchObject(strategyEngineModule, strategyEngineOverrides);
+  patchObject(logger, loggerOverrides);
   patchEnv({
     CANDLE_INTERVALS: "1",
     CANDLE_TIMER_FINALIZER_ENABLED: "true",
@@ -194,6 +220,149 @@ async function testPipelineStopLifecycle() {
     await pipeline.stop();
     assert.equal(harness.stats.writerStops, 1);
     assert.equal(harness.stats.traderStops, 1);
+  } finally {
+    try {
+      await pipeline?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testTradePathRuntimeAbortEscalation() {
+  const logs = [];
+  let closeCount = 0;
+  const signal = {
+    signalId: "sig-runtime-abort",
+    regimeSnapshotId: "snap-runtime-abort",
+    instrument_token: 12345,
+    side: "BUY",
+    strategyId: "ema_pullback",
+    strategyStyle: "TREND",
+    confidence: 67.1,
+    intervalMin: 1,
+    regime: "TREND",
+    preEmit: {
+      routeConfidence: {
+        preRouteScore: 50.2,
+        expectedRouteAdjustment: -0.7,
+        routedScore: 49.5,
+        estimated: true,
+      },
+    },
+    conversionSummary: {
+      routeAttempted: false,
+      preRouteScore: 50.2,
+      expectedRouteAdjustment: -0.7,
+      routedConfidence: 49.5,
+      routeConfidenceBasis: "ESTIMATED",
+    },
+  };
+
+  const harness = loadPipelineHarness({
+    envOverrides: {
+      CANDLE_TIMER_FINALIZER_ENABLED: "false",
+      FNO_ENABLED: "true",
+      FNO_MODE: "OPT",
+    },
+    candleBuilderOverrides: {
+      onTicks() {
+        closeCount += 1;
+        return [
+          {
+            instrument_token: 12345,
+            interval_min: 1,
+            ts: new Date(BASE_TS + closeCount * 60_000),
+            close: 101 + closeCount * 0.1,
+          },
+        ];
+      },
+    },
+    strategyEngineOverrides: {
+      async evaluateOnCandleClose() {
+        return {
+          ...signal,
+          candle: {
+            interval_min: 1,
+            ts: new Date(BASE_TS + closeCount * 60_000),
+          },
+        };
+      },
+    },
+    tradeManagerOverrides: {
+      async onSignal() {
+        throw new Error("router exploded before contract selection");
+      },
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        logs.push({ level: "info", payload, message });
+      },
+      warn(payload, message) {
+        logs.push({ level: "warn", payload, message });
+      },
+      error(payload, message) {
+        logs.push({ level: "error", payload, message });
+      },
+    },
+  });
+  let pipeline = null;
+
+  try {
+    pipeline = harness.buildPipeline({ kite: {}, tickerCtrl: {} });
+    await pipeline.onTicks([
+      { instrument_token: 12345, last_price: 101, timestamp: new Date(BASE_TS) },
+    ]);
+    await pipeline.onTicks([
+      { instrument_token: 12345, last_price: 101.2, timestamp: new Date(BASE_TS + 500) },
+    ]);
+
+    const runtimeAbortLog = logs.find(
+      (entry) =>
+        String(entry.message || "").includes(
+          "[route] candidate failed before contract selection",
+        ),
+    );
+    assert.ok(
+      runtimeAbortLog,
+      "structured runtime-abort event should be emitted for trade-path exceptions",
+    );
+
+    const payload = runtimeAbortLog.payload || {};
+    assert.equal(payload.runtimeAbortCategory, "RUNTIME_ERROR");
+    assert.equal(payload.stage, "signal_dispatch");
+    assert.equal(payload.substage, "bar_close");
+    assert.equal(payload.signalId, "sig-runtime-abort");
+    assert.equal(payload.regimeSnapshotId, "snap-runtime-abort");
+    assert.equal(payload.token, 12345);
+    assert.equal(payload.strategyId, "ema_pullback");
+    assert.equal(payload.side, "BUY");
+    assert.equal(payload.timeframe, 1);
+    assert.equal(payload.routeMode, "OPT");
+    assert.equal(payload.routeAttempted, false);
+    assert.equal(payload.contractSelectionStarted, false);
+    assert.equal(payload.estimatedRoutePhase, true);
+    assert.equal(payload.actualRoutePhase, false);
+    assert.equal(payload.errorName, "Error");
+    assert.ok(
+      String(payload.errorMessage || "").includes(
+        "router exploded before contract selection",
+      ),
+    );
+
+    assert.equal(
+      logs.some((entry) =>
+        String(entry.message || "").includes("[pipeline] task failed"),
+      ),
+      true,
+      "generic pipeline failure log should still be present",
+    );
+    assert.equal(
+      logs.some((entry) =>
+        String(entry.message || "").toLowerCase().includes("suppressed"),
+      ),
+      false,
+      "runtime abort should not be misclassified as suppression",
+    );
   } finally {
     try {
       await pipeline?.stop?.();
@@ -248,6 +417,147 @@ async function testPipelineSerializesOrderUpdateAndReconcile() {
   }
 }
 
+async function testReconcileMongoDegradationIsClassifiedAndDeferred() {
+  const logs = [];
+  const harness = loadPipelineHarness({
+    envOverrides: {
+      CANDLE_TIMER_FINALIZER_ENABLED: "false",
+    },
+    tradeManagerOverrides: {
+      async reconcile() {
+        throw new Error(
+          "Timed out while checking out a connection from connection pool",
+        );
+      },
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        logs.push({ level: "info", payload, message });
+      },
+      warn(payload, message) {
+        logs.push({ level: "warn", payload, message });
+      },
+      error(payload, message) {
+        logs.push({ level: "error", payload, message });
+      },
+    },
+  });
+  let pipeline = null;
+
+  try {
+    pipeline = harness.buildPipeline({ kite: {}, tickerCtrl: {} });
+    const out = await pipeline.reconcile();
+
+    assert.equal(out?.deferred, true);
+    assert.equal(
+      logs.some((entry) =>
+        String(entry.message || "").includes(
+          "[reconcile] deferred due to mongo degradation",
+        ),
+      ) ||
+        logs.some((entry) =>
+          String(entry.message || "").includes(
+            "[reconcile] skipped due to severe mongo pressure",
+          ),
+        ),
+      true,
+    );
+    assert.equal(
+      logs.some((entry) =>
+        String(entry.message || "").includes("[pipeline] task failed"),
+      ),
+      false,
+      "known mongo degradation should not surface as generic pipeline task failure",
+    );
+  } finally {
+    try {
+      await pipeline?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testReconcileNonMongoErrorsStillSurfaceAsPipelineFailures() {
+  const logs = [];
+  const harness = loadPipelineHarness({
+    envOverrides: {
+      CANDLE_TIMER_FINALIZER_ENABLED: "false",
+    },
+    tradeManagerOverrides: {
+      async reconcile() {
+        throw new Error("reconcile logic bug");
+      },
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        logs.push({ level: "info", payload, message });
+      },
+      warn(payload, message) {
+        logs.push({ level: "warn", payload, message });
+      },
+      error(payload, message) {
+        logs.push({ level: "error", payload, message });
+      },
+    },
+  });
+  let pipeline = null;
+
+  try {
+    pipeline = harness.buildPipeline({ kite: {}, tickerCtrl: {} });
+    await pipeline.reconcile();
+
+    assert.equal(
+      logs.some((entry) =>
+        String(entry.message || "").includes("[pipeline] task failed"),
+      ),
+      true,
+    );
+    assert.equal(
+      logs.some((entry) =>
+        String(entry.message || "").includes(
+          "[reconcile] deferred due to mongo degradation",
+        ),
+      ),
+      false,
+      "non-mongo reconcile failures must not be masked as degradation defers",
+    );
+  } finally {
+    try {
+      await pipeline?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testPipelineWiresCoordinatorAwareReconcileRunner() {
+  let injectedRunner = null;
+  let injectedOptions = null;
+  const harness = loadPipelineHarness({
+    envOverrides: {
+      CANDLE_TIMER_FINALIZER_ENABLED: "false",
+    },
+    tradeManagerOverrides: {
+      setReconcileRunner(fn, options = {}) {
+        injectedRunner = fn;
+        injectedOptions = options;
+      },
+    },
+  });
+  let pipeline = null;
+
+  try {
+    pipeline = harness.buildPipeline({ kite: {}, tickerCtrl: {} });
+    assert.equal(typeof injectedRunner, "function");
+    assert.equal(injectedOptions?.coordinatorAware, true);
+    assert.equal(injectedRunner, pipeline.reconcile);
+  } finally {
+    try {
+      await pipeline?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
 function testBeConfigSurfaceIsTruthful() {
   const envText = fs.readFileSync(path.join(ROOT, ".env"), "utf8");
   const { env } = require(path.join(ROOT, "src", "config.js"));
@@ -262,6 +572,10 @@ function testBeConfigSurfaceIsTruthful() {
 async function main() {
   await testPipelineStopLifecycle();
   await testPipelineSerializesOrderUpdateAndReconcile();
+  await testPipelineWiresCoordinatorAwareReconcileRunner();
+  await testReconcileMongoDegradationIsClassifiedAndDeferred();
+  await testReconcileNonMongoErrorsStillSurfaceAsPipelineFailures();
+  await testTradePathRuntimeAbortEscalation();
   testBeConfigSurfaceIsTruthful();
   console.log("pipelineLifecycle.test.js passed");
 }

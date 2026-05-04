@@ -5,8 +5,13 @@ const { getDb } = require("../db");
 const { reportFault, reportWindowedFault } = require("../runtime/errorBus");
 const { isTransientMongoError } = require("../runtime/isTransientMongoError");
 const {
-  markMongoHealthy,
-  markMongoDegraded,
+  evaluateMongoWorkGate,
+  deferMongoWorkForError,
+  logRecoveryIfAny,
+} = require("../runtime/mongoWorkGate");
+const {
+  noteMongoSubsystemBacklog,
+  updateMongoSubsystemHealth,
 } = require("../runtime/mongoRuntimeState");
 
 /**
@@ -104,14 +109,21 @@ class SignalTelemetry {
     this._rejTopKeys = Number(env.TELEMETRY_REJECTIONS_TOP_KEYS ?? 200);
     this._ringSize = Number(env.TELEMETRY_RING_SIZE ?? 300);
     this._flushSec = Number(env.TELEMETRY_FLUSH_SEC ?? 60);
+    this._maxQueue = Number(env.TELEMETRY_MAX_QUEUE ?? 10_000);
+    this._warnQueue = Number(env.TELEMETRY_WARN_QUEUE ?? 2_000);
+    this._flushBatchSize = Number(env.TELEMETRY_FLUSH_BATCH_SIZE ?? 500);
     this._dailyCollection =
       env.TELEMETRY_DB_DAILY_COLLECTION || "telemetry_signals_daily";
 
     this._state = this._freshState(dayKey());
     this._timer = null;
-    this._mongoDegraded = false;
-    this._mongoBackoffMs = 0;
     this._mongoNextFlushAt = 0;
+    this._pendingQueueDepth = 0;
+    this._droppedCount = 0;
+    this._compactedCount = 0;
+    this._lastFlushOkAt = null;
+    this._lastFlushFailedAt = null;
+    this._flushDeferredCount = 0;
   }
 
   _freshState(dk) {
@@ -167,6 +179,7 @@ class SignalTelemetry {
   recordCandidate(signal) {
     if (!this._enabled) return;
     this._rotateIfNeeded(new Date());
+    this._recordPendingEvent();
 
     this._state.updatedAt = new Date();
     this._state.candidatesTotal += 1;
@@ -178,6 +191,7 @@ class SignalTelemetry {
   recordDecision({ signal, token, outcome, stage, reason, meta }) {
     if (!this._enabled) return;
     this._rotateIfNeeded(new Date());
+    this._recordPendingEvent();
 
     const sid = safeKey(signal?.strategyId || "UNKNOWN", 80);
     const style = safeKey(signal?.strategyStyle || "UNKNOWN", 40);
@@ -321,37 +335,78 @@ class SignalTelemetry {
       blockedByStrategy: s.blockedByStrategy,
       blockedByStrategyReason: s.blockedByStrategyReason,
       lastDecisions: s.lastDecisions.slice(-50), // keep response small
+      health: this.healthSnapshot(),
     };
   }
 
-  _nextMongoBackoffMs() {
-    this._mongoBackoffMs = this._mongoBackoffMs
-      ? Math.min(this._mongoBackoffMs * 2, 15_000)
-      : 1_000;
-    this._mongoNextFlushAt = Date.now() + this._mongoBackoffMs;
-    return this._mongoBackoffMs;
+  _syncHealth() {
+    const snapshot = this.healthSnapshot();
+    noteMongoSubsystemBacklog({
+      subsystem: "signal_telemetry",
+      priority: "non_critical",
+      backlog: this._pendingQueueDepth,
+      dropped: this._droppedCount,
+      compacted: this._compactedCount,
+      health: snapshot,
+    });
+    updateMongoSubsystemHealth({
+      subsystem: "signal_telemetry",
+      priority: "non_critical",
+      health: snapshot,
+    });
   }
 
-  _markMongoFlushRecovered() {
-    if (!this._mongoDegraded) {
-      this._mongoBackoffMs = 0;
-      this._mongoNextFlushAt = 0;
-      return;
+  _recordPendingEvent() {
+    if (this._pendingQueueDepth >= this._maxQueue) {
+      this._pendingQueueDepth = this._maxQueue;
+      this._droppedCount += 1;
+      this._compactedCount += 1;
+    } else {
+      this._pendingQueueDepth += 1;
     }
-    this._mongoDegraded = false;
-    this._mongoBackoffMs = 0;
-    this._mongoNextFlushAt = 0;
-    markMongoHealthy();
-    logger.info("[telemetry] mongo recovered; flush resumed");
+    this._syncHealth();
   }
 
-  _deferMongoFlush(error) {
-    const backoffMs = this._nextMongoBackoffMs();
-    this._mongoDegraded = true;
-    markMongoDegraded({
+  healthSnapshot() {
+    return {
+      queueDepth: Math.max(0, Number(this._pendingQueueDepth || 0)),
+      maxQueue: this._maxQueue,
+      warnQueue: this._warnQueue,
+      flushBatchSize: this._flushBatchSize,
+      droppedCount: Math.max(0, Number(this._droppedCount || 0)),
+      compactedCount: Math.max(0, Number(this._compactedCount || 0)),
+      flushDeferredCount: Math.max(0, Number(this._flushDeferredCount || 0)),
+      lastFlushOkAt: this._lastFlushOkAt,
+      lastFlushFailedAt: this._lastFlushFailedAt,
+      warningCode:
+        this._pendingQueueDepth >= this._maxQueue
+          ? "TELEMETRY_QUEUE_MAXED"
+          : this._pendingQueueDepth >= this._warnQueue
+            ? "TELEMETRY_QUEUE_WARN"
+            : null,
+    };
+  }
+
+  _deferMongoFlush(error, release = null) {
+    this._flushDeferredCount += 1;
+    this._lastFlushFailedAt = new Date().toISOString();
+    const deferred = deferMongoWorkForError({
+      subsystem: "signal_telemetry",
+      priority: "non_critical",
       error,
       reason: "signal_telemetry_flush",
+      backlog: this._pendingQueueDepth,
+      dropped: this._droppedCount,
+      compacted: this._compactedCount,
+      phase: "flush",
+      windowKey: "signal_telemetry_mongo_degraded",
+      code: "SIGNAL_TELEMETRY_MONGO_DEGRADED",
+      message: "[telemetry] mongo degraded; flush deferred",
+      release,
     });
+    const backoffMs = Number(deferred?.backoffMs || 0);
+    this._mongoNextFlushAt = backoffMs > 0 ? Date.now() + backoffMs : 0;
+    this._syncHealth();
     reportWindowedFault({
       windowKey: "signal_telemetry_mongo_degraded",
       windowMs: 30_000,
@@ -373,11 +428,34 @@ class SignalTelemetry {
         deferredMs: Math.max(0, this._mongoNextFlushAt - Date.now()),
       };
     }
+    const gate = evaluateMongoWorkGate({
+      subsystem: "signal_telemetry",
+      priority: "non_critical",
+      backlog: this._pendingQueueDepth,
+      dropped: this._droppedCount,
+      compacted: this._compactedCount,
+      phase: "flush",
+      windowKey: "signal_telemetry_mongo_gate_deferred",
+      code: "SIGNAL_TELEMETRY_MONGO_DEFERRED",
+      message: "[telemetry] flush deferred by mongo coordinator",
+    });
+    if (gate?.deferred) {
+      this._flushDeferredCount += 1;
+      this._mongoNextFlushAt = Date.now() + Math.max(0, Number(gate.backoffMs) || 0);
+      this._syncHealth();
+      return {
+        ok: false,
+        reason: "mongo_backoff",
+        deferredMs: Math.max(0, Number(gate.backoffMs) || 0),
+      };
+    }
+    const release = gate?.release || null;
 
     let db;
     try {
       db = getDb();
     } catch (e) {
+      if (typeof release === "function") release();
       return { ok: false, reason: "db_not_ready" };
     }
 
@@ -395,12 +473,25 @@ class SignalTelemetry {
         { $set: doc, $setOnInsert: { createdAt: new Date() } },
         { upsert: true },
       );
-      this._markMongoFlushRecovered();
+      this._mongoNextFlushAt = 0;
+      this._pendingQueueDepth = 0;
+      this._lastFlushOkAt = new Date().toISOString();
+      this._syncHealth();
+      logRecoveryIfAny({
+        subsystem: "signal_telemetry",
+        priority: "non_critical",
+        phase: "flush",
+        release,
+        backlog: 0,
+      });
       return { ok: true, dayKey: doc.dayKey };
     } catch (e) {
       if (isTransientMongoError(e)) {
-        return this._deferMongoFlush(e);
+        return this._deferMongoFlush(e, release);
       }
+      if (typeof release === "function") release();
+      this._lastFlushFailedAt = new Date().toISOString();
+      this._syncHealth();
       logger.warn({ e: e?.message || String(e) }, "[telemetry] flush failed");
       return { ok: false, reason: "flush_failed", error: e?.message };
     }
@@ -425,4 +516,4 @@ class SignalTelemetry {
 
 const telemetry = new SignalTelemetry();
 
-module.exports = { telemetry, dayKey };
+module.exports = { SignalTelemetry, telemetry, dayKey };

@@ -37,8 +37,13 @@ const { buildTradeStatusSnapshot } = require("./tradeStatusBuilder");
 const { reportWindowedFault } = require("../runtime/errorBus");
 const { isTransientMongoError } = require("../runtime/isTransientMongoError");
 const {
-  markMongoHealthy,
-  markMongoDegraded,
+  evaluateMongoWorkGate,
+  deferMongoWorkForError,
+  logRecoveryIfAny,
+} = require("../runtime/mongoWorkGate");
+const {
+  getMongoRuntimeState,
+  updateMongoSubsystemHealth,
 } = require("../runtime/mongoRuntimeState");
 
 const INCIDENTS = "notification_incidents";
@@ -51,9 +56,14 @@ let heartbeatTimer = null;
 let liveRefreshTimer = null;
 let heartbeatProvider = null;
 let drainInFlight = false;
-let mongoPollDegraded = false;
-let mongoPollBackoffMs = 0;
 let mongoPollDeferredUntil = 0;
+const outboxHealth = {
+  pollDeferredCount: 0,
+  lastPollOkAt: null,
+  lastPollDeferredAt: null,
+  backlogEstimate: 0,
+  mongoSeverity: "HEALTHY",
+};
 
 const deliveryMetrics = {
   queued: 0,
@@ -69,6 +79,21 @@ const deliveryMetrics = {
 
 function incrementMetric(key) {
   deliveryMetrics[key] = Number(deliveryMetrics[key] || 0) + 1;
+}
+
+function syncOutboxHealth(patch = {}) {
+  Object.assign(outboxHealth, patch || {});
+  updateMongoSubsystemHealth({
+    subsystem: "notifications_outbox",
+    priority: "non_critical",
+    health: {
+      ...outboxHealth,
+      backlogEstimate:
+        outboxHealth.backlogEstimate === "unknown"
+          ? "unknown"
+          : Number(outboxHealth.backlogEstimate || 0),
+    },
+  });
 }
 
 function hashObject(value) {
@@ -147,43 +172,36 @@ function clearTimers() {
   }
 }
 
-function nextMongoPollBackoffMs() {
-  mongoPollBackoffMs = mongoPollBackoffMs
-    ? Math.min(mongoPollBackoffMs * 2, 15_000)
-    : 1_000;
-  mongoPollDeferredUntil = Date.now() + mongoPollBackoffMs;
-  return mongoPollBackoffMs;
+function setMongoPollDeferred(backoffMs = 0) {
+  const delay = Math.max(0, Number(backoffMs) || 0);
+  mongoPollDeferredUntil = delay > 0 ? Date.now() + delay : 0;
 }
 
-function deferMongoOutboxPoll(error, context = "outbox_poll") {
-  const backoffMs = nextMongoPollBackoffMs();
-  mongoPollDegraded = true;
-  markMongoDegraded({
+function deferMongoOutboxPoll(error, context = "outbox_poll", release = null) {
+  const deferred = deferMongoWorkForError({
+    subsystem: "notifications_outbox",
+    priority: "non_critical",
     error,
     reason: `notification_dispatcher_${context}`,
-  });
-  reportWindowedFault({
+    backlogEstimate:
+      outboxHealth.backlogEstimate === "unknown"
+        ? null
+        : outboxHealth.backlogEstimate,
+    phase: "outbox poll",
     windowKey: "notifications_mongo_degraded",
-    windowMs: 30_000,
     code: "NOTIFICATIONS_MONGO_DEGRADED",
-    err: error,
     message: "[notifications] mongo degraded; outbox poll deferred",
-    meta: { context, backoffMs },
+    release,
   });
-  return { ok: false, deferred: true, backoffMs };
-}
-
-function clearMongoOutboxPollDegraded() {
-  if (!mongoPollDegraded) {
-    mongoPollBackoffMs = 0;
-    mongoPollDeferredUntil = 0;
-    return;
-  }
-  mongoPollDegraded = false;
-  mongoPollBackoffMs = 0;
-  mongoPollDeferredUntil = 0;
-  markMongoHealthy();
-  logger.info("[notifications] mongo recovered; outbox poll resumed");
+  if (!deferred?.deferred) return null;
+  setMongoPollDeferred(deferred.backoffMs);
+  syncOutboxHealth({
+    pollDeferredCount: Number(outboxHealth.pollDeferredCount || 0) + 1,
+    lastPollDeferredAt: new Date().toISOString(),
+    backlogEstimate: "unknown",
+    mongoSeverity: deferred?.severity || getMongoRuntimeState()?.severity || "DEGRADED",
+  });
+  return deferred;
 }
 
 async function ensureIncidentIndexes() {
@@ -238,8 +256,6 @@ function stopNotificationDispatcher() {
   clearTimers();
   started = false;
   startPromise = null;
-  mongoPollDegraded = false;
-  mongoPollBackoffMs = 0;
   mongoPollDeferredUntil = 0;
 }
 
@@ -846,16 +862,46 @@ async function processOutboxOnce() {
       backoffMs: Math.max(0, mongoPollDeferredUntil - Date.now()),
     };
   }
+  const gate = evaluateMongoWorkGate({
+    subsystem: "notifications_outbox",
+    priority: "non_critical",
+    backlogEstimate:
+      outboxHealth.backlogEstimate === "unknown"
+        ? null
+        : outboxHealth.backlogEstimate,
+    phase: "outbox poll",
+    windowKey: "notifications_mongo_gate_deferred",
+    code: "NOTIFICATIONS_MONGO_DEFERRED",
+    message: "[notifications] outbox poll deferred by mongo coordinator",
+  });
+  if (gate?.deferred) {
+    setMongoPollDeferred(gate.backoffMs);
+    syncOutboxHealth({
+      pollDeferredCount: Number(outboxHealth.pollDeferredCount || 0) + 1,
+      lastPollDeferredAt: new Date().toISOString(),
+      backlogEstimate: "unknown",
+      mongoSeverity: gate?.severity || getMongoRuntimeState()?.severity || "DEGRADED",
+    });
+    return gate;
+  }
+  const release = gate?.release || null;
   drainInFlight = true;
   try {
     await startNotificationDispatcher();
     let jobs;
     try {
-      jobs = await claimDueJobs({ limit: 10, workerId });
+      jobs = await claimDueJobs({
+        limit: Math.max(
+          1,
+          Math.min(Number(env.TELEGRAM_OUTBOX_BATCH_SIZE ?? 10) || 10, 50),
+        ),
+        workerId,
+      });
     } catch (error) {
       if (isTransientMongoError(error)) {
-        return deferMongoOutboxPoll(error, "claim_due_jobs");
+        return deferMongoOutboxPoll(error, "claim_due_jobs", release);
       }
+      if (typeof release === "function") release();
       throw error;
     }
 
@@ -864,7 +910,7 @@ async function processOutboxOnce() {
         await processOutboxJob(job);
       } catch (error) {
         if (isTransientMongoError(error)) {
-          return deferMongoOutboxPoll(error, "process_outbox_job");
+          return deferMongoOutboxPoll(error, "process_outbox_job", release);
         }
         const classification =
           error?.notificationClassification ||
@@ -882,8 +928,9 @@ async function processOutboxOnce() {
             });
           } catch (persistError) {
             if (isTransientMongoError(persistError)) {
-              return deferMongoOutboxPoll(persistError, "mark_job_retry");
+              return deferMongoOutboxPoll(persistError, "mark_job_retry", release);
             }
+            if (typeof release === "function") release();
             throw persistError;
           }
           continue;
@@ -896,8 +943,9 @@ async function processOutboxOnce() {
           });
         } catch (persistError) {
           if (isTransientMongoError(persistError)) {
-            return deferMongoOutboxPoll(persistError, "mark_job_failed");
+            return deferMongoOutboxPoll(persistError, "mark_job_failed", release);
           }
+          if (typeof release === "function") release();
           throw persistError;
         }
         logger.warn(
@@ -912,7 +960,19 @@ async function processOutboxOnce() {
         );
       }
     }
-    clearMongoOutboxPollDegraded();
+    setMongoPollDeferred(0);
+    syncOutboxHealth({
+      lastPollOkAt: new Date().toISOString(),
+      backlogEstimate: Array.isArray(jobs) ? jobs.length : 0,
+      mongoSeverity: getMongoRuntimeState()?.severity || "HEALTHY",
+    });
+    logRecoveryIfAny({
+      subsystem: "notifications_outbox",
+      priority: "non_critical",
+      phase: "outbox poll",
+      release,
+      backlogEstimate: Array.isArray(jobs) ? jobs.length : 0,
+    });
     return { ok: true, processed: jobs.length };
   } finally {
     drainInFlight = false;
@@ -924,6 +984,15 @@ function getNotificationDispatcherStatus() {
     started,
     workerId,
     metrics: { ...deliveryMetrics },
+    health: { ...outboxHealth },
+    mongoPollDeferredUntil:
+      mongoPollDeferredUntil > 0
+        ? new Date(mongoPollDeferredUntil).toISOString()
+        : null,
+    mongoPollDeferredMs:
+      mongoPollDeferredUntil > Date.now()
+        ? Math.max(0, mongoPollDeferredUntil - Date.now())
+        : 0,
     heartbeatEnabled: shouldEmitHeartbeat(),
     tradeCardsEnabled: shouldEmitTradeCards(),
     liveRefreshMinSec: Math.round(getTradeCardMinRefreshMs() / 1000),

@@ -1,4 +1,7 @@
 const crypto = require("crypto");
+const {
+  resolveFragileReversalPermission,
+} = require("./fragileReversalPermission");
 
 function toFiniteOrNull(value) {
   const num = Number(value);
@@ -67,7 +70,20 @@ function allowedRegimesForStyle(style, env) {
   }
 }
 
-function isStrategyStyleAllowedForRegime({ strategyStyle, regime, env }) {
+function isStrategyStyleAllowedForRegime({
+  strategyStyle,
+  regime,
+  env,
+  strategyId = null,
+  candidate = null,
+  marketState = null,
+  levelAcceptance = null,
+  dangerStack = null,
+  mtf = null,
+  dteDays = null,
+  confidence = null,
+  regimeSnapshot = null,
+} = {}) {
   const style = normalizeStrategyStyle(strategyStyle);
   const regimeBucket = normalizeRegime(regime);
   const regimeFamily = normalizeRegimeFamily(regimeBucket);
@@ -79,6 +95,12 @@ function isStrategyStyleAllowedForRegime({ strategyStyle, regime, env }) {
       regime: regimeBucket,
       regimeFamily,
       allowedRegimes,
+      allowedByException: false,
+      exceptionChecked: false,
+      exceptionAllowed: false,
+      exceptionType: null,
+      exceptionReasonCode: null,
+      exceptionMeta: null,
     };
   }
   const allowed =
@@ -86,12 +108,69 @@ function isStrategyStyleAllowedForRegime({ strategyStyle, regime, env }) {
     allowedRegimes.includes(regimeBucket) ||
     allowedRegimes.includes(regimeFamily);
 
+  if (allowed) {
+    return {
+      allowed,
+      strategyStyle: style,
+      regime: regimeBucket,
+      regimeFamily,
+      allowedRegimes,
+      allowedByException: false,
+      exceptionChecked: false,
+      exceptionAllowed: false,
+      exceptionType: null,
+      exceptionReasonCode: null,
+      exceptionMeta: null,
+    };
+  }
+
+  let exceptionMeta = null;
+  if (style === "RANGE") {
+    exceptionMeta = resolveFragileReversalPermission({
+      strategyStyle: style,
+      strategyId,
+      regime: regimeBucket,
+      marketState,
+      candidate,
+      levelAcceptance,
+      dangerStack,
+      mtf,
+      dteDays,
+      confidence,
+      regimeSnapshot,
+      env,
+    });
+    if (exceptionMeta.allowed) {
+      return {
+        allowed: true,
+        strategyStyle: style,
+        regime: regimeBucket,
+        regimeFamily,
+        allowedRegimes,
+        allowedByException: true,
+        exceptionChecked: true,
+        exceptionAllowed: true,
+        exceptionType: "FRAGILE_REVERSAL",
+        exceptionReasonCode: "FRAGILE_REVERSAL_CONFIRMED",
+        exceptionMeta,
+      };
+    }
+  }
+
   return {
     allowed,
     strategyStyle: style,
     regime: regimeBucket,
     regimeFamily,
     allowedRegimes,
+    allowedByException: false,
+    exceptionChecked: exceptionMeta != null,
+    exceptionAllowed: false,
+    exceptionType: exceptionMeta?.exceptionType || null,
+    exceptionReasonCode:
+      exceptionMeta?.reasonCode ||
+      (exceptionMeta ? "FRAGILE_REVERSAL_NOT_CONFIRMED" : null),
+    exceptionMeta,
   };
 }
 
@@ -1527,6 +1606,12 @@ function deriveConversionOutcome({ summary = {}, signal = null, patch = {} }) {
   if (suppressionReason === "STYLE_REGIME_MISMATCH") {
     return "SUPPRESSED_STYLE_REGIME";
   }
+  if (
+    String(suppressionReason || "").startsWith("FRAGILE_REVERSAL_") ||
+    suppressionReason === "RANGE_FRAGILE_REQUIRES_EXCEPTION"
+  ) {
+    return "SUPPRESSED_STYLE_REGIME";
+  }
   if (String(suppressionReason || "").includes("MTF")) {
     return "SUPPRESSED_MTF";
   }
@@ -1537,6 +1622,182 @@ function deriveConversionOutcome({ summary = {}, signal = null, patch = {} }) {
   return null;
 }
 
+function hasOwnField(obj, key) {
+  return Boolean(obj) && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function normalizeRegimeCandidate(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return { present: false, normalized: null };
+  return { present: true, normalized: normalizeRegime(raw) };
+}
+
+function resolveConversionRegimeMeta({ signal = null, patch = {}, current = {} }) {
+  if (hasOwnField(patch, "regime")) {
+    const patched = normalizeRegimeCandidate(patch.regime);
+    if (!patched.present) {
+      return {
+        regime: null,
+        regimeSource: "PATCH",
+        regimeFallbackReason: "PATCH_EMPTY",
+        hasFreshMetadata: true,
+      };
+    }
+    return {
+      regime: patched.normalized,
+      regimeSource: "PATCH",
+      regimeFallbackReason:
+        patched.normalized === "UNKNOWN" ? "PATCH_UNKNOWN" : null,
+      hasFreshMetadata: true,
+    };
+  }
+
+  const snapshotRegime = normalizeRegimeCandidate(signal?.regimeSnapshot?.regime);
+  const signalRegime = normalizeRegimeCandidate(signal?.regime);
+  const currentRegime = normalizeRegimeCandidate(current?.regime);
+
+  if (snapshotRegime.present && snapshotRegime.normalized !== "UNKNOWN") {
+    return {
+      regime: snapshotRegime.normalized,
+      regimeSource: "SNAPSHOT",
+      regimeFallbackReason: null,
+      hasFreshMetadata: true,
+    };
+  }
+
+  if (signalRegime.present && signalRegime.normalized !== "UNKNOWN") {
+    return {
+      regime: signalRegime.normalized,
+      regimeSource: "SIGNAL_FALLBACK",
+      regimeFallbackReason: snapshotRegime.present
+        ? "SNAPSHOT_UNKNOWN"
+        : "SNAPSHOT_UNAVAILABLE",
+      hasFreshMetadata: true,
+    };
+  }
+
+  if (currentRegime.present && currentRegime.normalized !== "UNKNOWN") {
+    return {
+      regime: currentRegime.normalized,
+      regimeSource: "CURRENT_FALLBACK",
+      regimeFallbackReason: snapshotRegime.present
+        ? "SNAPSHOT_UNKNOWN"
+        : "SNAPSHOT_UNAVAILABLE",
+      hasFreshMetadata: snapshotRegime.present || signalRegime.present,
+    };
+  }
+
+  if (snapshotRegime.present) {
+    return {
+      regime: snapshotRegime.normalized,
+      regimeSource: "SNAPSHOT_UNKNOWN",
+      regimeFallbackReason: "SNAPSHOT_UNKNOWN",
+      hasFreshMetadata: true,
+    };
+  }
+  if (signalRegime.present) {
+    return {
+      regime: signalRegime.normalized,
+      regimeSource: "SIGNAL_UNKNOWN",
+      regimeFallbackReason: "SIGNAL_UNKNOWN",
+      hasFreshMetadata: true,
+    };
+  }
+  if (currentRegime.present) {
+    return {
+      regime: currentRegime.normalized,
+      regimeSource: "CURRENT_UNKNOWN",
+      regimeFallbackReason: "CURRENT_UNKNOWN",
+      hasFreshMetadata: false,
+    };
+  }
+  return {
+    regime: null,
+    regimeSource: "UNAVAILABLE",
+    regimeFallbackReason: "NO_REGIME_DATA",
+    hasFreshMetadata: false,
+  };
+}
+
+function resolveSignalRouteConfidence(signal = null) {
+  const signalRouteConfidence =
+    signal?.routeConfidence && typeof signal.routeConfidence === "object"
+      ? signal.routeConfidence
+      : null;
+  const preEmitRouteConfidence =
+    signal?.preEmit?.routeConfidence &&
+    typeof signal.preEmit.routeConfidence === "object"
+      ? signal.preEmit.routeConfidence
+      : null;
+
+  const actualRouteConfidence =
+    signalRouteConfidence && signalRouteConfidence.estimated !== true
+      ? signalRouteConfidence
+      : null;
+  const estimatedRouteConfidence =
+    signalRouteConfidence && signalRouteConfidence.estimated === true
+      ? signalRouteConfidence
+      : preEmitRouteConfidence;
+
+  return {
+    actualRouteConfidence,
+    estimatedRouteConfidence,
+    detailedRouteConfidence:
+      actualRouteConfidence || estimatedRouteConfidence || null,
+  };
+}
+
+function resolveConversionRouteTelemetry({ signal = null, patch = {}, current = {} }) {
+  const {
+    actualRouteConfidence,
+    estimatedRouteConfidence,
+    detailedRouteConfidence,
+  } = resolveSignalRouteConfidence(signal);
+
+  const routeAttempted = hasOwnField(patch, "routeAttempted")
+    ? patch.routeAttempted === true
+    : current?.routeAttempted === true ||
+      actualRouteConfidence != null ||
+      signal?.option_meta != null;
+
+  const preRouteScore = hasOwnField(patch, "preRouteScore")
+    ? toFiniteOrNull(patch.preRouteScore)
+    : toFiniteOrNull(detailedRouteConfidence?.preRouteScore) ??
+      toFiniteOrNull(current?.preRouteScore);
+  const expectedRouteAdjustment = hasOwnField(patch, "expectedRouteAdjustment")
+    ? toFiniteOrNull(patch.expectedRouteAdjustment)
+    : toFiniteOrNull(detailedRouteConfidence?.expectedRouteAdjustment) ??
+      toFiniteOrNull(current?.expectedRouteAdjustment);
+
+  let routedConfidence = hasOwnField(patch, "routedConfidence")
+    ? toFiniteOrNull(patch.routedConfidence)
+    : toFiniteOrNull(detailedRouteConfidence?.routedScore) ??
+      toFiniteOrNull(current?.routedConfidence);
+  if (routedConfidence == null && routeAttempted) {
+    routedConfidence = toFiniteOrNull(signal?.confidence);
+  }
+
+  const derivedRouteConfidenceBasis = actualRouteConfidence
+    ? "ACTUAL"
+    : estimatedRouteConfidence
+      ? "ESTIMATED"
+      : null;
+
+  const routeConfidenceBasis = hasOwnField(patch, "routeConfidenceBasis")
+    ? patch.routeConfidenceBasis || null
+    : derivedRouteConfidenceBasis ||
+      current?.routeConfidenceBasis ||
+      (routeAttempted ? "ACTUAL_INFERRED" : "NONE");
+
+  return {
+    routeAttempted,
+    preRouteScore,
+    expectedRouteAdjustment,
+    routedConfidence,
+    routeConfidenceBasis,
+  };
+}
+
 function buildSignalConversionSummary(signal, patch = {}) {
   const current = cloneObject(
     signal?.conversionSummary || signal?.signalDecision?.conversion || null,
@@ -1544,17 +1805,36 @@ function buildSignalConversionSummary(signal, patch = {}) {
     routeAttempted: false,
     preEmitFailureReasons: [],
   };
+  const regimeMeta = resolveConversionRegimeMeta({
+    signal,
+    patch,
+    current,
+  });
+  const routeTelemetry = resolveConversionRouteTelemetry({
+    signal,
+    patch,
+    current,
+  });
+
+  const regimeSource = hasOwnField(patch, "regimeSource")
+    ? patch.regimeSource ?? null
+    : regimeMeta.hasFreshMetadata
+      ? regimeMeta.regimeSource
+      : current.regimeSource ?? regimeMeta.regimeSource;
+  const regimeFallbackReason = hasOwnField(patch, "regimeFallbackReason")
+    ? patch.regimeFallbackReason ?? null
+    : regimeMeta.hasFreshMetadata
+      ? regimeMeta.regimeFallbackReason
+      : current.regimeFallbackReason ?? regimeMeta.regimeFallbackReason;
+
   const next = {
     signalId: patch.signalId ?? signal?.signalId ?? current.signalId ?? null,
     strategyId:
       patch.strategyId ?? signal?.strategyId ?? current.strategyId ?? null,
     side: patch.side ?? signal?.side ?? current.side ?? null,
-    regime:
-      patch.regime ??
-      signal?.regimeSnapshot?.regime ??
-      signal?.regime ??
-      current.regime ??
-      null,
+    regime: regimeMeta.regime,
+    regimeSource,
+    regimeFallbackReason,
     profileId:
       patch.profileId ??
       signal?.preEmit?.profileId ??
@@ -1581,32 +1861,36 @@ function buildSignalConversionSummary(signal, patch = {}) {
       signal?.scoreBreakdown?.mtfState ??
       current.mtfState ??
       null,
-    routeAttempted:
-      patch.routeAttempted ??
-      current.routeAttempted ??
-      false,
+    marketState:
+      patch.marketState ??
+      signal?.marketState ??
+      signal?.meta?.marketState ??
+      signal?.scoreBreakdown?.marketState ??
+      current.marketState ??
+      null,
+    styleGateDecision:
+      patch.styleGateDecision ?? current.styleGateDecision ?? null,
+    styleGateReasonCode:
+      patch.styleGateReasonCode ?? current.styleGateReasonCode ?? null,
+    styleGateExceptionType:
+      patch.styleGateExceptionType ?? current.styleGateExceptionType ?? null,
+    styleGateFailedChecks:
+      patch.styleGateFailedChecks ??
+      current.styleGateFailedChecks ??
+      [],
+    exceptionAllowed:
+      hasOwnField(patch, "exceptionAllowed")
+        ? patch.exceptionAllowed === true
+        : current.exceptionAllowed ?? null,
+    routeAttempted: routeTelemetry.routeAttempted,
+    routeConfidenceBasis: routeTelemetry.routeConfidenceBasis,
     selectedContract:
       patch.selectedContract ??
       current.selectedContract ??
       summarizeOptionContract(signal?.option_meta),
-    preRouteScore:
-      patch.preRouteScore ??
-      current.preRouteScore ??
-      signal?.preEmit?.routeConfidence?.preRouteScore ??
-      signal?.routeConfidence?.preRouteScore ??
-      null,
-    expectedRouteAdjustment:
-      patch.expectedRouteAdjustment ??
-      current.expectedRouteAdjustment ??
-      signal?.preEmit?.routeConfidence?.expectedRouteAdjustment ??
-      signal?.routeConfidence?.expectedRouteAdjustment ??
-      null,
-    routedConfidence:
-      patch.routedConfidence ??
-      current.routedConfidence ??
-      signal?.routeConfidence?.routedScore ??
-      toFiniteOrNull(signal?.confidence) ??
-      null,
+    preRouteScore: routeTelemetry.preRouteScore,
+    expectedRouteAdjustment: routeTelemetry.expectedRouteAdjustment,
+    routedConfidence: routeTelemetry.routedConfidence,
     postRouteDecision:
       patch.postRouteDecision ??
       current.postRouteDecision ??
@@ -1717,6 +2001,7 @@ module.exports = {
   normalizeRegime,
   normalizeRegimeFamily,
   isStrategyStyleAllowedForRegime,
+  resolveFragileReversalPermission,
   freezeSignalRegimeSnapshot,
   buildSignalLifecycleId,
   buildSignalTiming,

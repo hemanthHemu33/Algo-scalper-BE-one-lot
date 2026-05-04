@@ -10,6 +10,10 @@ const { upsertDailyRisk } = require("./trading/tradeStore");
 const { DateTime } = require("luxon");
 const dns = require("node:dns/promises");
 const { connectMongo } = require("./db");
+const {
+  flushRuntimeLogs,
+  stopRuntimeLogDailyPurgeSchedule,
+} = require("./runtime/runtimeLogStore");
 const { ensureRetentionIndexes } = require("./market/retention");
 const { buildApp } = require("./app");
 const { watchLatestToken } = require("./tokenWatcher");
@@ -555,7 +559,13 @@ async function main() {
         stopSessionControl();
       } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
       try {
+        stopRuntimeLogDailyPurgeSchedule();
+      } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+      try {
         if (io) io.close();
+      } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
+      try {
+        await flushRuntimeLogs({ drain: true });
       } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
       server.close(() => logger.warn("server closed"));
     } catch (err) { reportFault({ code: "INDEX_CATCH", err, message: "[src/index.js] caught and continued" }); }
@@ -574,6 +584,7 @@ process.on("unhandledRejection", async (reason) => {
   }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   await halt("UNHANDLED_REJECTION", { message: msg });
   await persistKill("UNHANDLED_REJECTION", { message: msg });
+  await flushRuntimeLogs({ drain: true });
   exitAfterCrash();
 });
 
@@ -585,13 +596,15 @@ process.on("uncaughtException", async (err) => {
   }).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
   await halt("UNCAUGHT_EXCEPTION", { message: msg, stack: err?.stack });
   await persistKill("UNCAUGHT_EXCEPTION", { message: msg });
+  await flushRuntimeLogs({ drain: true });
   exitAfterCrash();
 });
 
-main().catch((e) => {
+main().catch(async (e) => {
   const err = describeErr(e);
   // Use a structured object that preserves error details (pino won't serialize Error well under key "e").
   logger.error({ err }, "fatal");
   alert("error", "💥 Scalper engine crashed (fatal)", err).catch((err) => { reportFault({ code: "INDEX_ASYNC", err, message: "[src/index.js] async task failed" }); });
+  await flushRuntimeLogs({ drain: true });
   process.exit(1);
 });

@@ -15,12 +15,19 @@ function sleep(ms) {
 }
 
 function isEnabled() {
+  const overrideRaw = env.TELEGRAM_NOTIFICATIONS_ENABLED;
+  const override =
+    overrideRaw == null ? null : String(overrideRaw).trim();
   const enabledFlag =
-    env.TELEGRAM_NOTIFICATIONS_ENABLED ?? env.TELEGRAM_ENABLED ?? "false";
+    override && override.length > 0
+      ? override
+      : env.TELEGRAM_ENABLED ?? "false";
+  const botToken = String(env.TELEGRAM_BOT_TOKEN || "").trim();
+  const chatId = String(env.TELEGRAM_CHAT_ID || "").trim();
   return (
     String(enabledFlag).trim().toLowerCase() === "true" &&
-    !!env.TELEGRAM_BOT_TOKEN &&
-    !!env.TELEGRAM_CHAT_ID
+    botToken.length > 0 &&
+    chatId.length > 0
   );
 }
 

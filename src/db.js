@@ -4,16 +4,27 @@ const { env } = require("./config");
 const { logger } = require("./logger");
 const { reportWindowedFault } = require("./runtime/errorBus");
 const { isTransientMongoError } = require("./runtime/isTransientMongoError");
+const { configureRuntimeLogDb } = require("./runtime/runtimeLogStore");
 const {
   getMongoRuntimeState,
+  getMongoHealthSnapshot,
   markMongoHealthy,
   markMongoDegraded,
+  noteMongoPoolCreated,
+  noteMongoPoolClosed,
   noteMongoPoolCleared,
-  noteMongoCheckoutFailure,
+  noteMongoConnectionCreated,
+  noteMongoConnectionReady,
+  noteMongoConnectionClosed,
+  noteMongoCheckoutStarted,
+  noteMongoCheckoutSuccess,
+  noteMongoCheckoutCheckedIn,
+  noteMongoCheckoutFailed,
 } = require("./runtime/mongoRuntimeState");
 
 let client;
 let db;
+let connectPromise = null;
 let listenersAttached = false;
 
 function mongoNum(name, fallback) {
@@ -21,28 +32,60 @@ function mongoNum(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function mongoBool(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const normalized = String(raw).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 function mongoClientOptions() {
-  return {
+  const options = {
     appName: String(process.env.MONGO_APP_NAME || "kite-scalper-engine"),
-    retryReads: true,
-    retryWrites: true,
-    maxPoolSize: mongoNum("MONGO_MAX_POOL_SIZE", 20),
+    retryReads: mongoBool("MONGO_RETRY_READS", true),
+    retryWrites: mongoBool("MONGO_RETRY_WRITES", true),
+    maxPoolSize: mongoNum("MONGO_MAX_POOL_SIZE", 30),
     minPoolSize: mongoNum("MONGO_MIN_POOL_SIZE", 2),
-    maxConnecting: mongoNum("MONGO_MAX_CONNECTING", 4),
     maxIdleTimeMS: mongoNum("MONGO_MAX_IDLE_MS", 60_000),
-    waitQueueTimeoutMS: mongoNum("MONGO_WAIT_QUEUE_TIMEOUT_MS", 5_000),
+    waitQueueTimeoutMS: mongoNum("MONGO_WAIT_QUEUE_TIMEOUT_MS", 8_000),
     connectTimeoutMS: mongoNum("MONGO_CONNECT_TIMEOUT_MS", 10_000),
     serverSelectionTimeoutMS: mongoNum(
       "MONGO_SERVER_SELECTION_TIMEOUT_MS",
       10_000,
     ),
     socketTimeoutMS: mongoNum("MONGO_SOCKET_TIMEOUT_MS", 45_000),
+    heartbeatFrequencyMS: mongoNum("MONGO_HEARTBEAT_FREQUENCY_MS", 10_000),
   };
+
+  const maxConnecting = mongoNum("MONGO_MAX_CONNECTING", 4);
+  if (Number.isFinite(maxConnecting) && maxConnecting > 0) {
+    options.maxConnecting = maxConnecting;
+  }
+
+  return options;
+}
+
+function logMongoClientOptions(options) {
+  logger.info(
+    {
+      maxPoolSize: options.maxPoolSize,
+      minPoolSize: options.minPoolSize,
+      maxConnecting: options.maxConnecting ?? null,
+      waitQueueTimeoutMS: options.waitQueueTimeoutMS,
+      serverSelectionTimeoutMS: options.serverSelectionTimeoutMS,
+      connectTimeoutMS: options.connectTimeoutMS,
+      socketTimeoutMS: options.socketTimeoutMS,
+      heartbeatFrequencyMS: options.heartbeatFrequencyMS,
+      retryReads: options.retryReads,
+      retryWrites: options.retryWrites,
+    },
+    "[db] mongo client options resolved",
+  );
 }
 
 function applySrvDnsWorkaround() {
-  // Workaround for Windows SRV DNS failures like:
-  // querySrv ECONNREFUSED _mongodb._tcp.<cluster>.mongodb.net
   try {
     if (process.platform !== "win32") return;
 
@@ -71,43 +114,60 @@ function applySrvDnsWorkaround() {
   }
 }
 
+function toCheckoutError(event = {}) {
+  if (event?.reason instanceof Error) return event.reason;
+  if (event?.error instanceof Error) return event.error;
+  const fallbackReason = String(
+    event?.reason || event?.error || "connection checkout failed",
+  );
+  const error = new Error(fallbackReason);
+  error.code = String(event?.reason || "");
+  return error;
+}
+
 function markAndLogMongoDegraded({
   error,
   reason,
   message = "[db] degraded",
   meta,
 } = {}) {
-  const next = markMongoDegraded({ error, reason });
-  const payload = {
-    reason: reason || null,
-    err: error?.message || String(error || ""),
-    ...(meta || {}),
-  };
-
-  if (next.becameDegraded) {
-    logger.warn(payload, message);
-    return;
-  }
-
+  const degraded = markMongoDegraded({ error, reason });
+  const runtime = getMongoRuntimeState();
   reportWindowedFault({
     windowKey: `db_degraded_${String(reason || "unknown")}`,
     windowMs: 30_000,
     code: "DB_DEGRADED",
     err: error,
     message,
-    meta: payload,
+    meta: {
+      reason: reason || null,
+      severity: degraded?.severity || runtime?.severity || null,
+      state: degraded?.state || runtime?.state || null,
+      failureStreak: Number(
+        degraded?.failureStreak || runtime?.failureStreak || 0,
+      ),
+      burstCount: Number(degraded?.burstCount || runtime?.burstCount || 0),
+      degradedSince: runtime?.degradedSince || null,
+      err: error?.message || String(error || ""),
+      ...(meta || {}),
+    },
   });
 }
 
 function markMongoConnected(meta = {}) {
-  markMongoHealthy({ connect: true });
-  logger.info({ db: env.MONGO_DB, ...(meta || {}) }, "[db] connected");
-}
-
-function markMongoRecovered(meta = {}) {
-  const next = markMongoHealthy();
-  if (!next.recovered) return;
-  logger.info(meta || {}, "[db] recovered");
+  const next = markMongoHealthy({
+    connect: true,
+    reason: "CONNECT_SUCCESS",
+  });
+  logger.info(
+    {
+      db: env.MONGO_DB,
+      mongoState: next?.state || getMongoRuntimeState()?.state || null,
+      mongoSeverity: next?.severity || getMongoRuntimeState()?.severity || null,
+      ...(meta || {}),
+    },
+    "[db] connected",
+  );
 }
 
 function attachMongoListeners() {
@@ -115,119 +175,193 @@ function attachMongoListeners() {
   listenersAttached = true;
 
   client.on("connectionPoolCreated", (event) => {
-    logger.info(
-      { address: event?.address || null },
-      "[db] connection pool created",
-    );
+    try {
+      noteMongoPoolCreated(event);
+      logger.info(
+        {
+          address: event?.address || null,
+          maxPoolSize: event?.options?.maxPoolSize ?? null,
+          minPoolSize: event?.options?.minPoolSize ?? null,
+          maxConnecting: event?.options?.maxConnecting ?? null,
+          waitQueueTimeoutMS: event?.options?.waitQueueTimeoutMS ?? null,
+        },
+        "[db] connection pool created",
+      );
+    } catch {}
   });
 
   client.on("connectionPoolReady", (event) => {
-    markMongoRecovered({ address: event?.address || null });
+    try {
+      logger.info(
+        { address: event?.address || null },
+        "[db] connection pool ready",
+      );
+    } catch {}
   });
 
   client.on("connectionPoolCleared", (event) => {
-    const error =
-      event?.error || new Error("connection pool cleared");
-    const poolClearedCount = noteMongoPoolCleared();
-    markAndLogMongoDegraded({
-      error,
-      reason: "connection_pool_cleared",
-      message: "[db] connection pool cleared",
-      meta: {
-        address: event?.address || null,
-        interruptInUseConnections: !!event?.interruptInUseConnections,
-        poolClearedCount,
-      },
-    });
+    try {
+      const error = event?.error || new Error("connection pool cleared");
+      const poolClearedCount = noteMongoPoolCleared({ event });
+      markAndLogMongoDegraded({
+        error,
+        reason: "CONNECTION_POOL_CLEARED",
+        message: "[db] connection pool cleared",
+        meta: {
+          address: event?.address || null,
+          interruptInUseConnections: !!event?.interruptInUseConnections,
+          poolClearedCount,
+        },
+      });
+    } catch {}
   });
 
   client.on("connectionPoolClosed", (event) => {
-    markAndLogMongoDegraded({
-      error: new Error("connection pool closed"),
-      reason: "connection_pool_closed",
-      meta: { address: event?.address || null },
-    });
+    try {
+      noteMongoPoolClosed(event);
+      markAndLogMongoDegraded({
+        error: new Error("connection pool closed"),
+        reason: "CONNECTION_POOL_CLOSED",
+        message: "[db] connection pool closed",
+        meta: { address: event?.address || null },
+      });
+    } catch {}
   });
 
-  client.on("connectionCheckOutFailed", (event) => {
-    const error =
-      event?.reason instanceof Error
-        ? event.reason
-        : event?.error instanceof Error
-          ? event.error
-          : new Error(
-              String(
-                event?.reason || event?.error || "connection checkout failed",
-              ),
-            );
-    const checkoutFailedCount = noteMongoCheckoutFailure();
+  client.on("connectionCreated", (event) => {
+    try {
+      noteMongoConnectionCreated(event);
+    } catch {}
+  });
 
-    if (isTransientMongoError(error)) {
-      markAndLogMongoDegraded({
-        error,
-        reason: "connection_checkout_failed",
-        message: "[db] connection checkout failed",
-        meta: {
-          address: event?.address || null,
-          checkoutFailedCount,
-        },
-      });
-      return;
-    }
-
-    reportWindowedFault({
-      windowKey: "db_checkout_failed",
-      windowMs: 30_000,
-      code: "DB_CHECKOUT_FAILED",
-      err: error,
-      message: "[db] connection checkout failed",
-      meta: {
-        address: event?.address || null,
-        checkoutFailedCount,
-      },
-    });
+  client.on("connectionReady", (event) => {
+    try {
+      noteMongoConnectionReady(event);
+    } catch {}
   });
 
   client.on("connectionClosed", (event) => {
-    const error =
-      event?.error ||
-      (String(event?.reason || "").trim()
-        ? new Error(String(event.reason))
-        : null);
-    if (!isTransientMongoError(error)) return;
-    markAndLogMongoDegraded({
-      error,
-      reason: "connection_closed",
-      meta: {
-        address: event?.address || null,
-        closeReason: event?.reason || null,
-      },
-    });
+    try {
+      noteMongoConnectionClosed(event);
+      const error =
+        event?.error ||
+        (String(event?.reason || "").trim()
+          ? new Error(String(event.reason))
+          : null);
+      if (!isTransientMongoError(error)) return;
+      markAndLogMongoDegraded({
+        error,
+        reason: "CONNECTION_CLOSED",
+        message: "[db] connection closed during mongo degradation",
+        meta: {
+          address: event?.address || null,
+          closeReason: event?.reason || null,
+        },
+      });
+    } catch {}
+  });
+
+  client.on("connectionCheckOutStarted", (event) => {
+    try {
+      const pressure = noteMongoCheckoutStarted(event);
+      if (!pressure?.pressureHigh) return;
+      reportWindowedFault({
+        windowKey: `db_pool_pressure_${String(event?.address || "unknown")}`,
+        windowMs: 30_000,
+        code: "DB_POOL_PRESSURE_HIGH",
+        message: "[db] connection pool pressure high",
+        meta: {
+          address: event?.address || null,
+          checkedOutTotal: Number(pressure?.checkedOutTotal || 0),
+          pendingCheckouts: Number(pressure?.pendingCheckouts || 0),
+        },
+      });
+    } catch {}
+  });
+
+  client.on("connectionCheckedOut", (event) => {
+    try {
+      const success = noteMongoCheckoutSuccess(event);
+      if (!success?.recovered) return;
+      logger.info(
+        {
+          address: event?.address || null,
+          checkedOutTotal: Number(success?.checkedOutTotal || 0),
+          lastCheckoutSuccessAt: success?.lastCheckoutSuccessAt || null,
+        },
+        "[db] connection pool recovered",
+      );
+    } catch {}
+  });
+
+  client.on("connectionCheckedIn", (event) => {
+    try {
+      noteMongoCheckoutCheckedIn(event);
+    } catch {}
+  });
+
+  client.on("connectionCheckOutFailed", (event) => {
+    try {
+      const error = toCheckoutError(event);
+      const metrics = noteMongoCheckoutFailed({
+        event,
+        error,
+        reason: event?.reason || null,
+      });
+      const reason = metrics?.checkoutTimeout
+        ? "CHECKOUT_TIMEOUT"
+        : "CHECKOUT_FAILED";
+
+      markAndLogMongoDegraded({
+        error,
+        reason,
+        message: "[db] connection checkout failed",
+        meta: {
+          address: event?.address || null,
+          checkoutFailureCount: Number(metrics?.checkoutFailureCount || 0),
+          checkoutTimeoutCount: Number(metrics?.checkoutTimeoutCount || 0),
+          checkoutFailureStreak: Number(metrics?.checkoutFailureStreak || 0),
+        },
+      });
+    } catch {}
   });
 }
 
 async function connectMongo() {
   if (db) return { client, db };
+  if (connectPromise) return connectPromise;
 
   applySrvDnsWorkaround();
 
-  client = new MongoClient(env.MONGO_URI, mongoClientOptions());
+  const options = mongoClientOptions();
+  logMongoClientOptions(options);
+  if (!client) {
+    client = new MongoClient(env.MONGO_URI, options);
+  }
   attachMongoListeners();
 
-  try {
-    await client.connect();
-    db = client.db(env.MONGO_DB);
-    markMongoConnected();
-    return { client, db };
-  } catch (error) {
-    if (isTransientMongoError(error)) {
-      markAndLogMongoDegraded({
-        error,
-        reason: "connect_failed",
-      });
+  connectPromise = (async () => {
+    try {
+      await client.connect();
+      db = client.db(env.MONGO_DB);
+      configureRuntimeLogDb(db);
+      markMongoConnected();
+      return { client, db };
+    } catch (error) {
+      if (isTransientMongoError(error)) {
+        markAndLogMongoDegraded({
+          error,
+          reason: "CONNECT_FAILED",
+          message: "[db] mongo connect failed",
+        });
+      }
+      throw error;
+    } finally {
+      if (!db) connectPromise = null;
     }
-    throw error;
-  }
+  })();
+
+  return connectPromise;
 }
 
 function getDb() {
@@ -239,8 +373,13 @@ function getMongoRuntimeStateSnapshot() {
   return getMongoRuntimeState();
 }
 
+function getMongoHealthSnapshotWrapper() {
+  return getMongoHealthSnapshot();
+}
+
 module.exports = {
   connectMongo,
   getDb,
   getMongoRuntimeState: getMongoRuntimeStateSnapshot,
+  getMongoHealthSnapshot: getMongoHealthSnapshotWrapper,
 };

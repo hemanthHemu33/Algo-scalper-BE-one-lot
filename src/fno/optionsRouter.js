@@ -81,6 +81,91 @@ function _dteDays(expiryISO, nowMs = Date.now()) {
   return hours / 24;
 }
 
+function normalizeMarketState(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase();
+}
+
+function hasFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return false;
+  return Number.isFinite(Number(value));
+}
+
+function buildProductRiskAdaptation({
+  dteDays,
+  marketState,
+  dangerStackScore = 0,
+  env,
+}) {
+  const state = normalizeMarketState(marketState);
+  const oneDte = hasFiniteNumber(dteDays) && Number(dteDays) <= 1;
+  const oneDteHardeningEnabled =
+    String(env.ONE_DTE_HARDENING_ENABLED ?? "true") === "true";
+  const oneDteHardened = oneDteHardeningEnabled && oneDte;
+  const maxDangerToAllow = Number(env.ONE_DTE_MAX_DANGER_TO_ALLOW ?? 62);
+
+  let productRiskTier = "LOW";
+  let productRecommendation = "ALLOW";
+  let suggestedDtePolicy = "NEAREST_OK";
+  let riskSizeMultiplierRecommendation = 1;
+  let oneDteBlocked = false;
+  let blockReason = null;
+
+  if (state === "TREND_COMPRESSED" || state === "BREAKOUT_WATCH") {
+    productRiskTier = "MEDIUM";
+    suggestedDtePolicy = "PREFER_2_TO_5_DTE";
+    riskSizeMultiplierRecommendation = 0.6;
+    if (oneDte) productRecommendation = "PREFER_FARTHER_DTE";
+  } else if (state === "FAILED_BREAKOUT" || state === "RANGE_CHOP") {
+    productRiskTier = "HIGH";
+    suggestedDtePolicy = "PREFER_3_TO_7_DTE";
+    riskSizeMultiplierRecommendation = 0.35;
+    productRecommendation = oneDte ? "BLOCK" : "PREFER_FARTHER_DTE";
+  } else if (state === "TRAP_RISK_HIGH" || state === "NO_TRADE") {
+    productRiskTier = "EXTREME";
+    suggestedDtePolicy = "NO_TRADE";
+    riskSizeMultiplierRecommendation = 0;
+    productRecommendation = "BLOCK";
+  }
+
+  if (oneDte && Number(dangerStackScore) > maxDangerToAllow) {
+    productRiskTier = "EXTREME";
+    suggestedDtePolicy = "NO_TRADE";
+    riskSizeMultiplierRecommendation = 0;
+    productRecommendation = "BLOCK";
+    oneDteBlocked = true;
+    blockReason = "ONE_DTE_BLOCKED_DANGER_STACK";
+  }
+
+  if (!oneDteBlocked && oneDte && productRecommendation === "BLOCK") {
+    oneDteBlocked = true;
+    blockReason = "ONE_DTE_BLOCKED_MARKET_STATE";
+  }
+
+  let optionFragilityScore = 0;
+  if (oneDte) optionFragilityScore += 42;
+  optionFragilityScore += Math.min(45, Number(dangerStackScore || 0) * 0.4);
+  if (state === "FAILED_BREAKOUT" || state === "TRAP_RISK_HIGH") optionFragilityScore += 14;
+  optionFragilityScore = Math.max(0, Math.min(100, optionFragilityScore));
+
+  return {
+    marketState: state || null,
+    dte: hasFiniteNumber(dteDays) ? Number(dteDays) : null,
+    oneDteHardened,
+    oneDteBlocked,
+    blockReason,
+    productRiskTier,
+    productRecommendation,
+    suggestedDtePolicy,
+    riskSizeMultiplierRecommendation,
+    optionFragilityScore,
+    maxDangerToAllow,
+    allowFragileContinuation:
+      productRecommendation === "ALLOW" || productRecommendation === "PREFER_FARTHER_DTE",
+  };
+}
+
 function roundToStep(price, step) {
   const s = Number(step ?? 1);
   if (!Number.isFinite(s) || s <= 0) return Math.round(price);
@@ -643,6 +728,7 @@ async function pickOptionContractForSignal({
   underlyingTradingsymbol,
   side, // BUY/SELL on underlying
   underlyingLtp,
+  signalContext = null,
   // Optional dynamic overrides (pacing policy)
   maxSpreadBpsOverride,
   minPremiumOverride,
@@ -867,14 +953,51 @@ async function pickOptionContractForSignal({
       ? maxSpreadBpsOverride
       : env.OPT_MAX_SPREAD_BPS ?? 35,
   );
-  const minDepth = Number(env.OPT_MIN_DEPTH_QTY ?? 0);
+  const minDepthBase = Number(env.OPT_MIN_DEPTH_QTY ?? 0);
 
   const stage = Math.max(0, Number(gateStage ?? 0));
-  const maxBps = stage >= 1 ? maxBpsRaw * 1.25 : maxBpsRaw;
+  const dteDays = _dteDays(expiryISO, nowMs);
+  const marketStateFromSignal =
+    signalContext?.marketState ||
+    signalContext?.meta?.marketState ||
+    signalContext?.regimeMeta?.marketState ||
+    signalContext?.regimeSnapshot?.marketState ||
+    null;
+  const dangerStackScore =
+    Number(signalContext?.dangerStackScore ?? signalContext?.meta?.dangerStackScore) ||
+    Number(signalContext?.meta?.dangerStack?.dangerStackScore ?? 0);
+  const productAdaptation = buildProductRiskAdaptation({
+    dteDays,
+    marketState: marketStateFromSignal,
+    dangerStackScore,
+    env,
+  });
+  if (productAdaptation.oneDteBlocked) {
+    return {
+      ok: false,
+      reason: productAdaptation.blockReason || "ONE_DTE_BLOCKED",
+      message: `[options] blocked by 1-DTE adaptive policy (${productAdaptation.blockReason || "ONE_DTE_BLOCKED"})`,
+      underlying,
+      optType,
+      expiry: expiryISO,
+      meta: {
+        dteDays: Number.isFinite(dteDays) ? dteDays : null,
+        marketState: productAdaptation.marketState,
+        dangerStackScore: Number.isFinite(dangerStackScore) ? dangerStackScore : 0,
+        productAdaptation,
+      },
+    };
+  }
+
+  const adaptiveSpreadMult = productAdaptation.oneDteHardened ? 0.88 : 1;
+  const maxBps = (stage >= 1 ? maxBpsRaw * 1.25 : maxBpsRaw) * adaptiveSpreadMult;
   const premiumSlack = stage >= 2 ? 25 : 0;
   const deltaGateEnabled =
     stage >= 3 ? false : Boolean(env.OPT_DELTA_BAND_ENFORCE ?? true);
   const gammaGateEnabled = stage >= 4 ? false : true;
+  const minDepth = productAdaptation.oneDteHardened
+    ? Math.max(minDepthBase, Number(env.ONE_DTE_MIN_DEPTH_QTY ?? minDepthBase))
+    : minDepthBase;
   const greeksRequired = Boolean(
     env.OPT_GREEKS_REQUIRED ?? env.GREEKS_REQUIRED ?? false,
   );
@@ -887,14 +1010,14 @@ async function pickOptionContractForSignal({
 
   const gammaMax = Number(env.OPT_GAMMA_MAX ?? 0.004);
   const gammaGateDteDays = Number(env.OPT_GAMMA_GATE_DTE_DAYS ?? 0.5);
-  const dteDays = _dteDays(expiryISO, nowMs);
   const gammaGateActive = Number.isFinite(dteDays)
     ? dteDays <= gammaGateDteDays
     : false;
 
   const spreadRiseBlockBps = Number(env.OPT_SPREAD_RISE_BLOCK_BPS ?? 8);
   const flickerBlock = Number(env.OPT_BOOK_FLICKER_BLOCK ?? 4);
-  const minHealthScore = Number(env.OPT_HEALTH_SCORE_MIN ?? 45);
+  const adaptiveHealthUplift = productAdaptation.oneDteHardened ? 5 : 0;
+  const minHealthScore = Number(env.OPT_HEALTH_SCORE_MIN ?? 45) + adaptiveHealthUplift;
 
   const ivMaxPts = Number(env.OPT_IV_MAX_PTS ?? 80);
   const ivDropBlockPts = Number(env.OPT_IV_DROP_BLOCK_PTS ?? 2);
@@ -1278,6 +1401,18 @@ async function pickOptionContractForSignal({
         strikeStep: step,
         premiumBand: { minPrem, maxPrem, enforced: enforcePremBand },
         meta: {
+          dte: Number.isFinite(dteDays) ? dteDays : null,
+          oneDteHardened: productAdaptation.oneDteHardened === true,
+          oneDteBlocked: productAdaptation.oneDteBlocked === true,
+          optionFragilityScore: productAdaptation.optionFragilityScore,
+          productRiskTier: productAdaptation.productRiskTier,
+          productRecommendation: productAdaptation.productRecommendation,
+          suggestedDtePolicy: productAdaptation.suggestedDtePolicy,
+          riskSizeMultiplierRecommendation:
+            productAdaptation.riskSizeMultiplierRecommendation,
+          allowFragileContinuation: productAdaptation.allowFragileContinuation,
+          marketState: productAdaptation.marketState || null,
+          dangerStackScore: Number.isFinite(dangerStackScore) ? dangerStackScore : 0,
           micro: { maxBps, spreadRiseBlockBps, minDepth, flickerBlock, minHealthScore },
           deltaBand: enforceDeltaBand
             ? { min: deltaMin, max: deltaMax, target: deltaTarget }
@@ -1359,6 +1494,18 @@ async function pickOptionContractForSignal({
     meta: {
       policy: picked?.policy || null,
       dteDays: Number.isFinite(dteDays) ? dteDays : null,
+      dte: Number.isFinite(dteDays) ? dteDays : null,
+      oneDteHardened: productAdaptation.oneDteHardened === true,
+      oneDteBlocked: productAdaptation.oneDteBlocked === true,
+      optionFragilityScore: productAdaptation.optionFragilityScore,
+      productRiskTier: productAdaptation.productRiskTier,
+      productRecommendation: productAdaptation.productRecommendation,
+      suggestedDtePolicy: productAdaptation.suggestedDtePolicy,
+      riskSizeMultiplierRecommendation:
+        productAdaptation.riskSizeMultiplierRecommendation,
+      allowFragileContinuation: productAdaptation.allowFragileContinuation,
+      marketState: productAdaptation.marketState || null,
+      dangerStackScore: Number.isFinite(dangerStackScore) ? dangerStackScore : 0,
       premiumBandFallbackUsed,
       selectionPath: {
         stage,
@@ -1484,6 +1631,7 @@ module.exports = {
   chainRootFromSpot,
   buildOptionSubscriptionCandidates,
   buildContractSelectionObservability,
+  buildProductRiskAdaptation,
   getPremiumBandForUnderlying,
   pickOptionContractForSignal,
 };

@@ -100,6 +100,13 @@ The engine is fully configurable via environment variables. Below are **core set
 MONGO_URI=mongodb+srv://<user>:<pass>@cluster.mongodb.net
 MONGO_DB=algo_scalper
 
+# Runtime logger persistence
+RUNTIME_LOGS_DB_ENABLED=true
+RUNTIME_LOGS_COLLECTION=run_time_logs
+RUNTIME_LOGS_DAILY_PURGE_ENABLED=true
+RUNTIME_LOGS_DAILY_PURGE_HHMM=09:00
+RUNTIME_LOGS_DAILY_PURGE_TZ=Asia/Kolkata
+
 # Kite
 KITE_API_KEY=your_key
 KITE_API_SECRET=your_secret

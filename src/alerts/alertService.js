@@ -21,8 +21,13 @@ function minLevel() {
 }
 
 function notificationsEnabled() {
+  const overrideRaw = env.TELEGRAM_NOTIFICATIONS_ENABLED;
+  const override =
+    overrideRaw == null ? null : String(overrideRaw).trim();
   const enabledFlag =
-    env.TELEGRAM_NOTIFICATIONS_ENABLED ?? env.TELEGRAM_ENABLED ?? "false";
+    override && override.length > 0
+      ? override
+      : env.TELEGRAM_ENABLED ?? "false";
   return String(enabledFlag).trim().toLowerCase() === "true";
 }
 

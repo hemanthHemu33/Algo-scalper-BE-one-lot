@@ -118,6 +118,24 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function makeSignal(overrides = {}) {
+  return {
+    instrument_token: 12345,
+    side: "BUY",
+    reason: "TEST_SIGNAL",
+    strategyId: "ema_cross",
+    strategyStyle: "TREND",
+    confidence: 0.9,
+    intervalMin: 1,
+    candle: {
+      close: 100,
+      ts: new Date().toISOString(),
+      interval_min: 1,
+    },
+    ...overrides,
+  };
+}
+
 async function testReconcileInitGuard() {
   const calls = {
     ensureIndexes: 0,
@@ -2494,6 +2512,136 @@ async function testEarlyFailAuthorizationLogsCompactWhenVerboseOff() {
   }
 }
 
+async function testReconcileDiffSkipsTerminalTradeMutation() {
+  let updateTradeCalls = 0;
+  const infoLogs = [];
+  const terminalTrade = {
+    tradeId: "T-RECON-TERM",
+    status: "CLOSED",
+    instrument_token: 17001,
+    closedAt: "2026-03-18T09:20:00.000Z",
+  };
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...terminalTrade }),
+      updateTrade: async () => {
+        updateTradeCalls += 1;
+      },
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        infoLogs.push({ payload, message });
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    tm._virtualTargetHeartbeat = async () => {
+      throw new Error("terminal reconcile should no-op before heartbeat");
+    };
+
+    const result = await tm._reconcileTrade(
+      {
+        tradeId: "T-RECON-TERM",
+        status: "ENTRY_OPEN",
+        instrument_token: 17001,
+      },
+      new Map(),
+      new Map(),
+    );
+
+    assert.equal(updateTradeCalls, 0);
+    assert.equal(Boolean(result?.ok), true);
+    assert.equal(result?.reason, "TERMINAL_RECONCILE_MUTATION_SUPPRESSED");
+    assert.equal(
+      infoLogs.some((entry) =>
+        String(entry.message || "").includes("[trade] terminal trade mutation skipped"),
+      ),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testDelayedEntryUpdateAfterPanicCloseIsTelemetryOnly() {
+  let appendOrderLogCalls = 0;
+  let updateTradeCalls = 0;
+  const infoLogs = [];
+  const closedTrade = {
+    tradeId: "T-PANIC-CLOSED",
+    status: "CLOSED",
+    entryOrderId: "ENTRY-PANIC-1",
+    qty: 50,
+    closedAt: "2026-03-18T09:20:00.000Z",
+    lastEventAt: "2026-03-18T09:20:00.000Z",
+  };
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      findTradeByOrder: async () => ({
+        trade: { ...closedTrade },
+        link: { role: "ENTRY" },
+      }),
+      getTrade: async () => ({ ...closedTrade }),
+      appendOrderLog: async () => {
+        appendOrderLogCalls += 1;
+      },
+      updateTrade: async () => {
+        updateTradeCalls += 1;
+      },
+      linkOrder: async () => {},
+      upsertLiveOrderSnapshot: async () => {},
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        infoLogs.push({ payload, message });
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    tm._scheduleReconcile = () => {};
+
+    const delayedEntryUpdate = {
+      order_id: "ENTRY-PANIC-1",
+      status: "COMPLETE",
+      filled_quantity: 50,
+      average_price: 102.5,
+      pending_quantity: 0,
+      exchange_update_timestamp: "2026-03-18T09:19:00.000Z",
+    };
+
+    await tm.onOrderUpdate(delayedEntryUpdate);
+
+    assert.equal(appendOrderLogCalls, 1);
+    assert.equal(updateTradeCalls, 0);
+    assert.equal(
+      infoLogs.some((entry) =>
+        String(entry.message || "").includes(
+          "[order_update] stale delayed order update recorded as telemetry-only",
+        ),
+      ),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
 async function testStaleEntryReplayIsIgnoredEarly() {
   let appendOrderLogCalls = 0;
   let updateTradeCalls = 0;
@@ -2998,6 +3146,689 @@ async function testEntryLimitFallbackEscalatesAmbiguousRecovery() {
   }
 }
 
+async function testTerminalCloseCleanupRunsWhenPnlBookingFails() {
+  const tradeId = "T-PNL-FAIL";
+  const tradeState = {
+    tradeId,
+    status: "EXITED_TARGET",
+    instrument_token: 4321,
+    side: "BUY",
+    qty: 10,
+    entryPrice: 100,
+    exitPrice: 104,
+  };
+  const errors = [];
+
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({ ...tradeState }),
+      updateTrade: async (_tradeId, patch) => {
+        Object.assign(tradeState, patch);
+      },
+    },
+    loggerOverrides: {
+      error(_payload, message) {
+        errors.push(String(message || ""));
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    tm.activeTradeId = tradeId;
+    tm._activeTradeToken = tradeState.instrument_token;
+    tm._activeTradeSide = tradeState.side;
+    tm._bookRealizedPnl = async () => {
+      throw new Error("pnl_booking_failed");
+    };
+
+    await tm._finalizeTerminalCloseWithBestEffort({
+      tradeId,
+      instrumentToken: tradeState.instrument_token,
+      source: "TEST_PNL_FAILURE",
+    });
+
+    assert.equal(tm.activeTradeId, null);
+    assert.equal(
+      errors.some((m) =>
+        m.includes(
+          "[trade] cleanup attempted after terminal close but secondary work failed",
+        ),
+      ),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testSignalGateClearsStaleActiveTradeWhenDbTradeTerminal() {
+  const tradeId = "T-SIGNAL-STALE";
+  const infos = [];
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({
+        tradeId,
+        status: "CLOSED",
+        instrument_token: 12001,
+      }),
+    },
+    loggerOverrides: {
+      info(_payload, message) {
+        infos.push(String(message || ""));
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.activeTradeId = tradeId;
+    tm._isBlockedByNoTradeWindow = () => true;
+
+    await tm.onSignal(makeSignal({ instrument_token: 12001 }));
+
+    assert.equal(tm.activeTradeId, null);
+    assert.equal(
+      infos.some((m) =>
+        m.includes("[trade] cleared stale active trade before signal gate"),
+      ),
+      true,
+    );
+    assert.equal(
+      infos.some((m) => m.includes("[signal] ignored (active trade exists)")),
+      false,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testSignalGateKeepsBlockingWhenTradeIsLive() {
+  const tradeId = "T-SIGNAL-LIVE";
+  const infos = [];
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => ({
+        tradeId,
+        status: "LIVE",
+        instrument_token: 13001,
+        side: "BUY",
+        qty: 10,
+      }),
+    },
+    loggerOverrides: {
+      info(_payload, message) {
+        infos.push(String(message || ""));
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {
+        getPositions: async () => ({
+          net: [{ instrument_token: 13001, quantity: 10 }],
+        }),
+      },
+      riskEngine: makeRiskEngine(),
+    });
+    tm.activeTradeId = tradeId;
+
+    await tm.onSignal(makeSignal({ instrument_token: 13001 }));
+
+    assert.equal(tm.activeTradeId, tradeId);
+    assert.equal(
+      infos.some((m) => m.includes("[signal] ignored (active trade exists)")),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testReconcileHealsStaleRuntimePointerWhenDbActivesEmpty() {
+  const tradeId = "T-RECON-STALE";
+  const infos = [];
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getActiveTrades: async () => [],
+      getTrade: async () => ({
+        tradeId,
+        status: "CLOSED",
+        instrument_token: 14001,
+      }),
+    },
+    loggerOverrides: {
+      info(_payload, message) {
+        infos.push(String(message || ""));
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {
+        getOrders: async () => [],
+        getPositions: async () => ({ net: [] }),
+      },
+      riskEngine: makeRiskEngine(),
+    });
+
+    tm.init = async () => {};
+    tm._globalFactRecoveryGate = async () => ({ ok: true, blockers: [] });
+    tm._restoreDynamicExitState = async () => {};
+    tm._persistLiveOrderSnapshotsForTrades = async () => {};
+    tm._syncRiskFromPositions = () => {};
+    tm._monitorPortfolioRisk = async () => {};
+    tm._maybeHardFlatOnRestart = async () => {};
+    tm._reconcileTrade = async () => {};
+
+    tm.activeTradeId = tradeId;
+    tm._activeTradeToken = 14001;
+    tm._activeTradeSide = "BUY";
+
+    await tm.reconcile([]);
+
+    assert.equal(tm.activeTradeId, null);
+    assert.equal(
+      infos.some((m) =>
+        m.includes("[reconcile] healed stale active-trade runtime state"),
+      ),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testClearActiveTradeRuntimeStateIsIdempotent() {
+  const tradeId = "T-CLEAR-IDEMPOTENT";
+  const otherTradeId = "T-CLEAR-OTHER";
+  const harness = loadTradeManagerHarness();
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+
+    const ownTimer = setTimeout(() => {}, 500);
+    const otherTimer = setTimeout(() => {}, 500);
+    tm.activeTradeId = tradeId;
+    tm._activeTradeToken = 15001;
+    tm._activeTradeSide = "BUY";
+    tm._panicExitTimers.set(tradeId, ownTimer);
+    tm._panicExitTimers.set(otherTradeId, otherTimer);
+    tm._dynExitDisabled.add(tradeId);
+    tm._dynExitDisabled.add(otherTradeId);
+
+    tm._clearActiveTradeRuntimeState(tradeId, {
+      instrumentToken: 15001,
+      source: "test",
+      reason: "idempotent_check",
+    });
+    tm._clearActiveTradeRuntimeState(tradeId, {
+      instrumentToken: 15001,
+      source: "test",
+      reason: "idempotent_check_repeat",
+    });
+
+    assert.equal(tm.activeTradeId, null);
+    assert.equal(tm._panicExitTimers.has(tradeId), false);
+    assert.equal(tm._dynExitDisabled.has(tradeId), false);
+    assert.equal(tm._panicExitTimers.has(otherTradeId), true);
+    assert.equal(tm._dynExitDisabled.has(otherTradeId), true);
+
+    clearTimeout(otherTimer);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testMissingTradeRecordForActiveTradeGetsHealed() {
+  const tradeId = "T-MISSING-ROW";
+  const warnings = [];
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => null,
+    },
+    loggerOverrides: {
+      warn(_payload, message) {
+        warnings.push(String(message || ""));
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.activeTradeId = tradeId;
+
+    const state = await tm._validateAndHealActiveTradeRuntimeState({
+      source: "signal_gate",
+    });
+
+    assert.equal(state?.staleCleared, true);
+    assert.equal(tm.activeTradeId, null);
+    assert.equal(
+      warnings.some((m) => m.includes("[trade] stale active-trade detected")),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testTransientTradeLookupFailureDoesNotClearActiveTrade() {
+  const tradeId = "T-LOOKUP-TRANSIENT";
+  const infos = [];
+  const warnings = [];
+  const harness = loadTradeManagerHarness({
+    tradeStoreOverrides: {
+      getTrade: async () => {
+        throw new Error("temporary_db_read_failure");
+      },
+    },
+    loggerOverrides: {
+      info(_payload, message) {
+        infos.push(String(message || ""));
+      },
+      warn(_payload, message) {
+        warnings.push(String(message || ""));
+      },
+    },
+  });
+
+  try {
+    const { TradeManager } = harness;
+    const tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.activeTradeId = tradeId;
+
+    await tm.onSignal(makeSignal({ instrument_token: 16001 }));
+
+    assert.equal(tm.activeTradeId, tradeId);
+    assert.equal(
+      infos.some((m) => m.includes("[signal] ignored (active trade exists)")),
+      true,
+    );
+    assert.equal(
+      warnings.some((m) =>
+        m.includes("[trade] active-trade validation deferred (trade lookup failed)"),
+      ),
+      true,
+    );
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testDebouncedReconcileRespectsMongoDefer() {
+  const warns = [];
+  const infos = [];
+  let directReconcileCalls = 0;
+  let runnerCalls = 0;
+  const deferredResult = {
+    ok: false,
+    deferred: true,
+    reason: "mongo_degraded_pressure",
+    backoffMs: 275,
+    severity: "DEGRADED",
+    status: "DEGRADED",
+  };
+  const harness = loadTradeManagerHarness({
+    envOverrides: {
+      RECONCILE_ON_ORDER_UPDATE: "true",
+      RECONCILE_DEBOUNCE_MS: 250,
+      MONGO_RECONCILE_MAX_DEFER_MS: 5_000,
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        infos.push({ payload, message: String(message || "") });
+      },
+      warn(payload, message) {
+        warns.push({ payload, message: String(message || "") });
+      },
+    },
+  });
+  let tm = null;
+
+  try {
+    const { TradeManager } = harness;
+    tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.reconcile = async () => {
+      directReconcileCalls += 1;
+      return { ok: true };
+    };
+    tm.setReconcileRunner(
+      async () => {
+        runnerCalls += 1;
+        return runnerCalls === 1 ? deferredResult : { ok: true };
+      },
+      { coordinatorAware: false },
+    );
+
+    tm._scheduleReconcile("mongo_defer_test");
+    await sleep(900);
+
+    assert.equal(directReconcileCalls, 0);
+    assert.equal(runnerCalls, 2);
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes(
+          "[reconcile] debounced run deferred due to mongo degradation",
+        ),
+      ),
+      true,
+    );
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes("[reconcile] debounced run failed"),
+      ),
+      false,
+    );
+    assert.equal(
+      infos.some((entry) =>
+        entry.message.includes(
+          "[reconcile] debounced run resumed after mongo recovery",
+        ),
+      ),
+      true,
+    );
+  } finally {
+    try {
+      await tm?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testDebouncedReconcileRespectsSevereMongoSkip() {
+  const warns = [];
+  let directReconcileCalls = 0;
+  let runnerCalls = 0;
+  const harness = loadTradeManagerHarness({
+    envOverrides: {
+      RECONCILE_ON_ORDER_UPDATE: "true",
+      RECONCILE_DEBOUNCE_MS: 250,
+      MONGO_RECONCILE_MAX_DEFER_MS: 5_000,
+    },
+    loggerOverrides: {
+      warn(payload, message) {
+        warns.push({ payload, message: String(message || "") });
+      },
+    },
+  });
+  let tm = null;
+
+  try {
+    const { TradeManager } = harness;
+    tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.reconcile = async () => {
+      directReconcileCalls += 1;
+      return { ok: true };
+    };
+    tm.setReconcileRunner(
+      async () => {
+        runnerCalls += 1;
+        return {
+          ok: false,
+          deferred: true,
+          reason: "mongo_severe_pressure",
+          backoffMs: 500,
+          severity: "SEVERELY_DEGRADED",
+          status: "SEVERELY_DEGRADED",
+        };
+      },
+      { coordinatorAware: true },
+    );
+
+    tm._scheduleReconcile("mongo_severe_test");
+    await sleep(380);
+
+    assert.equal(runnerCalls, 1);
+    assert.equal(directReconcileCalls, 0);
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes(
+          "[reconcile] debounced run skipped due to severe mongo pressure",
+        ),
+      ),
+      true,
+    );
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes("[reconcile] debounced run failed"),
+      ),
+      false,
+    );
+  } finally {
+    try {
+      await tm?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testDebouncedReconcileRunsAfterRecoveryWithoutOverlap() {
+  const infos = [];
+  let runnerCalls = 0;
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  let phase = "degraded";
+  const harness = loadTradeManagerHarness({
+    envOverrides: {
+      RECONCILE_ON_ORDER_UPDATE: "true",
+      RECONCILE_DEBOUNCE_MS: 250,
+      MONGO_RECONCILE_MAX_DEFER_MS: 5_000,
+    },
+    loggerOverrides: {
+      info(payload, message) {
+        infos.push({ payload, message: String(message || "") });
+      },
+    },
+  });
+  let tm = null;
+
+  try {
+    const { TradeManager } = harness;
+    tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.setReconcileRunner(
+      async () => {
+        runnerCalls += 1;
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        try {
+          if (phase === "degraded") {
+            return {
+              ok: false,
+              deferred: true,
+              reason: "mongo_degraded_pressure",
+              backoffMs: 400,
+              severity: "DEGRADED",
+              status: "DEGRADED",
+            };
+          }
+          await sleep(120);
+          return { ok: true };
+        } finally {
+          concurrent -= 1;
+        }
+      },
+      { coordinatorAware: true },
+    );
+
+    tm._scheduleReconcile("degraded_phase");
+    await sleep(320);
+
+    phase = "healthy";
+    tm._scheduleReconcile("healthy_phase");
+    tm._scheduleReconcile("healthy_phase_dup1");
+    tm._scheduleReconcile("healthy_phase_dup2");
+    await sleep(80);
+    tm._scheduleReconcile("healthy_phase_during_run");
+    await sleep(520);
+
+    assert.equal(maxConcurrent, 1);
+    assert.equal(runnerCalls >= 2, true);
+    assert.equal(
+      infos.some((entry) =>
+        entry.message.includes(
+          "[reconcile] debounced run resumed after mongo recovery",
+        ),
+      ),
+      true,
+    );
+  } finally {
+    try {
+      await tm?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testDebouncedReconcileNonMongoErrorsStillSurface() {
+  const warns = [];
+  const harness = loadTradeManagerHarness({
+    envOverrides: {
+      RECONCILE_ON_ORDER_UPDATE: "true",
+      RECONCILE_DEBOUNCE_MS: 250,
+    },
+    loggerOverrides: {
+      warn(payload, message) {
+        warns.push({ payload, message: String(message || "") });
+      },
+    },
+  });
+  let tm = null;
+
+  try {
+    const { TradeManager } = harness;
+    tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.setReconcileRunner(
+      async () => {
+        throw new Error("reconcile logic bug");
+      },
+      { coordinatorAware: true },
+    );
+
+    tm._scheduleReconcile("non_mongo_error_test");
+    await sleep(380);
+
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes("[reconcile] debounced run failed"),
+      ),
+      true,
+    );
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes(
+          "[reconcile] debounced run deferred due to mongo degradation",
+        ),
+      ),
+      false,
+    );
+    assert.equal(
+      warns.some((entry) =>
+        entry.message.includes(
+          "[reconcile] debounced run skipped due to severe mongo pressure",
+        ),
+      ),
+      false,
+    );
+  } finally {
+    try {
+      await tm?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
+async function testDebouncedReconcileDeferredRetriesStayBounded() {
+  let runnerCalls = 0;
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  const harness = loadTradeManagerHarness({
+    envOverrides: {
+      RECONCILE_ON_ORDER_UPDATE: "true",
+      RECONCILE_DEBOUNCE_MS: 250,
+      MONGO_RECONCILE_MAX_DEFER_MS: 5_000,
+    },
+  });
+  let tm = null;
+
+  try {
+    const { TradeManager } = harness;
+    tm = new TradeManager({
+      kite: {},
+      riskEngine: makeRiskEngine(),
+    });
+    tm.setReconcileRunner(
+      async () => {
+        runnerCalls += 1;
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        try {
+          return {
+            ok: false,
+            deferred: true,
+            reason: "mongo_degraded_pressure",
+            backoffMs: 250,
+            severity: "DEGRADED",
+            status: "DEGRADED",
+          };
+        } finally {
+          concurrent -= 1;
+        }
+      },
+      { coordinatorAware: false },
+    );
+
+    for (let i = 0; i < 25; i += 1) {
+      tm._scheduleReconcile(`storm_${i}`);
+    }
+    await sleep(900);
+
+    assert.equal(maxConcurrent, 1);
+    assert.equal(runnerCalls <= 3, true);
+  } finally {
+    try {
+      await tm?.stop?.();
+    } catch {}
+    harness.restore();
+  }
+}
+
 async function main() {
   await testReconcileInitGuard();
   await testProtectiveSlIsNotFastWatched();
@@ -3023,6 +3854,8 @@ async function main() {
   await testTp1RunnerRebasesWinnerStateAndMarksBeLive();
   await testEarlyFailAuthorizationLogsDecisionFacts();
   await testEarlyFailAuthorizationLogsCompactWhenVerboseOff();
+  await testReconcileDiffSkipsTerminalTradeMutation();
+  await testDelayedEntryUpdateAfterPanicCloseIsTelemetryOnly();
   await testTradeCommandSerializesReconcileAndOrderUpdate();
   await testRestoreDynamicExitStatePreservesPendingProtection();
   await testStaleEntryReplayIsIgnoredEarly();
@@ -3030,6 +3863,18 @@ async function main() {
   await testFinalizeClosedCleansTradeRuntimeState();
   await testFinalizeEntryFillUsesReducedQtyForExitSync();
   await testEntryLimitFallbackEscalatesAmbiguousRecovery();
+  await testTerminalCloseCleanupRunsWhenPnlBookingFails();
+  await testSignalGateClearsStaleActiveTradeWhenDbTradeTerminal();
+  await testSignalGateKeepsBlockingWhenTradeIsLive();
+  await testReconcileHealsStaleRuntimePointerWhenDbActivesEmpty();
+  await testClearActiveTradeRuntimeStateIsIdempotent();
+  await testMissingTradeRecordForActiveTradeGetsHealed();
+  await testTransientTradeLookupFailureDoesNotClearActiveTrade();
+  await testDebouncedReconcileRespectsMongoDefer();
+  await testDebouncedReconcileRespectsSevereMongoSkip();
+  await testDebouncedReconcileRunsAfterRecoveryWithoutOverlap();
+  await testDebouncedReconcileNonMongoErrorsStillSurface();
+  await testDebouncedReconcileDeferredRetriesStayBounded();
   console.log("tradeManagerRuntime.test.js passed");
 }
 

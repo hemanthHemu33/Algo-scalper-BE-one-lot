@@ -49,7 +49,19 @@ function makeFakeDb() {
         },
         findOneAndUpdate: async (filter, update) => {
           const tradeId = String(filter?.tradeId || "");
-          const doc = trades.get(tradeId);
+          let doc = trades.get(tradeId);
+          if (doc?.__conflictToTerminalOnNextUpdate) {
+            const promoted = {
+              ...clone(doc),
+              status: String(doc.__terminalConflictStatus || "CLOSED"),
+              closedAt: doc.closedAt || "2026-03-18T09:20:00.000Z",
+              version: Number(doc.version ?? 0) + 1,
+            };
+            delete promoted.__conflictToTerminalOnNextUpdate;
+            delete promoted.__terminalConflictStatus;
+            trades.set(tradeId, promoted);
+            doc = promoted;
+          }
           if (!matchFilter(doc, filter)) {
             return { value: null };
           }
@@ -163,6 +175,184 @@ async function testInvalidTransitionFailsClosed() {
   }
 }
 
+function buildStaleEntryFinalizePatch() {
+  return {
+    status: "ENTRY_FILLED",
+    entryPrice: 101.25,
+    actualEntry: 101.25,
+    qty: 10,
+    entryFilledAt: "2026-03-18T09:16:00.000Z",
+    entryAt: "2026-03-18T09:16:00.000Z",
+    entryFinalized: true,
+    entrySlippageBps: 4,
+    lastEvent: "ENTRY_FILLED",
+    lastEventMeta: { role: "ENTRY", source: "TEST" },
+  };
+}
+
+async function testClosedTradeRejectsStaleEntryMutationAsNoop() {
+  const harness = loadTradeStoreHarness();
+
+  try {
+    const { insertTrade, getTrade, updateTrade } = harness.tradeStore;
+
+    await insertTrade({
+      tradeId: "T-CLOSED-NOOP",
+      status: "CLOSED",
+      strategyStopLoss: 90,
+      stopLoss: 90,
+      closedAt: "2026-03-18T09:20:00.000Z",
+    });
+
+    const before = await getTrade("T-CLOSED-NOOP");
+    const result = await updateTrade(
+      "T-CLOSED-NOOP",
+      buildStaleEntryFinalizePatch(),
+      { expectedVersion: before.version, currentTrade: before },
+    );
+
+    const after = await getTrade("T-CLOSED-NOOP");
+    assert.equal(result.status, "NOOP_TERMINAL_STALE");
+    assert.equal(after.status, "CLOSED");
+    assert.equal(after.entryFinalized, undefined);
+    assert.equal(after.entryPrice, undefined);
+    assert.equal(after.version, before.version);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testTerminalVersionConflictDowngradesStaleEntryPatch() {
+  const harness = loadTradeStoreHarness();
+
+  try {
+    const { insertTrade, getTrade, updateTrade } = harness.tradeStore;
+
+    await insertTrade({
+      tradeId: "T-CONFLICT-NOOP",
+      status: "ENTRY_OPEN",
+      strategyStopLoss: 90,
+      stopLoss: 90,
+      __conflictToTerminalOnNextUpdate: true,
+      __terminalConflictStatus: "CLOSED",
+    });
+
+    const initial = await getTrade("T-CONFLICT-NOOP");
+
+    const stale = await updateTrade(
+      "T-CONFLICT-NOOP",
+      buildStaleEntryFinalizePatch(),
+      { expectedVersion: initial.version, currentTrade: initial },
+    );
+
+    const after = await getTrade("T-CONFLICT-NOOP");
+    assert.equal(stale.status, "NOOP_TERMINAL_STALE");
+    assert.equal(stale.dropReason, "TERMINAL_STALE_VERSION_CONFLICT");
+    assert.equal(after.status, "CLOSED");
+    assert.equal(after.entryFinalized, undefined);
+    assert.equal(after.version, initial.version + 1);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testLiveTradeStillAcceptsEntryMutation() {
+  const harness = loadTradeStoreHarness();
+
+  try {
+    const { insertTrade, getTrade, updateTrade } = harness.tradeStore;
+
+    await insertTrade({
+      tradeId: "T-LIVE-ENTRY",
+      status: "ENTRY_OPEN",
+      strategyStopLoss: 90,
+      stopLoss: 90,
+    });
+
+    const before = await getTrade("T-LIVE-ENTRY");
+    const applied = await updateTrade(
+      "T-LIVE-ENTRY",
+      buildStaleEntryFinalizePatch(),
+      { expectedVersion: before.version, currentTrade: before },
+    );
+
+    assert.equal(applied.status, "APPLIED");
+    assert.equal(applied.trade.status, "ENTRY_FILLED");
+    assert.equal(applied.trade.entryFinalized, true);
+    assert.equal(Number(applied.trade.entryPrice), 101.25);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testDuplicateTerminalStaleUpdatesRemainIdempotent() {
+  const harness = loadTradeStoreHarness();
+
+  try {
+    const { insertTrade, getTrade, updateTrade } = harness.tradeStore;
+
+    await insertTrade({
+      tradeId: "T-DUP-TERMINAL",
+      status: "CLOSED",
+      strategyStopLoss: 90,
+      stopLoss: 90,
+      closedAt: "2026-03-18T09:20:00.000Z",
+    });
+
+    const before = await getTrade("T-DUP-TERMINAL");
+    const patch = buildStaleEntryFinalizePatch();
+
+    const first = await updateTrade("T-DUP-TERMINAL", patch, {
+      expectedVersion: before.version,
+      currentTrade: before,
+    });
+    const second = await updateTrade("T-DUP-TERMINAL", patch, {
+      expectedVersion: before.version,
+      currentTrade: before,
+    });
+
+    const after = await getTrade("T-DUP-TERMINAL");
+    assert.equal(first.status, "NOOP_TERMINAL_STALE");
+    assert.equal(second.status, "NOOP_TERMINAL_STALE");
+    assert.equal(after.status, "CLOSED");
+    assert.equal(after.version, before.version);
+    assert.equal(after.entryFinalized, undefined);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testTerminalStatusesRejectEntryFinalizationWrites() {
+  const harness = loadTradeStoreHarness();
+
+  try {
+    const { insertTrade, getTrade, updateTrade } = harness.tradeStore;
+    const statuses = ["ENTRY_CANCELLED", "CLOSED", "EXITED_TARGET"];
+
+    for (const status of statuses) {
+      const tradeId = `T-TERM-${status}`;
+      await insertTrade({
+        tradeId,
+        status,
+        strategyStopLoss: 90,
+        stopLoss: 90,
+        closedAt: "2026-03-18T09:20:00.000Z",
+      });
+      const before = await getTrade(tradeId);
+      const result = await updateTrade(tradeId, buildStaleEntryFinalizePatch(), {
+        expectedVersion: before.version,
+        currentTrade: before,
+      });
+      const after = await getTrade(tradeId);
+      assert.equal(result.status, "NOOP_TERMINAL_STALE", tradeId);
+      assert.equal(after.status, status, tradeId);
+      assert.equal(after.entryFinalized, undefined, tradeId);
+    }
+  } finally {
+    harness.restore();
+  }
+}
+
 async function testMissingTradeIsExplicit() {
   const harness = loadTradeStoreHarness();
 
@@ -191,6 +381,11 @@ function testStateMachineRejectsEmptyAndUnknownFromStates() {
 async function main() {
   await testStaleWriteConflictRejectsOlderVersion();
   await testInvalidTransitionFailsClosed();
+  await testClosedTradeRejectsStaleEntryMutationAsNoop();
+  await testTerminalVersionConflictDowngradesStaleEntryPatch();
+  await testLiveTradeStillAcceptsEntryMutation();
+  await testDuplicateTerminalStaleUpdatesRemainIdempotent();
+  await testTerminalStatusesRejectEntryFinalizationWrites();
   await testMissingTradeIsExplicit();
   testStateMachineRejectsEmptyAndUnknownFromStates();
   console.log("tradeStoreConcurrency.test.js passed");

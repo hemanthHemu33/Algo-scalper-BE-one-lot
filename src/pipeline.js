@@ -22,6 +22,12 @@ const { TradeManager } = require("./trading/tradeManager");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { marketHealth } = require("./market/marketHealth");
 const { alert } = require("./alerts/alertService");
+const { isTransientMongoError } = require("./runtime/isTransientMongoError");
+const {
+  evaluateMongoWorkGate,
+  deferMongoWorkForError,
+  noteMongoWorkSuccess,
+} = require("./runtime/mongoWorkGate");
 
 function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   const intervals = (env.CANDLE_INTERVALS || "1,3")
@@ -45,6 +51,9 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
   let stopped = false;
   let stopPromise = null;
   let candleFinalizerTimer = null;
+  let reconcileDeferredTimer = null;
+  let reconcileDeferredUntil = 0;
+  let reconcileDeferredActive = false;
 
   let tokensRef = [];
   let tokensSet = new Set();
@@ -59,6 +68,113 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
 
   function previewActionableEnabled() {
     return String(process.env.SIGNAL_PREVIEW_ACTIONABLE ?? env.SIGNAL_PREVIEW_ACTIONABLE ?? "false") === "true";
+  }
+
+  function normalizeRuntimeError(error) {
+    const name =
+      String(error?.name || "").trim() ||
+      (error instanceof Error ? "Error" : "RuntimeError");
+    const message =
+      String(error?.message || "").trim() || String(error || "Unknown runtime error");
+    const stack =
+      typeof error?.stack === "string" && error.stack.trim()
+        ? error.stack.slice(0, 4000)
+        : null;
+    return { name, message, stack };
+  }
+
+  function resolveRouteMode(signal) {
+    const explicit = String(
+      signal?.routeMode || signal?.conversionSummary?.routeMode || "",
+    )
+      .trim()
+      .toUpperCase();
+    if (explicit) return explicit;
+    if (signal?.option_meta || signal?.underlying_token) return "OPT";
+    if (
+      String(env.FNO_ENABLED || "false").toLowerCase() === "true" &&
+      String(env.FNO_MODE || "FUT").toUpperCase() === "OPT"
+    ) {
+      return "OPT";
+    }
+    return "DIRECT";
+  }
+
+  function resolveRoutePhase(signal) {
+    const basis = String(signal?.conversionSummary?.routeConfidenceBasis || "")
+      .trim()
+      .toUpperCase();
+    if (basis.startsWith("ACTUAL")) return "ACTUAL";
+    if (basis === "ESTIMATED") return "ESTIMATED";
+    if (
+      signal?.routeConfidence &&
+      typeof signal.routeConfidence === "object" &&
+      signal.routeConfidence.estimated !== true
+    ) {
+      return "ACTUAL";
+    }
+    if (
+      signal?.preEmit?.routeConfidence ||
+      signal?.conversionSummary?.preRouteScore != null ||
+      signal?.conversionSummary?.expectedRouteAdjustment != null
+    ) {
+      return "ESTIMATED";
+    }
+    return null;
+  }
+
+  function emitTradePathRuntimeAbort({
+    signal,
+    error,
+    stage,
+    substage,
+  }) {
+    const normalized = normalizeRuntimeError(error);
+    const routeMode = resolveRouteMode(signal);
+    const routeAttempted =
+      signal?.conversionSummary?.routeAttempted === true ||
+      signal?.option_meta != null;
+    const contractSelectionStarted =
+      signal?.entryPipeline?.contractSelectedAt != null ||
+      signal?.conversionSummary?.selectedContract != null ||
+      signal?.option_meta != null;
+    const routePhase = resolveRoutePhase(signal);
+
+    const payload = {
+      runtimeAbortCategory: "RUNTIME_ERROR",
+      stage,
+      substage,
+      signalId: signal?.signalId || null,
+      regimeSnapshotId:
+        signal?.regimeSnapshotId || signal?.regimeSnapshot?.snapshotId || null,
+      token: Number.isFinite(Number(signal?.instrument_token))
+        ? Number(signal.instrument_token)
+        : null,
+      strategyId: signal?.strategyId || null,
+      side: signal?.side || null,
+      timeframe:
+        Number(signal?.intervalMin ?? signal?.candle?.interval_min) || null,
+      routeMode,
+      routeAttempted,
+      contractSelectionStarted,
+      routePhase,
+      estimatedRoutePhase: routePhase === "ESTIMATED",
+      actualRoutePhase: routePhase === "ACTUAL",
+      errorName: normalized.name,
+      errorMessage: normalized.message,
+    };
+    if (normalized.stack) {
+      payload.debug = { stack: normalized.stack };
+    }
+
+    let eventMessage = "[trade] candidate aborted by runtime error";
+    if (routeMode === "OPT" && contractSelectionStarted !== true) {
+      eventMessage = "[route] candidate failed before contract selection";
+    } else if (routeAttempted || routePhase === "ACTUAL") {
+      eventMessage = "[signal] conversion aborted by runtime error";
+    }
+
+    logger.error(payload, eventMessage);
   }
 
   async function emitSignalPreview(signal) {
@@ -338,13 +454,151 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
       candleCache.getCandles(token, intervalMin, limit),
     );
   }
+  if (typeof trader.setReconcileRunner === "function") {
+    trader.setReconcileRunner(reconcile, { coordinatorAware: true });
+  }
+
+  function clearDeferredReconcileTimer() {
+    if (!reconcileDeferredTimer) return;
+    clearTimeout(reconcileDeferredTimer);
+    reconcileDeferredTimer = null;
+    reconcileDeferredUntil = 0;
+  }
+
+  function scheduleDeferredReconcile(backoffMs, reason = "mongo_degraded") {
+    if (stopped) return;
+    const delay = Math.max(250, Number(backoffMs) || 0);
+    if (delay <= 0) return;
+    reconcileDeferredUntil = Date.now() + delay;
+    if (reconcileDeferredTimer) return;
+    reconcileDeferredTimer = setTimeout(() => {
+      reconcileDeferredTimer = null;
+      if (stopped) return;
+      reconcile()
+        .then((result) => {
+          logger.info(
+            {
+              reason,
+              deferredResult: result || null,
+              deferredWaitMs: Math.max(0, Date.now() - reconcileDeferredUntil),
+            },
+            "[reconcile] resumed after mongo recovery",
+          );
+        })
+        .catch((error) => {
+          logger.warn(
+            { reason, err: error?.message || String(error) },
+            "[reconcile] deferred retry failed",
+          );
+        });
+    }, delay);
+    reconcileDeferredTimer.unref?.();
+  }
 
   async function reconcile() {
     if (stopped) return { ok: false, stopped: true };
     return enqueue(async () => {
       if (stopped) return { ok: false, stopped: true };
-      await trader.reconcile(tokensRef);
-      logger.info("[reconcile] done");
+      const gate = evaluateMongoWorkGate({
+        subsystem: "reconcile",
+        priority: "critical",
+        phase: "reconcile",
+        windowKey: "reconcile_mongo_gate_deferred",
+        code: "RECONCILE_MONGO_DEFERRED",
+        message: "[reconcile] deferred by mongo coordinator",
+      });
+      const release = gate?.release || null;
+      if (gate?.deferred) {
+        reconcileDeferredActive = true;
+        const severe =
+          String(gate.status || gate.severity || "").toUpperCase() ===
+          "SEVERELY_DEGRADED";
+        scheduleDeferredReconcile(gate.backoffMs, "mongo_state");
+        if (severe) {
+          logger.warn(
+            {
+              backoffMs: gate.backoffMs,
+              severity: gate.severity || gate.status || null,
+            },
+            "[reconcile] skipped due to severe mongo pressure",
+          );
+        } else {
+          logger.warn(
+            {
+              backoffMs: gate.backoffMs,
+              severity: gate.severity || gate.status || null,
+            },
+            "[reconcile] deferred due to mongo degradation",
+          );
+        }
+        return {
+          ok: false,
+          deferred: true,
+          reason: severe
+            ? "mongo_severe_pressure"
+            : "mongo_degraded_pressure",
+          backoffMs: gate.backoffMs,
+        };
+      }
+      try {
+        const out = await trader.reconcile(tokensRef);
+        noteMongoWorkSuccess({
+          subsystem: "reconcile",
+          priority: "critical",
+          release,
+        });
+        if (reconcileDeferredActive) {
+          reconcileDeferredActive = false;
+          clearDeferredReconcileTimer();
+          logger.info("[reconcile] resumed after mongo recovery");
+        }
+        logger.info("[reconcile] done");
+        return out || { ok: true };
+      } catch (error) {
+        if (!isTransientMongoError(error)) {
+          if (typeof release === "function") {
+            release();
+          }
+          throw error;
+        }
+        const deferred = deferMongoWorkForError({
+          subsystem: "reconcile",
+          priority: "critical",
+          error,
+          reason: "reconcile_mongo_checkout_timeout",
+          phase: "reconcile",
+          windowKey: "reconcile_mongo_degraded",
+          code: "RECONCILE_MONGO_DEGRADED",
+          message: "[reconcile] deferred due to mongo degradation",
+          release,
+        });
+        if (deferred?.deferred) {
+          reconcileDeferredActive = true;
+          scheduleDeferredReconcile(deferred.backoffMs, "mongo_error");
+          const severe =
+            String(deferred.status || deferred.severity || "").toUpperCase() ===
+            "SEVERELY_DEGRADED";
+          logger.warn(
+            {
+              backoffMs: deferred.backoffMs,
+              severity: deferred.severity || deferred.status || null,
+              err: error?.message || String(error),
+            },
+            severe
+              ? "[reconcile] skipped due to severe mongo pressure"
+              : "[reconcile] deferred due to mongo degradation",
+          );
+          return {
+            ok: false,
+            deferred: true,
+            reason: severe
+              ? "mongo_severe_pressure"
+              : "mongo_degraded_pressure",
+            backoffMs: deferred.backoffMs,
+          };
+        }
+        throw error;
+      }
     }, "reconcile");
   }
 
@@ -435,7 +689,17 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
           lastSignalCandleTs: c?.ts ? new Date(c.ts).getTime() : null,
           lastSignalStage: signal.signalStage || "bar_close_confirmed",
         });
-        await trader.onSignal(signal);
+        try {
+          await trader.onSignal(signal);
+        } catch (error) {
+          emitTradePathRuntimeAbort({
+            signal,
+            error,
+            stage: "signal_dispatch",
+            substage: "bar_close",
+          });
+          throw error;
+        }
       }
     }
   }
@@ -546,7 +810,17 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
                 setupLineage: signal.setupLineage || signal.meta?.setupLineage || null,
               },
             });
-            await trader.onSignal(signal);
+            try {
+              await trader.onSignal(signal);
+            } catch (error) {
+              emitTradePathRuntimeAbort({
+                signal,
+                error,
+                stage: "signal_dispatch",
+                substage: "tick_preview",
+              });
+              throw error;
+            }
           }
           tickSignalState.set(key, {
             ...tickSignalState.get(key),
@@ -675,6 +949,8 @@ function buildPipeline({ kite, tickerCtrl, marketGate } = {}) {
     if (stopPromise) return stopPromise;
 
     stopped = true;
+    clearDeferredReconcileTimer();
+    reconcileDeferredActive = false;
     stopPromise = (async () => {
       if (candleFinalizerTimer) {
         clearInterval(candleFinalizerTimer);

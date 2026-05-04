@@ -104,6 +104,9 @@ const schema = z.object({
   TELEMETRY_ENABLED: z.string().default("true"),
   TELEMETRY_FLUSH_SEC: z.coerce.number().default(60),
   TELEMETRY_RING_SIZE: z.coerce.number().default(300),
+  TELEMETRY_MAX_QUEUE: z.coerce.number().default(10_000),
+  TELEMETRY_WARN_QUEUE: z.coerce.number().default(2_000),
+  TELEMETRY_FLUSH_BATCH_SIZE: z.coerce.number().default(500),
   TELEMETRY_DB_DAILY_COLLECTION: z.string().default("telemetry_signals_daily"),
 
   // Rejection histograms (symbol×strategy×time-bucket)
@@ -182,6 +185,38 @@ const schema = z.object({
 
   MONGO_URI: z.string().min(10),
   MONGO_DB: z.string().min(1),
+  MONGO_MAX_POOL_SIZE: z.coerce.number().default(30),
+  MONGO_MIN_POOL_SIZE: z.coerce.number().default(2),
+  MONGO_MAX_CONNECTING: z.coerce.number().default(4),
+  MONGO_WAIT_QUEUE_TIMEOUT_MS: z.coerce.number().default(8_000),
+  MONGO_SERVER_SELECTION_TIMEOUT_MS: z.coerce.number().default(10_000),
+  MONGO_CONNECT_TIMEOUT_MS: z.coerce.number().default(10_000),
+  MONGO_SOCKET_TIMEOUT_MS: z.coerce.number().default(45_000),
+  MONGO_HEARTBEAT_FREQUENCY_MS: z.coerce.number().default(10_000),
+  MONGO_RETRY_READS: boolFromEnv.default(true),
+  MONGO_RETRY_WRITES: boolFromEnv.default(true),
+  // Mongo degradation coordinator (pool pressure + shared backpressure)
+  MONGO_DEGRADE_BURST_WINDOW_MS: z.coerce.number().default(60_000),
+  MONGO_SEVERE_BURST_COUNT: z.coerce.number().default(3),
+  MONGO_SEVERE_FAILURE_STREAK: z.coerce.number().default(3),
+  MONGO_SEVERE_AFTER_MS: z.coerce.number().default(30_000),
+  MONGO_SEVERE_STALE_STATUS_MS: z.coerce.number().default(30_000),
+  MONGO_RECOVERY_STREAK_REQUIRED: z.coerce.number().default(3),
+  MONGO_RECOVERY_COOLDOWN_MS: z.coerce.number().default(30_000),
+  MONGO_RECOVERY_NO_FAILURE_WINDOW_MS: z.coerce.number().default(30_000),
+  MONGO_BACKLOG_WARN_THRESHOLD: z.coerce.number().default(500),
+  MONGO_BACKLOG_SEVERE_THRESHOLD: z.coerce.number().default(2_000),
+  MONGO_BACKOFF_MIN_MS: z.coerce.number().default(750),
+  MONGO_BACKOFF_MAX_MS: z.coerce.number().default(15_000),
+  MONGO_BACKOFF_JITTER_PCT: z.coerce.number().default(0.2),
+  MONGO_CRITICAL_BACKOFF_MIN_MS: z.coerce.number().default(750),
+  MONGO_CRITICAL_BACKOFF_MAX_MS: z.coerce.number().default(15_000),
+  MONGO_RECONCILE_DEFER_MS: z.coerce.number().default(1_500),
+  MONGO_RECONCILE_MAX_DEFER_MS: z.coerce.number().default(20_000),
+  MONGO_CHANGE_STREAM_BACKOFF_MIN_MS: z.coerce.number().default(1_000),
+  MONGO_CHANGE_STREAM_BACKOFF_MAX_MS: z.coerce.number().default(60_000),
+  MONGO_SOCKET_STALE_WARN_MS: z.coerce.number().default(15_000),
+  SOCKET_STATUS_MAX_STALE_MS: z.coerce.number().default(60_000),
 
   TOKENS_COLLECTION: z.string().default("broker_tokens"),
   TOKEN_FILTER_USER_ID: z.string().optional(),
@@ -497,6 +532,19 @@ const schema = z.object({
   // Ensure TTL indexes at startup (recommended)
   RETENTION_ENSURE_ON_START: z.string().default("true"),
 
+  // Runtime application logs persisted to MongoDB.
+  RUNTIME_LOGS_DB_ENABLED: z.string().default("true"),
+  RUNTIME_LOGS_COLLECTION: z.string().default("run_time_logs"),
+  RUNTIME_LOGS_BUFFER_MAX: z.coerce.number().default(5000),
+  RUNTIME_LOGS_BATCH_SIZE: z.coerce.number().default(100),
+  RUNTIME_LOGS_FLUSH_INTERVAL_MS: z.coerce.number().default(1000),
+  RUNTIME_LOGS_MAX_FIELD_CHARS: z.coerce.number().default(8000),
+  RUNTIME_LOGS_TTL_ENABLED: z.string().default("false"),
+  RUNTIME_LOGS_TTL_DAYS: z.coerce.number().default(14),
+  RUNTIME_LOGS_DAILY_PURGE_ENABLED: z.string().default("true"),
+  RUNTIME_LOGS_DAILY_PURGE_HHMM: z.string().default("09:00"),
+  RUNTIME_LOGS_DAILY_PURGE_TZ: z.string().default("Asia/Kolkata"),
+
   // Admin DB purge (dangerous; deletes all docs except keep list)
   DB_PURGE_ENABLED: z.string().default("false"),
   // Comma-separated collections to keep when purging (e.g., "audit_logs,broker_tokens")
@@ -522,6 +570,11 @@ const schema = z.object({
   CANDLE_WRITE_MAX_BATCH: z.coerce.number().default(500),
   CANDLE_WRITE_MAX_BUFFER: z.coerce.number().default(15000),
   CANDLE_WRITE_LOG: z.string().default("false"),
+  CANDLE_WRITER_MAX_BACKLOG: z.coerce.number().default(5_000),
+  CANDLE_WRITER_WARN_BACKLOG: z.coerce.number().default(500),
+  CANDLE_WRITER_CRITICAL_BACKLOG: z.coerce.number().default(2_000),
+  CANDLE_WRITER_FLUSH_BATCH_SIZE: z.coerce.number().default(500),
+  CANDLE_WRITER_FLUSH_CONCURRENCY: z.coerce.number().default(1),
   // Persist candles for non-signal tokens (e.g., option instruments) if enabled.
   CANDLE_PERSIST_NON_SIGNAL_TOKENS: z.string().default("false"),
   DAILY_LOSS_CHECK_MS: z.coerce.number().default(2000),
@@ -773,6 +826,8 @@ const schema = z.object({
 
   // Reliability guards
   MAX_CONSECUTIVE_FAILURES: z.coerce.number().default(3),
+  MAX_RECENT_ENTRY_FAILURES: z.coerce.number().default(3),
+  FAILURE_STREAK_WINDOW_SEC: z.coerce.number().default(600),
 
   // Order rate limits (conservative broker-side safety defaults)
   MAX_ORDERS_PER_SEC: z.coerce.number().default(10),
@@ -851,6 +906,7 @@ const schema = z.object({
   TELEGRAM_OUTBOX_RETRY_BASE_MS: z.coerce.number().default(1500),
   TELEGRAM_OUTBOX_MAX_RETRIES: z.coerce.number().default(8),
   TELEGRAM_OUTBOX_POLL_MS: z.coerce.number().default(1000),
+  TELEGRAM_OUTBOX_BATCH_SIZE: z.coerce.number().default(10),
   TELEGRAM_API_TIMEOUT_MS: z.coerce.number().default(10000),
   TELEGRAM_RATE_LIMIT_MS: z.coerce.number().default(300),
 
@@ -873,6 +929,80 @@ const schema = z.object({
   STRATEGIES_RANGE: z.string().optional(),
   STRATEGIES_OPEN: z.string().optional(),
   STRATEGIES_ALWAYS: z.string().optional(),
+  STRATEGIES_TREND_COMPRESSED: z.string().optional(),
+  STRATEGIES_BREAKOUT_WATCH: z.string().optional(),
+  STRATEGIES_FAILED_BREAKOUT: z.string().optional(),
+  STRATEGIES_RANGE_CHOP: z.string().optional(),
+  STRATEGIES_TRAP_RISK_HIGH: z.string().optional(),
+  STRATEGIES_OPEN_DRIVE: z.string().optional(),
+
+  MARKET_STATE_ENGINE_ENABLED: boolFromEnv.default(true),
+  MARKET_STATE_NO_TRADE_ENABLED: boolFromEnv.default(true),
+  MARKET_STATE_FAILED_BREAKOUT_ENABLED: boolFromEnv.default(true),
+  MARKET_STATE_TRAP_RISK_ENABLED: boolFromEnv.default(true),
+
+  LEVEL_ACCEPTANCE_ENABLED: boolFromEnv.default(true),
+  LEVEL_ACCEPTANCE_LOOKBACK_BARS: z.coerce.number().default(8),
+  LEVEL_ACCEPTANCE_MAX_DISTANCE_ATR: z.coerce.number().default(0.8),
+  LEVEL_ACCEPTANCE_MIN_CLOSES_BEYOND: z.coerce.number().default(2),
+  LEVEL_ACCEPTANCE_RETEST_REQUIRED: boolFromEnv.default(true),
+  LEVEL_ACCEPTANCE_RETEST_OVERRIDE_ENABLED: boolFromEnv.default(true),
+  LEVEL_ACCEPTANCE_MIN_SCORE: z.coerce.number().default(55),
+  LEVEL_REJECTION_MIN_COUNT: z.coerce.number().default(2),
+  LEVEL_REJECTION_HARD_BLOCK_ENABLED: boolFromEnv.default(true),
+
+  DANGER_STACK_ENABLED: boolFromEnv.default(true),
+  DANGER_STACK_NO_TRADE_SCORE: z.coerce.number().default(82),
+  DANGER_STACK_A_PLUS_ONLY_SCORE: z.coerce.number().default(62),
+  DANGER_STACK_REJECTION_WEIGHT: z.coerce.number().default(18),
+  DANGER_STACK_ONE_DTE_WEIGHT: z.coerce.number().default(16),
+  DANGER_STACK_WEAK_MTF_WEIGHT: z.coerce.number().default(14),
+  DANGER_STACK_WHIPSAW_WEIGHT: z.coerce.number().default(12),
+
+  COMPRESSED_STRICT_MTF_ENABLED: boolFromEnv.default(true),
+  COMPRESSED_MTF_UPLIFT: z.coerce.number().default(4),
+  BREAKOUT_WATCH_MTF_UPLIFT: z.coerce.number().default(6),
+  FAILED_BREAKOUT_MTF_UPLIFT: z.coerce.number().default(8),
+  TRAP_RISK_MTF_UPLIFT: z.coerce.number().default(10),
+  STALE_HTF_EXTRA_PENALTY: z.coerce.number().default(4),
+  MISSING_HTF_EXTRA_PENALTY: z.coerce.number().default(6),
+  PARTIAL_ALIGN_EXTRA_PENALTY: z.coerce.number().default(4),
+
+  ONE_DTE_HARDENING_ENABLED: boolFromEnv.default(true),
+  ONE_DTE_BLOCK_COMPRESSED_TREND: boolFromEnv.default(true),
+  ONE_DTE_BLOCK_BREAKOUT_WATCH_TREND: boolFromEnv.default(true),
+  ONE_DTE_BLOCK_FAILED_BREAKOUT: boolFromEnv.default(true),
+  ONE_DTE_CONFIDENCE_UPLIFT: z.coerce.number().default(8),
+  ONE_DTE_MTF_UPLIFT: z.coerce.number().default(8),
+  ONE_DTE_PREFER_SAFER_DTE: boolFromEnv.default(true),
+  ONE_DTE_MAX_DANGER_TO_ALLOW: z.coerce.number().default(62),
+  ONE_DTE_MIN_DEPTH_QTY: z.coerce.number().default(0),
+
+  FRAGILE_REVERSAL_EXCEPTION_ENABLED: boolFromEnv.default(true),
+  FRAGILE_REVERSAL_TREND_COMPRESSED_STRATEGIES:
+    z.string().default("wick_reversal"),
+  FRAGILE_REVERSAL_BREAKOUT_WATCH_STRATEGIES:
+    z.string().default("wick_reversal"),
+  FRAGILE_REVERSAL_FAILED_BREAKOUT_STRATEGIES:
+    z.string().default("fakeout,wick_reversal"),
+  FRAGILE_REVERSAL_ALLOW_RSI_FADE: boolFromEnv.default(false),
+  FRAGILE_REVERSAL_MIN_CONFIDENCE: z.coerce.number().default(80),
+  FRAGILE_REVERSAL_MIN_MTF_SCORE: z.coerce.number().default(55),
+  FRAGILE_REVERSAL_BLOCK_ON_MTF_DISAGREEMENT:
+    boolFromEnv.default(true),
+  FRAGILE_REVERSAL_REQUIRE_LEVEL_REJECTION: boolFromEnv.default(true),
+  FRAGILE_REVERSAL_REQUIRE_SESSION_EXTREME: boolFromEnv.default(true),
+  FRAGILE_REVERSAL_REQUIRE_DANGER_BELOW: z.coerce.number().default(62),
+  FRAGILE_REVERSAL_ONE_DTE_MIN_CONFIDENCE:
+    z.coerce.number().default(86),
+  FRAGILE_REVERSAL_ONE_DTE_MAX_DANGER: z.coerce.number().default(45),
+  FRAGILE_REVERSAL_TELEMETRY_ENABLED: boolFromEnv.default(true),
+
+  THESIS_RETRY_GOVERNOR_ENABLED: boolFromEnv.default(true),
+  THESIS_RETRY_LOOKBACK_MIN: z.coerce.number().default(35),
+  THESIS_RETRY_MAX_FAILURES: z.coerce.number().default(2),
+  THESIS_RETRY_ZONE_ATR: z.coerce.number().default(0.35),
+  THESIS_RETRY_BLOCK_MINUTES: z.coerce.number().default(18),
 
   SELECTOR_OPEN_WINDOW_MIN: z.coerce.number().default(20),
   SELECTOR_FAST_EMA: z.coerce.number().default(9),

@@ -17,6 +17,40 @@ const LIVE_ORDER_SNAPSHOTS = "live_order_snapshots";
 const COST_CALIBRATION = "cost_calibration";
 const COST_RECONCILIATIONS = "cost_reconciliations";
 const STALE_TRANSITION_LOG_DEDUP_WINDOW_MS = 60 * 1000;
+const TERMINAL_TRADE_STATUSES = new Set([
+  "CLOSED",
+  "EXITED_TARGET",
+  "EXITED_SL",
+  "ENTRY_FAILED",
+  "ENTRY_CANCELLED",
+  "EXIT_FILLED",
+  "PANIC_EXIT_CONFIRMED",
+]);
+const ENTRY_RELATED_STATUS_TARGETS = new Set([
+  "ENTRY_PLACED",
+  "ENTRY_OPEN",
+  "ENTRY_REPLACED",
+  "ENTRY_FILLED",
+  "SL_PLACED",
+  "SL_OPEN",
+  "SL_CONFIRMED",
+  "LIVE",
+  "RECOVERY_REHYDRATED",
+]);
+const ENTRY_RELATED_PATCH_KEYS = new Set([
+  "entryPrice",
+  "actualEntry",
+  "qty",
+  "entryFilledAt",
+  "entryAt",
+  "entryFinalized",
+  "entrySlippageBps",
+  "entrySlippageInrWorse",
+  "entryDriftPct",
+  "entryPlacedAt",
+  "entryPendingLastReason",
+  "entryPendingLastCheckAt",
+]);
 const staleTransitionLogCache = new Map();
 let staleTransitionLogCacheSweepAt = 0;
 
@@ -77,6 +111,109 @@ function shouldLogStaleTransition({ tradeId, fromStatus, toStatus, role }) {
 
   staleTransitionLogCache.set(key, now);
   return true;
+}
+
+function isTerminalTradeStatus(status) {
+  return TERMINAL_TRADE_STATUSES.has(normalizeTradeStatus(status));
+}
+
+function collectEntryRelatedPatchKeys(update) {
+  const keys = [];
+  if (!update || typeof update !== "object") return keys;
+
+  for (const key of ENTRY_RELATED_PATCH_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(update, key)) {
+      keys.push(key);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(update, "status")) {
+    const nextStatus = normalizeTradeStatus(update.status);
+    if (ENTRY_RELATED_STATUS_TARGETS.has(nextStatus)) {
+      keys.push("status");
+    }
+  }
+
+  const hasCoreEntryMutation = keys.length > 0;
+  if (
+    Object.prototype.hasOwnProperty.call(update, "lastEvent") &&
+    (hasCoreEntryMutation || /^ENTRY_/i.test(String(update.lastEvent || "")))
+  ) {
+    keys.push("lastEvent");
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(update, "lastEventMeta") &&
+    (hasCoreEntryMutation || Object.prototype.hasOwnProperty.call(update, "lastEvent"))
+  ) {
+    keys.push("lastEventMeta");
+  }
+
+  return keys;
+}
+
+function terminalStalePatchMeta({
+  tradeId,
+  currentStatus,
+  attemptedStatus,
+  options,
+  update,
+  patchKeys,
+  dropReason,
+  expectedVersion = null,
+  actualVersion = null,
+}) {
+  const meta = {
+    tradeId,
+    currentStatus: currentStatus || null,
+    attemptedStatus: attemptedStatus || null,
+    command:
+      options?.commandType || options?.command || options?.source || null,
+    eventRole:
+      update?.lastEventMeta?.role ??
+      update?.role ??
+      options?.eventRole ??
+      null,
+    patchKeys: Array.isArray(patchKeys) ? patchKeys : [],
+    dropReason: dropReason || "TERMINAL_STALE_PATCH",
+  };
+  if (Number.isInteger(Number(expectedVersion))) {
+    meta.expectedVersion = Number(expectedVersion);
+  }
+  if (Number.isInteger(Number(actualVersion))) {
+    meta.actualVersion = Number(actualVersion);
+  }
+  return meta;
+}
+
+function buildTerminalStaleNoopResult({
+  tradeId,
+  expectedVersion,
+  trade,
+  validation,
+  patchKeys,
+  dropReason,
+  actualVersion = null,
+}) {
+  return {
+    ok: true,
+    status: "NOOP_TERMINAL_STALE",
+    tradeId,
+    expectedVersion:
+      Number.isInteger(Number(expectedVersion)) && Number(expectedVersion) >= 0
+        ? Number(expectedVersion)
+        : null,
+    actualVersion:
+      Number.isInteger(Number(actualVersion)) && Number(actualVersion) >= 0
+        ? Number(actualVersion)
+        : normalizeTradeVersionValue(trade?.version),
+    version: normalizeTradeVersionValue(trade?.version),
+    trade: trade || null,
+    validation: validation || null,
+    noop: true,
+    terminalStale: true,
+    dropReason: dropReason || "TERMINAL_STALE_PATCH",
+    patchKeys: Array.isArray(patchKeys) ? patchKeys : [],
+  };
 }
 
 async function ensureTradeIndexes() {
@@ -147,9 +284,13 @@ async function updateTrade(tradeId, patch, options = {}) {
   const db = getDb();
   const update = { ...(patch || {}) };
   const suppliedVersion = Number(options?.expectedVersion);
-  const current = withNormalizedTradeVersion(
-    options?.currentTrade || (await db.collection(TRADES).findOne({ tradeId })),
-  );
+  const entryRelatedPatchKeys = collectEntryRelatedPatchKeys(update);
+  let current = withNormalizedTradeVersion(options?.currentTrade || null);
+  if (!current || entryRelatedPatchKeys.length > 0) {
+    current = withNormalizedTradeVersion(
+      await db.collection(TRADES).findOne({ tradeId }),
+    );
+  }
 
   if (!current) {
     return {
@@ -167,6 +308,36 @@ async function updateTrade(tradeId, patch, options = {}) {
       ? suppliedVersion
       : normalizeTradeVersionValue(current?.version);
   let validation = null;
+
+  if (
+    entryRelatedPatchKeys.length > 0 &&
+    isTerminalTradeStatus(current?.status)
+  ) {
+    const staleMeta = terminalStalePatchMeta({
+      tradeId,
+      currentStatus: normalizeTradeStatus(current?.status),
+      attemptedStatus: Object.prototype.hasOwnProperty.call(update, "status")
+        ? normalizeTradeStatus(update.status)
+        : null,
+      options,
+      update,
+      patchKeys: entryRelatedPatchKeys,
+      dropReason: "TERMINAL_TRADE_STALE_ENTRY_MUTATION",
+      expectedVersion,
+      actualVersion: current?.version,
+    });
+    logger.info(staleMeta, "[trade] stale post-close patch dropped");
+    logger.info(staleMeta, "[trade] terminal trade mutation skipped");
+    return buildTerminalStaleNoopResult({
+      tradeId,
+      expectedVersion,
+      trade: current,
+      validation,
+      patchKeys: entryRelatedPatchKeys,
+      dropReason: "TERMINAL_TRADE_STALE_ENTRY_MUTATION",
+      actualVersion: current?.version,
+    });
+  }
 
   if (
     Object.prototype.hasOwnProperty.call(update, "stopLoss") &&
@@ -362,6 +533,39 @@ async function updateTrade(tradeId, patch, options = {}) {
         trade: null,
         validation,
       };
+    }
+
+    if (
+      entryRelatedPatchKeys.length > 0 &&
+      isTerminalTradeStatus(latest?.status)
+    ) {
+      const staleMeta = terminalStalePatchMeta({
+        tradeId,
+        currentStatus: normalizeTradeStatus(latest?.status),
+        attemptedStatus: Object.prototype.hasOwnProperty.call(update, "status")
+          ? normalizeTradeStatus(update.status)
+          : null,
+        options,
+        update,
+        patchKeys: entryRelatedPatchKeys,
+        dropReason: "TERMINAL_STALE_VERSION_CONFLICT",
+        expectedVersion,
+        actualVersion: latest?.version,
+      });
+      logger.info(staleMeta, "[trade] stale post-close patch dropped");
+      logger.info(
+        staleMeta,
+        "[trade] terminal stale version conflict downgraded to no-op",
+      );
+      return buildTerminalStaleNoopResult({
+        tradeId,
+        expectedVersion,
+        trade: latest,
+        validation,
+        patchKeys: entryRelatedPatchKeys,
+        dropReason: "TERMINAL_STALE_VERSION_CONFLICT",
+        actualVersion: latest?.version,
+      });
     }
 
     logger.warn(

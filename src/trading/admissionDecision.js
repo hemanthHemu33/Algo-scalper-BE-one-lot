@@ -1146,6 +1146,13 @@ function buildDecisionSignalPatch({
     legacyFallbackSupported: decisionMeta.legacyFallbackSupported,
     legacyFallbackUsed: decisionMeta.legacyFallbackUsed,
   };
+  const routedScoreForSummary = toFiniteOrNull(
+    meta?.routedScore ??
+      signal?.routeConfidence?.routedScore ??
+      priorConversionSummary?.routedConfidence ??
+      signal?.conversionSummary?.routedConfidence ??
+      (signal?.option_meta ? signal?.confidence : null),
+  );
   const priorPostRouteDecision = defaultPostRouteDecision(
     priorConversionSummary,
     signal,
@@ -1160,12 +1167,12 @@ function buildDecisionSignalPatch({
         : "BLOCKED_ADMISSION";
     patch.finalReasonCode = reason;
     if (reason === "POST_ROUTE_LOW_CONFIDENCE") {
-      patch.routedConfidence = toFiniteOrNull(meta?.conf ?? signal?.confidence);
+      patch.routedConfidence = routedScoreForSummary;
     }
   } else if (stage === "admission" && outcome === "ADJUSTED") {
     if (reason === "POST_ROUTE_CONFIDENCE_SOFT_PASS") {
       patch.postRouteDecision = "SOFT_PASS";
-      patch.routedConfidence = toFiniteOrNull(meta?.routedScore ?? meta?.conf);
+      patch.routedConfidence = routedScoreForSummary;
     } else if (reason === "MULTI_TF_TREND_TRANSITION_PASS") {
       patch.postRouteDecision = priorPostRouteDecision;
     }

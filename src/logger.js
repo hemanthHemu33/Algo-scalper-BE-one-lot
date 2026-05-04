@@ -1,4 +1,5 @@
 const pino = require("pino");
+const { recordRuntimeLog } = require("./runtime/runtimeLogStore");
 
 const logTimezone = process.env.LOG_TZ || "Asia/Kolkata";
 const prettyLogs = process.env.LOG_PRETTY !== "false";
@@ -36,5 +37,18 @@ const logger = pino({
     }
     : undefined
 });
+
+for (const level of ["trace", "debug", "info", "warn", "error", "fatal"]) {
+  const original = logger[level].bind(logger);
+  logger[level] = (...args) => {
+    if (
+      typeof logger.isLevelEnabled !== "function" ||
+      logger.isLevelEnabled(level)
+    ) {
+      recordRuntimeLog(level, args);
+    }
+    return original(...args);
+  };
+}
 
 module.exports = { logger };

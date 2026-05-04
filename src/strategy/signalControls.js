@@ -9,8 +9,143 @@ const {
   sessionContextSummary,
 } = require("./utils");
 const { resolveScoreCalibration } = require("./scoreCalibration");
+const { evaluateLevelAcceptance } = require("./levelAcceptance");
+const { computeDangerStack, resolveAdaptiveThresholds } = require("./dangerStack");
+const {
+  resolveMarketState,
+  buildStrategyPermissionMatrix,
+  DANGEROUS_STRATEGY_IDS,
+  SOFT_PENALTY_STRATEGY_IDS,
+  isFragileMarketState,
+} = require("./marketStateMachine");
+const {
+  evaluateRetryGovernor,
+  resetRetryGovernor,
+  getRetryGovernorSnapshot,
+} = require("./retryGovernor");
 const { env } = require("../config");
 const { logger } = require("../logger");
+
+const TREND_CONTINUATION_STRATEGIES = new Set([
+  "ema_cross",
+  "ema_pullback",
+  "breakout",
+  "volume_spike",
+  "bb_squeeze",
+]);
+const ACCEPTANCE_ACTIONABLE_LEVEL_TYPES = new Set([
+  "TRIGGER",
+  "RESISTANCE",
+  "SUPPORT",
+  "ANCHOR",
+]);
+
+function parseList(spec) {
+  return String(spec || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function safeNumber(value, fallback = null) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hasFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return false;
+  return Number.isFinite(Number(value));
+}
+
+function resolveDteDays(signal, context = {}) {
+  const candidates = [
+    signal?.dteDays,
+    signal?.dte,
+    signal?.meta?.dteDays,
+    signal?.meta?.dte,
+    signal?.regimeMeta?.dteDays,
+    context?.regimeMeta?.dteDays,
+    context?.dteDays,
+  ];
+  for (const candidate of candidates) {
+    const n = safeNumber(candidate, null);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function continuationStrategy(signal) {
+  const strategyId = String(signal?.strategyId || "").trim();
+  const style = String(signal?.strategyStyle || "").toUpperCase();
+  if (TREND_CONTINUATION_STRATEGIES.has(strategyId)) return true;
+  return style === "TREND" || style === "OPEN";
+}
+
+function resolveProductAdaptation({
+  marketState,
+  oneDte,
+  dangerStack,
+  levelAcceptance,
+}) {
+  const state = String(marketState || "").toUpperCase();
+  const danger = Number(dangerStack?.dangerStackScore ?? 0);
+  const repeatedRejection = levelAcceptance?.repeatedRejectionDetected === true;
+  let productRiskTier = "LOW";
+  let productRecommendation = "ALLOW";
+  let suggestedDtePolicy = "NEAREST_OK";
+  let riskSizeMultiplierRecommendation = 1;
+
+  if (state === "TREND_COMPRESSED") {
+    productRiskTier = "MEDIUM";
+    productRecommendation = oneDte ? "PREFER_FARTHER_DTE" : "ALLOW";
+    suggestedDtePolicy = "PREFER_2_TO_5_DTE";
+    riskSizeMultiplierRecommendation = 0.6;
+  } else if (state === "BREAKOUT_WATCH") {
+    productRiskTier = "MEDIUM";
+    productRecommendation = oneDte ? "PREFER_FARTHER_DTE" : "ALLOW";
+    suggestedDtePolicy = "PREFER_2_TO_5_DTE";
+    riskSizeMultiplierRecommendation = 0.45;
+  } else if (state === "FAILED_BREAKOUT" || state === "RANGE_CHOP") {
+    productRiskTier = "HIGH";
+    productRecommendation = oneDte ? "BLOCK" : "PREFER_FARTHER_DTE";
+    suggestedDtePolicy = "PREFER_3_TO_7_DTE";
+    riskSizeMultiplierRecommendation = 0.3;
+  } else if (state === "TRAP_RISK_HIGH" || state === "NO_TRADE") {
+    productRiskTier = "EXTREME";
+    productRecommendation = "BLOCK";
+    suggestedDtePolicy = "NO_TRADE";
+    riskSizeMultiplierRecommendation = 0;
+  }
+
+  if (danger >= 80) {
+    productRiskTier = "EXTREME";
+    productRecommendation = "BLOCK";
+    suggestedDtePolicy = "NO_TRADE";
+    riskSizeMultiplierRecommendation = 0;
+  } else if (danger >= 62 && productRiskTier === "LOW") {
+    productRiskTier = "MEDIUM";
+    riskSizeMultiplierRecommendation = Math.min(
+      riskSizeMultiplierRecommendation,
+      0.65,
+    );
+  }
+
+  let optionFragilityScore = 0;
+  if (oneDte) optionFragilityScore += 42;
+  if (danger > 0) optionFragilityScore += Math.min(40, danger * 0.35);
+  if (repeatedRejection) optionFragilityScore += 14;
+  optionFragilityScore = clamp(optionFragilityScore, 0, 100);
+
+  return {
+    productRiskTier,
+    productRecommendation,
+    suggestedDtePolicy,
+    riskSizeMultiplierRecommendation,
+    optionFragilityScore,
+    allowFragileContinuation:
+      productRecommendation === "ALLOW" || productRecommendation === "PREFER_FARTHER_DTE",
+  };
+}
 
 const STRATEGY_PROFILES = {
   ema_cross: { raw: { floor: 55, ceil: 100, shape: 1.05 }, bias: 0, coolingBars: 1, expiryBars: 6 },
@@ -303,15 +438,33 @@ function bucketRegimeAlignment(strategyStyle, regime, sessionPhase) {
     if (style === "RANGE") return 42;
   }
   if (bucket === "TREND_COMPRESSED") {
-    if (style === "TREND") return 87;
-    if (style === "RANGE") return 56;
+    if (style === "TREND") return 74;
+    if (style === "RANGE") return 62;
     if (style === "OPEN") return 60;
   }
 
   if (bucket === "BREAKOUT_WATCH") {
-    if (style === "TREND") return 84;
-    if (style === "OPEN") return 64;
-    if (style === "RANGE") return 54;
+    if (style === "TREND") return 66;
+    if (style === "OPEN") return 55;
+    if (style === "RANGE") return 64;
+  }
+  if (bucket === "FAILED_BREAKOUT") {
+    if (style === "TREND") return 48;
+    if (style === "OPEN") return 44;
+    if (style === "RANGE") return 69;
+  }
+  if (bucket === "RANGE_CHOP") {
+    if (style === "RANGE") return 88;
+    if (style === "TREND") return 42;
+    if (style === "OPEN") return 46;
+  }
+  if (bucket === "TRAP_RISK_HIGH") {
+    if (style === "TREND") return 35;
+    if (style === "OPEN") return 30;
+    if (style === "RANGE") return 48;
+  }
+  if (bucket === "NO_TRADE") {
+    return 15;
   }
   if (bucket === "RANGE") {
     if (style === "RANGE") return phase === "MIDDAY_COMPRESSION" ? 95 : 90;
@@ -346,11 +499,17 @@ function scoreRegimeAlignment(strategyStyle, regime, sessionPhase, regimeWeights
 }
 
 function inferChopPenalty(candidate, context) {
-  const regime = String(context?.regime || "").toUpperCase();
+  const regime = String(
+    context?.regimeMeta?.marketState || context?.regime || "",
+  ).toUpperCase();
   const style = String(candidate?.strategyStyle || "").toUpperCase();
   if (regime === "RANGE" && style === "TREND") return 18;
   if (regime === "TREND" && style === "RANGE") return 15;
-  if (regime === "TREND_COMPRESSED" && style === "RANGE") return 10;
+  if (regime === "TREND_COMPRESSED" && style === "RANGE") return 8;
+  if (regime === "BREAKOUT_WATCH" && style === "TREND") return 15;
+  if (regime === "FAILED_BREAKOUT" && style === "TREND") return 20;
+  if (regime === "TRAP_RISK_HIGH" && style === "TREND") return 24;
+  if (regime === "NO_TRADE") return 28;
   return 4;
 }
 
@@ -523,8 +682,26 @@ function readMtfAgreement(signal, context = {}) {
   const intervalMin = Number(context.intervalMin ?? 0);
   const currentTs = candleTs(context.last?.ts || context.last);
   const style = String(signal?.strategyStyle || "").toUpperCase();
+  const marketState = String(
+    signal?.marketState ||
+      signal?.meta?.marketState ||
+      context?.regimeMeta?.marketState ||
+      signal?.regimeSnapshot?.marketState ||
+      "",
+  )
+    .trim()
+    .toUpperCase();
+  const strictMtfEnabled =
+    String(env.COMPRESSED_STRICT_MTF_ENABLED ?? "true") === "true";
+  const strictFragileState =
+    strictMtfEnabled &&
+    (marketState === "TREND_COMPRESSED" ||
+      marketState === "BREAKOUT_WATCH" ||
+      marketState === "FAILED_BREAKOUT" ||
+      marketState === "TRAP_RISK_HIGH");
   const compressionActive =
     signal?.regimeSnapshot?.compressionActive === true ||
+    strictFragileState ||
     String(signal?.regime || signal?.primaryRegime || context?.regime || "").toUpperCase() ===
       "TREND_COMPRESSED";
   if (!Number.isFinite(token) || !Number.isFinite(intervalMin) || !Number.isFinite(currentTs)) {
@@ -540,6 +717,8 @@ function readMtfAgreement(signal, context = {}) {
       mtfFallbackReason: "INVALID_CONTEXT",
       mtfDegraded: true,
       mtfPenalty: 0,
+      mtfStrictnessPenalty: 0,
+      mtfStrictnessState: strictFragileState ? marketState : null,
       mtfInputs: null,
     };
   }
@@ -572,17 +751,29 @@ function readMtfAgreement(signal, context = {}) {
   );
 
   let penalty = 0;
+  const strictMissingPenalty = Math.max(
+    0,
+    Number(env.MISSING_HTF_EXTRA_PENALTY ?? 6),
+  );
+  const strictStalePenalty = Math.max(
+    0,
+    Number(env.STALE_HTF_EXTRA_PENALTY ?? 4),
+  );
+  const strictPartialPenalty = Math.max(
+    0,
+    Number(env.PARTIAL_ALIGN_EXTRA_PENALTY ?? 4),
+  );
   if (missingIntervals.length > 0) {
-    penalty += Math.min(
-      compressionActive && style !== "RANGE" ? 7 : 9,
-      missingIntervals.length * (compressionActive && style !== "RANGE" ? 3 : 4),
-    );
+    const perInterval = strictFragileState && style !== "RANGE" ? 6 : 4;
+    const maxPenalty = strictFragileState ? 20 : 12;
+    penalty += Math.min(maxPenalty, missingIntervals.length * perInterval);
+    if (strictFragileState) penalty += strictMissingPenalty;
   }
   if (staleIntervals.length > 0) {
-    penalty += Math.min(
-      compressionActive && style !== "RANGE" ? 8 : 12,
-      staleIntervals.length * (compressionActive && style !== "RANGE" ? 4 : 6),
-    );
+    const perInterval = strictFragileState && style !== "RANGE" ? 5 : 3;
+    const maxPenalty = strictFragileState ? 18 : 10;
+    penalty += Math.min(maxPenalty, staleIntervals.length * perInterval);
+    if (strictFragileState) penalty += strictStalePenalty;
   }
 
   if (!contributors.length) {
@@ -610,6 +801,8 @@ function readMtfAgreement(signal, context = {}) {
       mtfFallbackReason: fallbackReason,
       mtfDegraded: true,
       mtfPenalty: penalty,
+      mtfStrictnessPenalty: penalty,
+      mtfStrictnessState: strictFragileState ? marketState : null,
       mtfInputs: {
         expectedIntervals,
         usedIntervals: [],
@@ -620,8 +813,22 @@ function readMtfAgreement(signal, context = {}) {
     };
   }
   const total = contributors.reduce((sum, item) => sum + Number(item.contribution ?? 0), 0);
-  const mtfAgreementScore = clamp(60 + total - penalty, conflictFresh.length > 0 ? 20 : 44, 98);
+  let mtfAgreementScore = clamp(60 + total - penalty, conflictFresh.length > 0 ? 20 : 44, 98);
   const mtfBias = total > 3 ? "ALIGNED" : total < -3 ? "CONFLICT" : "NEUTRAL";
+  let strictnessPenalty = penalty;
+  if (
+    strictFragileState &&
+    style !== "RANGE" &&
+    mtfBias === "NEUTRAL" &&
+    Number(mtfAgreementScore) < 66
+  ) {
+    strictnessPenalty += strictPartialPenalty;
+    mtfAgreementScore = clamp(
+      Number(mtfAgreementScore) - strictPartialPenalty,
+      conflictFresh.length > 0 ? 20 : 38,
+      98,
+    );
+  }
   let mtfState = "NEUTRAL";
   if (conflictFresh.length > 0 && total < -3) {
     mtfState = "DISAGREEMENT";
@@ -657,6 +864,8 @@ function readMtfAgreement(signal, context = {}) {
     mtfFallbackReason: fallbackReason,
     mtfDegraded: missingIntervals.length > 0 || staleIntervals.length > 0,
     mtfPenalty: penalty,
+    mtfStrictnessPenalty: strictnessPenalty,
+    mtfStrictnessState: strictFragileState ? marketState : null,
     mtfInputs: {
       expectedIntervals,
       usedIntervals: usedIntervals.sort((a, b) => a - b),
@@ -727,39 +936,241 @@ function deriveStageScore(signal) {
 function buildScoreBreakdown(signal, context = {}) {
   const meta = signal?.meta || {};
   const sessionContext = strategySessionContext(context);
-  const rawConfidence = clamp(Number(signal?.confidence ?? 0), 0, 100);
+  const rawConfidenceOriginal = clamp(Number(signal?.confidence ?? 0), 0, 100);
   const calibration = resolveScoreCalibration(
     signal?.strategyId,
     signal?.strategyFamily,
     context.intervalMin,
   );
-  const normalizedConfidence = normalizeWithProfile(
-    rawConfidence,
+  let normalizedConfidence = normalizeWithProfile(
+    rawConfidenceOriginal,
     calibration.raw || strategyProfile(signal?.strategyId).raw,
   );
-  const patternQuality = clamp(Number(meta.patternQuality ?? rawConfidence), 0, 100);
+  const patternQuality = clamp(Number(meta.patternQuality ?? rawConfidenceOriginal), 0, 100);
   const volumeQuality = clamp(Number(meta.volumeQuality ?? 55), 0, 100);
   const anchorQuality = clamp(Number(meta.anchorQuality ?? 60), 0, 100);
-  const structureQuality = clamp(Number(meta.structureQuality ?? meta.patternQuality ?? rawConfidence), 0, 100);
+  const structureQuality = clamp(
+    Number(meta.structureQuality ?? meta.patternQuality ?? rawConfidenceOriginal),
+    0,
+    100,
+  );
   const freshness = clamp(Number(meta.setupFreshness ?? meta.freshness ?? 80), 0, 100);
+  const rawRegime = String(
+    context?.regime || meta?.primaryRegime || signal?.regime || "",
+  )
+    .trim()
+    .toUpperCase();
+  const primaryRegime = String(
+    meta?.primaryRegime || context?.regimeMeta?.primaryRegime || rawRegime || "UNKNOWN",
+  )
+    .trim()
+    .toUpperCase();
+  const secondaryRegime = String(
+    meta?.secondaryRegime || context?.regimeMeta?.secondaryRegime || "",
+  )
+    .trim()
+    .toUpperCase();
+  const regimeWeights =
+    meta?.regimeWeightsSnapshot || context?.regimeMeta?.regimeWeights || null;
+  const dteDays = resolveDteDays(signal, context);
+  const oneDte = hasFiniteNumber(dteDays) && Number(dteDays) <= 1;
+
+  const baseStateResolution = resolveMarketState({
+    regime: rawRegime,
+    primaryRegime,
+    secondaryRegime,
+    regimeWeights,
+    dteDays,
+    env,
+  });
+  const baseMarketState = baseStateResolution.marketState;
+
+  const levelAcceptance = evaluateLevelAcceptance({
+    candles: context?.candles || [],
+    signal,
+    context,
+    env,
+  });
+
+  const mtf = readMtfAgreement(
+    {
+      ...signal,
+      marketState: baseMarketState,
+      meta: {
+        ...(signal?.meta || {}),
+        marketState: baseMarketState,
+      },
+    },
+    {
+      ...context,
+      regimeMeta: {
+        ...(context?.regimeMeta || {}),
+        marketState: baseMarketState,
+      },
+    },
+  );
+
+  const retryGovernor = evaluateRetryGovernor({
+    candidate: signal,
+    context,
+    levelAcceptance,
+    marketState: baseMarketState,
+    env,
+  });
+
+  const dangerStack = computeDangerStack({
+    marketState: baseMarketState,
+    levelAcceptance,
+    mtf,
+    dteDays,
+    directionalPersistence:
+      safeNumber(context?.regimeMeta?.directionalPersistence, null) ||
+      safeNumber(meta?.directionalPersistence, null),
+    retryGovernor,
+    env,
+  });
+
+  const stateResolution = resolveMarketState({
+    regime: rawRegime,
+    primaryRegime,
+    secondaryRegime,
+    regimeWeights,
+    levelAcceptance,
+    dangerStack,
+    retryGovernor,
+    dteDays,
+    env,
+  });
+  const marketState = stateResolution.marketState;
+  const marketStateFamily = stateResolution.marketStateFamily;
+  const uglyState = isFragileMarketState(marketState);
+  const continuation = continuationStrategy(signal);
+  const strategyIdNorm = String(signal?.strategyId || "").trim();
+  const dangerousContinuation =
+    DANGEROUS_STRATEGY_IDS.has(strategyIdNorm) ||
+    SOFT_PENALTY_STRATEGY_IDS.has(strategyIdNorm) ||
+    strategyIdNorm === "ema_pullback";
+  const keyLevelTypeNorm = String(levelAcceptance?.keyLevelType || "")
+    .trim()
+    .toUpperCase();
+  const acceptanceActionableLevel =
+    ACCEPTANCE_ACTIONABLE_LEVEL_TYPES.has(keyLevelTypeNorm);
+
+  const productAdaptation = resolveProductAdaptation({
+    marketState,
+    oneDte,
+    dangerStack,
+    levelAcceptance,
+  });
+
+  const thresholds = resolveAdaptiveThresholds({
+    baseMinConfidence: Number(env.MIN_SIGNAL_CONFIDENCE ?? 70),
+    baseMinMtfAgreement: Number(env.SIGNAL_PREEMIT_GLOBAL_MIN_MTF_SCORE ?? 50),
+    baseMinAdmissionScore: Number(env.SIGNAL_PREEMIT_GLOBAL_MIN_FINAL_SCORE ?? 71),
+    baseMinAcceptanceScore: Number(env.LEVEL_ACCEPTANCE_MIN_SCORE ?? 55),
+    marketState,
+    dangerStackScore: dangerStack.dangerStackScore,
+    dteDays,
+    levelAcceptance,
+    mtf,
+    optionFragilityScore: productAdaptation.optionFragilityScore,
+    env,
+  });
+
+  const allStrategies = parseList(env.STRATEGIES || process.env.STRATEGIES || "");
+  const statePermission = buildStrategyPermissionMatrix({
+    marketState,
+    allowedStrategies: [String(signal?.strategyId || "").trim()],
+    allStrategies,
+    env,
+  });
+  const stateBlockedStrategy =
+    statePermission.allowedStrategies.length === 0 ||
+    statePermission.blockedStrategies.includes(String(signal?.strategyId || "").trim());
+
+  const oneDteHardeningEnabled =
+    String(env.ONE_DTE_HARDENING_ENABLED ?? "true") === "true";
+  const oneDteDangerLimit = Number(env.ONE_DTE_MAX_DANGER_TO_ALLOW ?? 62);
+  const oneDteBlockedByState =
+    oneDteHardeningEnabled &&
+    oneDte &&
+    dangerousContinuation &&
+    ((marketState === "TREND_COMPRESSED" &&
+      String(env.ONE_DTE_BLOCK_COMPRESSED_TREND ?? "true") === "true") ||
+      (marketState === "BREAKOUT_WATCH" &&
+        String(env.ONE_DTE_BLOCK_BREAKOUT_WATCH_TREND ?? "true") === "true") ||
+      ((marketState === "FAILED_BREAKOUT" || marketState === "TRAP_RISK_HIGH" || marketState === "NO_TRADE") &&
+        String(env.ONE_DTE_BLOCK_FAILED_BREAKOUT ?? "true") === "true"));
+
+  const acceptanceOverrideEnabled =
+    String(env.LEVEL_ACCEPTANCE_RETEST_OVERRIDE_ENABLED ?? "true") === "true";
+  const blockedByAcceptanceFailure =
+    continuation &&
+    uglyState &&
+    acceptanceActionableLevel &&
+    levelAcceptance?.acceptanceMeta?.nearEnough === true &&
+    levelAcceptance.breakoutAttemptDetected === true &&
+    levelAcceptance.breakoutAccepted !== true &&
+    !(acceptanceOverrideEnabled && levelAcceptance.retestAccepted === true);
+  const blockedByLevelRejection =
+    String(env.LEVEL_REJECTION_HARD_BLOCK_ENABLED ?? "true") === "true" &&
+    continuation &&
+    acceptanceActionableLevel &&
+    levelAcceptance?.acceptanceMeta?.nearEnough === true &&
+    levelAcceptance.repeatedRejectionDetected === true;
+  const blockedByRetryGovernor = retryGovernor.blocked === true;
+  const blockedByDangerStack = dangerStack.noTradeTriggered === true;
+  const blockedByMarketState =
+    marketState === "NO_TRADE" ||
+    (marketState === "TRAP_RISK_HIGH" && continuation);
+  const blockedByOneDteGate =
+    oneDteBlockedByState ||
+    (oneDteHardeningEnabled &&
+      oneDte &&
+      Number(dangerStack?.dangerStackScore ?? 0) > oneDteDangerLimit);
+
+  let finalReasonCode = "ALLOW_ADAPTIVE";
+  if (blockedByRetryGovernor) finalReasonCode = "BLOCKED_RETRY_GOVERNOR";
+  else if (blockedByMarketState) finalReasonCode = "BLOCKED_MARKET_STATE_NO_TRADE";
+  else if (blockedByDangerStack) finalReasonCode = "BLOCKED_DANGER_STACK_EXTREME";
+  else if (blockedByOneDteGate) finalReasonCode = "BLOCKED_ONE_DTE_FRAGILITY";
+  else if (blockedByLevelRejection) finalReasonCode = "BLOCKED_LEVEL_REJECTION_STACK";
+  else if (blockedByAcceptanceFailure) finalReasonCode = "BLOCKED_ACCEPTANCE_REQUIRED";
+  else if (stateBlockedStrategy) finalReasonCode = "BLOCKED_STRATEGY_BY_STATE";
+
+  const finalBlocked =
+    blockedByRetryGovernor ||
+    blockedByMarketState ||
+    blockedByDangerStack ||
+    blockedByOneDteGate ||
+    blockedByLevelRejection ||
+    blockedByAcceptanceFailure ||
+    stateBlockedStrategy;
+
   const chopPenalty = clamp(Number(meta.chopPenalty ?? inferChopPenalty(signal, context)), 0, 40);
-  const gapPenalty = clamp(Number(meta.gapPenalty ?? inferGapPenalty(signal, context, sessionContext)), 0, 20);
+  const gapPenalty = clamp(
+    Number(meta.gapPenalty ?? inferGapPenalty(signal, context, sessionContext)),
+    0,
+    20,
+  );
   const regimeAlignment = scoreRegimeAlignment(
     signal?.strategyStyle,
-    context?.regime,
+    marketState || context?.regime,
     meta.sessionPhase || context?.regimeMeta?.sessionPhase,
-    meta.regimeWeightsSnapshot || context?.regimeMeta?.regimeWeights,
+    regimeWeights,
   );
   const stageScore = deriveStageScore(signal);
-  const mtf = readMtfAgreement(signal, context);
   const selectorParticipation = clamp(
     Number(meta.strategyParticipationWeight ?? 1) * 100,
     0,
     100,
   );
 
-  const qualityScore = weightedScore({ patternQuality, volumeQuality, anchorQuality, structureQuality }, calibration.qualityWeights);
-  const contextScore = weightedScore(
+  const qualityScore = weightedScore(
+    { patternQuality, volumeQuality, anchorQuality, structureQuality },
+    calibration.qualityWeights,
+  );
+  let contextScore = weightedScore(
     {
       regimeAlignment,
       freshness,
@@ -771,16 +1182,41 @@ function buildScoreBreakdown(signal, context = {}) {
     },
     calibration.contextWeights,
   );
-  const finalSignalScore = clamp(
+  let finalSignalScore = clamp(
     weightedScore({ normalizedConfidence, qualityScore, contextScore }, calibration.finalWeights) +
       Number(strategyProfile(signal?.strategyId).bias ?? 0) +
       Number(calibration.bias ?? 0),
     0,
     100,
   );
+  let rawConfidence = rawConfidenceOriginal;
+
+  if (finalBlocked) {
+    const hardPenalty = Math.max(
+      18,
+      Math.round(16 + Number(dangerStack.dangerStackScore ?? 0) * 0.22),
+    );
+    rawConfidence = clamp(rawConfidenceOriginal - Math.round(hardPenalty * 0.58), 0, 100);
+    normalizedConfidence = clamp(
+      normalizedConfidence - Math.round(hardPenalty * 0.55),
+      0,
+      100,
+    );
+    contextScore = clamp(contextScore - Math.round(hardPenalty * 0.7), 0, 100);
+    finalSignalScore = clamp(finalSignalScore - hardPenalty, 0, 100);
+  } else if (dangerStack.degradedEdgeState === true || uglyState || oneDte) {
+    const softPenalty = Math.max(
+      4,
+      Math.round((Number(dangerStack.dangerStackScore ?? 0) / 100) * 12),
+    );
+    normalizedConfidence = clamp(normalizedConfidence - softPenalty, 0, 100);
+    contextScore = clamp(contextScore - Math.round(softPenalty * 0.7), 0, 100);
+    finalSignalScore = clamp(finalSignalScore - softPenalty, 0, 100);
+  }
 
   return {
     rawConfidence,
+    rawConfidenceOriginal,
     normalizedConfidence,
     patternQuality,
     volumeQuality,
@@ -806,7 +1242,68 @@ function buildScoreBreakdown(signal, context = {}) {
     mtfFallbackReason: mtf.mtfFallbackReason,
     mtfDegraded: mtf.mtfDegraded === true,
     mtfPenalty: mtf.mtfPenalty,
+    mtfStrictnessPenalty: mtf.mtfStrictnessPenalty,
+    mtfStrictnessState: mtf.mtfStrictnessState || null,
     mtfInputs: mtf.mtfInputs,
+    rawRegime,
+    primaryRegime,
+    secondaryRegime: secondaryRegime || null,
+    marketState,
+    marketStateFamily,
+    compressionActive:
+      String(primaryRegime).toUpperCase() === "TREND_COMPRESSED" ||
+      Number(regimeWeights?.TREND_COMPRESSED ?? 0) >= 0.35,
+    breakoutWatchActive:
+      String(primaryRegime).toUpperCase() === "BREAKOUT_WATCH" ||
+      Number(regimeWeights?.BREAKOUT_WATCH ?? 0) >= 0.24,
+    nearestKeyLevel: levelAcceptance.nearestKeyLevel,
+    keyLevelType: levelAcceptance.keyLevelType,
+    distanceToLevelAbs: levelAcceptance.distanceToLevelAbs,
+    distanceToLevelAtr: levelAcceptance.distanceToLevelAtr,
+    breakoutAttemptDetected: levelAcceptance.breakoutAttemptDetected,
+    breakoutAccepted: levelAcceptance.breakoutAccepted,
+    breakoutRejected: levelAcceptance.breakoutRejected,
+    retestAccepted: levelAcceptance.retestAccepted,
+    repeatedRejectionDetected: levelAcceptance.repeatedRejectionDetected,
+    rejectionSide: levelAcceptance.rejectionSide,
+    rejectionCount: levelAcceptance.rejectionCount,
+    acceptanceScore: levelAcceptance.acceptanceScore,
+    dangerStackScore: dangerStack.dangerStackScore,
+    dangerStackReasons: dangerStack.dangerStackReasons,
+    degradeTier: dangerStack.degradeTier,
+    degradedEdgeState: dangerStack.degradedEdgeState,
+    dte: Number.isFinite(Number(dteDays)) ? Number(dteDays) : null,
+    oneDteHardened: oneDteHardeningEnabled && oneDte,
+    oneDteBlocked: blockedByOneDteGate,
+    optionFragilityScore: productAdaptation.optionFragilityScore,
+    productRiskTier: productAdaptation.productRiskTier,
+    productRecommendation: productAdaptation.productRecommendation,
+    suggestedDtePolicy: productAdaptation.suggestedDtePolicy,
+    riskSizeMultiplierRecommendation:
+      productAdaptation.riskSizeMultiplierRecommendation,
+    allowFragileContinuation: productAdaptation.allowFragileContinuation === true,
+    baseMinConfidence: thresholds.baseMinConfidence,
+    resolvedMinConfidence: thresholds.resolvedMinConfidence,
+    baseMinMtfAgreement: thresholds.baseMinMtfAgreement,
+    resolvedMinMtfAgreement: thresholds.resolvedMinMtfAgreement,
+    baseMinAdmissionScore: thresholds.baseMinAdmissionScore,
+    resolvedMinAdmissionScore: thresholds.resolvedMinAdmissionScore,
+    baseMinAcceptanceScore: thresholds.baseMinAcceptanceScore,
+    resolvedAcceptanceScore: thresholds.resolvedAcceptanceScore,
+    thresholdUpliftBreakdown: thresholds.thresholdUpliftBreakdown,
+    blockedByMarketState,
+    blockedByAcceptanceFailure,
+    blockedByLevelRejection,
+    blockedByOneDteGate,
+    blockedByDangerStack,
+    blockedByRetryGovernor,
+    blockedByStrategyMatrix: stateBlockedStrategy,
+    finalDecision: finalBlocked ? "BLOCK" : "ALLOW",
+    finalReasonCode,
+    retryGovernorState: retryGovernor.state,
+    retryGovernorFailureCount: retryGovernor.failureCount,
+    retryGovernorBlockedUntil: retryGovernor.blockedUntil,
+    retryGovernorKey: retryGovernor.key,
     calibrationActive: calibration.active === true,
     calibrationVersion: calibration.version,
     calibrationSource: calibration.source,
@@ -832,12 +1329,34 @@ function buildScoreBreakdown(signal, context = {}) {
       mtfFallbackReason: mtf.mtfFallbackReason,
       mtfDegraded: mtf.mtfDegraded === true,
       mtfPenalty: mtf.mtfPenalty,
+      mtfStrictnessPenalty: mtf.mtfStrictnessPenalty,
+      mtfStrictnessState: mtf.mtfStrictnessState || null,
       mtfInputs: mtf.mtfInputs,
       selectorParticipation,
       calibrationVersion: calibration.version,
       calibrationSource: calibration.source,
       calibrationActive: calibration.active === true,
       fallbackReason: calibration.fallbackReason || null,
+      rawRegime,
+      primaryRegime,
+      secondaryRegime: secondaryRegime || null,
+      marketState,
+      marketStateFamily,
+      levelAcceptance,
+      dangerStack,
+      productAdaptation,
+      thresholds,
+      decision: {
+        blockedByMarketState,
+        blockedByAcceptanceFailure,
+        blockedByLevelRejection,
+        blockedByOneDteGate,
+        blockedByDangerStack,
+        blockedByRetryGovernor,
+        blockedByStrategyMatrix: stateBlockedStrategy,
+        finalDecision: finalBlocked ? "BLOCK" : "ALLOW",
+        finalReasonCode,
+      },
     },
   };
 }
@@ -880,6 +1399,62 @@ function decorateSignalCandidate(signal, context = {}) {
     triggerType: signal?.meta?.triggerType || signal?.triggerType || "PATTERN_TRIGGER",
     anchorType: signal?.meta?.anchorType || signal?.anchorType || "PRICE",
     freshness: scores.scoreBreakdown.freshness,
+    rawRegime: scores.rawRegime || null,
+    marketState: scores.marketState || null,
+    marketStateFamily: scores.marketStateFamily || null,
+    compressionActive: scores.compressionActive === true,
+    breakoutWatchActive: scores.breakoutWatchActive === true,
+    levelAcceptance: {
+      nearestKeyLevel: scores.nearestKeyLevel ?? null,
+      keyLevelType: scores.keyLevelType || null,
+      distanceToLevelAtr: scores.distanceToLevelAtr ?? null,
+      breakoutAttemptDetected: scores.breakoutAttemptDetected === true,
+      breakoutAccepted: scores.breakoutAccepted === true,
+      breakoutRejected: scores.breakoutRejected === true,
+      retestAccepted: scores.retestAccepted === true,
+      repeatedRejectionDetected: scores.repeatedRejectionDetected === true,
+      rejectionSide: scores.rejectionSide || null,
+      rejectionCount: Number(scores.rejectionCount ?? 0),
+      acceptanceScore: Number(scores.acceptanceScore ?? 0),
+    },
+    dangerStack: {
+      dangerStackScore: Number(scores.dangerStackScore ?? 0),
+      dangerStackReasons: scores.dangerStackReasons || [],
+      degradeTier: scores.degradeTier || "LOW",
+      degradedEdgeState: scores.degradedEdgeState === true,
+    },
+    adaptiveThresholds: {
+      baseMinConfidence: scores.baseMinConfidence ?? null,
+      resolvedMinConfidence: scores.resolvedMinConfidence ?? null,
+      baseMinMtfAgreement: scores.baseMinMtfAgreement ?? null,
+      resolvedMinMtfAgreement: scores.resolvedMinMtfAgreement ?? null,
+      baseMinAdmissionScore: scores.baseMinAdmissionScore ?? null,
+      resolvedMinAdmissionScore: scores.resolvedMinAdmissionScore ?? null,
+      resolvedAcceptanceScore: scores.resolvedAcceptanceScore ?? null,
+      thresholdUpliftBreakdown: scores.thresholdUpliftBreakdown || null,
+    },
+    productAdaptation: {
+      dte: scores.dte ?? null,
+      oneDteHardened: scores.oneDteHardened === true,
+      oneDteBlocked: scores.oneDteBlocked === true,
+      productRiskTier: scores.productRiskTier || null,
+      productRecommendation: scores.productRecommendation || null,
+      suggestedDtePolicy: scores.suggestedDtePolicy || null,
+      riskSizeMultiplierRecommendation:
+        scores.riskSizeMultiplierRecommendation ?? null,
+      optionFragilityScore: scores.optionFragilityScore ?? null,
+    },
+    adaptiveDecision: {
+      blockedByMarketState: scores.blockedByMarketState === true,
+      blockedByAcceptanceFailure: scores.blockedByAcceptanceFailure === true,
+      blockedByLevelRejection: scores.blockedByLevelRejection === true,
+      blockedByOneDteGate: scores.blockedByOneDteGate === true,
+      blockedByDangerStack: scores.blockedByDangerStack === true,
+      blockedByRetryGovernor: scores.blockedByRetryGovernor === true,
+      blockedByStrategyMatrix: scores.blockedByStrategyMatrix === true,
+      finalDecision: scores.finalDecision || "ALLOW",
+      finalReasonCode: scores.finalReasonCode || "ALLOW_ADAPTIVE",
+    },
   };
 
   return {
@@ -1048,6 +1623,17 @@ function buildStatePatch(candidate, context, currentTs, fingerprint, setupId) {
     strategyFamily: String(candidate?.strategyFamily || ""),
     side: String(candidate?.side || ""),
     regime: String(candidate?.regime || candidate?.meta?.primaryRegime || context?.regime || ""),
+    rawRegime: String(candidate?.rawRegime || candidate?.regime || context?.regime || ""),
+    marketState: String(candidate?.marketState || candidate?.meta?.marketState || ""),
+    marketStateFamily: String(
+      candidate?.marketStateFamily || candidate?.meta?.marketStateFamily || "",
+    ),
+    dangerStackScore: Number(candidate?.dangerStackScore ?? 0),
+    degradeTier: String(candidate?.degradeTier || ""),
+    dte: Number(candidate?.dte),
+    oneDteHardened: candidate?.oneDteHardened === true,
+    finalDecision: String(candidate?.finalDecision || ""),
+    finalReasonCode: String(candidate?.finalReasonCode || ""),
     fingerprint,
     setupId,
     parentSetupId: null,
@@ -1219,6 +1805,15 @@ function refreshStateFromCandidate(state, candidate, context, currentTs) {
     structureQuality: nextBase.structureQuality,
     qualityScore: nextBase.qualityScore,
     regime: nextBase.regime,
+    rawRegime: nextBase.rawRegime,
+    marketState: nextBase.marketState,
+    marketStateFamily: nextBase.marketStateFamily,
+    dangerStackScore: nextBase.dangerStackScore,
+    degradeTier: nextBase.degradeTier,
+    dte: nextBase.dte,
+    oneDteHardened: nextBase.oneDteHardened,
+    finalDecision: nextBase.finalDecision,
+    finalReasonCode: nextBase.finalReasonCode,
     regimeAlignment: nextBase.regimeAlignment,
     freshness: nextBase.freshness,
     antiChop: nextBase.antiChop,
@@ -1528,6 +2123,10 @@ function rememberFiredSignal(candidate, context = {}) {
       strategyId: String(candidate?.strategyId || ""),
       strategyStyle: String(candidate?.strategyStyle || ""),
       strategyFamily: String(candidate?.strategyFamily || ""),
+      marketState: String(candidate?.marketState || candidate?.meta?.marketState || ""),
+      marketStateFamily: String(
+        candidate?.marketStateFamily || candidate?.meta?.marketStateFamily || "",
+      ),
       setupId: String(candidate?.meta?.setupId || existing.setupId),
       lineageId: String(candidate?.meta?.lineageId || existing.lineageId || ""),
       finalSignalScore: Number(candidate?.finalSignalScore ?? 0),
@@ -1611,6 +2210,15 @@ module.exports = {
   getSignalLayerStateSnapshot,
   __debug: {
     buildFingerprint,
+    buildScoreBreakdown,
+    readMtfAgreement,
+    evaluateLevelAcceptance,
+    computeDangerStack,
+    resolveAdaptiveThresholds,
+    resolveProductAdaptation,
+    evaluateRetryGovernor,
+    resetRetryGovernor,
+    getRetryGovernorSnapshot,
     getSetupRegistrySnapshot,
     getIntervalSnapshots,
     describeSignalLayerPersistence,

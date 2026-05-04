@@ -2942,13 +2942,23 @@ async function testSignalSuppressedForStyleRegimeMismatch() {
       "style/regime mismatches should be suppressed before the signal reaches the live trade path",
     );
     assert.equal(captured.length, 1);
-    assert.equal(
+    assert.match(
       captured[0].payload.reasonCode,
-      "SIGNAL_SUPPRESSED_STYLE_REGIME_MISMATCH",
+      /^SIGNAL_SUPPRESSED_FRAGILE_REVERSAL_/,
     );
     assert.equal(captured[0].payload.strategyStyle, "RANGE");
     assert.equal(captured[0].payload.regime, "TREND_COMPRESSED");
     assert.equal(captured[0].payload.regimeFamily, "TREND");
+    assert.equal(captured[0].payload.exceptionChecked, true);
+    assert.equal(captured[0].payload.exceptionAllowed, false);
+    assert.match(
+      captured[0].payload.exceptionReasonCode,
+      /^FRAGILE_REVERSAL_/,
+    );
+    assert.equal(
+      captured[0].payload.conversionSummary.styleGateDecision,
+      "BLOCK",
+    );
   } finally {
     loggerRestore();
     storeRestore();

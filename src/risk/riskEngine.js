@@ -11,6 +11,7 @@ class RiskEngine {
   constructor({ limits, onStateChange, clock } = {}) {
     this.kill = false;
     this.consecutiveFailures = 0;
+    this.recentFailuresByScope = new Map(); // scope -> [{ ts, reason }]
     this.tradesToday = 0;
     this.openPositions = new Map(); // token -> {tradeId, side, qty}
     this.cooldownUntil = new Map(); // token -> timestamp
@@ -38,10 +39,241 @@ class RiskEngine {
     return this.limits || {};
   }
 
+  _failureWindowSec() {
+    const sec = Number(env.FAILURE_STREAK_WINDOW_SEC ?? 600);
+    return Number.isFinite(sec) && sec > 0 ? sec : 600;
+  }
+
+  _maxRecentEntryFailures() {
+    const max = Number(
+      env.MAX_RECENT_ENTRY_FAILURES ?? env.MAX_CONSECUTIVE_FAILURES ?? 3,
+    );
+    return Number.isFinite(max) && max > 0 ? max : 3;
+  }
+
+  _normalizeFailureSide(side) {
+    const s = String(side || "")
+      .trim()
+      .toUpperCase();
+    if (s === "BUY" || s === "SELL") return s;
+    return "";
+  }
+
+  _normalizeFailureUnderlying(underlying) {
+    const raw = String(underlying || "")
+      .trim()
+      .toUpperCase();
+    if (!raw) return "";
+    return raw.replace(/\s+/g, "");
+  }
+
+  _buildFailureScopeKey({
+    underlying,
+    side,
+    token,
+    instrumentToken,
+  } = {}) {
+    const normalizedSide = this._normalizeFailureSide(side);
+    if (!normalizedSide) return "";
+
+    const normalizedUnderlying = this._normalizeFailureUnderlying(underlying);
+    const fallbackToken = this._keyOf(instrumentToken ?? token);
+    const base = normalizedUnderlying || fallbackToken;
+    if (!base) return "";
+    return `${base}|${normalizedSide}`;
+  }
+
+  _sanitizeFailureEvents(events = []) {
+    if (!Array.isArray(events)) return [];
+    return events
+      .map((event) => {
+        const ts = Number(event?.ts);
+        if (!Number.isFinite(ts) || ts <= 0) return null;
+        const reason = String(event?.reason || "ENTRY_FAILURE")
+          .trim()
+          .toUpperCase();
+        return {
+          ts,
+          reason: reason || "ENTRY_FAILURE",
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.ts - b.ts);
+  }
+
+  _pruneExpiredFailures({
+    nowMs = this.clock.nowMs(),
+    emit = true,
+  } = {}) {
+    const cutoff = nowMs - this._failureWindowSec() * 1000;
+    let changed = false;
+
+    for (const [scope, events] of this.recentFailuresByScope.entries()) {
+      const sanitized = this._sanitizeFailureEvents(events);
+      const kept = sanitized.filter((event) => event.ts >= cutoff);
+      if (!kept.length) {
+        this.recentFailuresByScope.delete(scope);
+        changed = true;
+        continue;
+      }
+      const sizeChanged =
+        kept.length !== events.length || kept.length !== sanitized.length;
+      const orderChanged = sizeChanged
+        ? true
+        : kept.some((event, idx) => {
+            const prev = events[idx] || {};
+            return (
+              Number(prev.ts) !== Number(event.ts) ||
+              String(prev.reason || "") !== String(event.reason || "")
+            );
+          });
+      if (orderChanged) {
+        this.recentFailuresByScope.set(scope, kept);
+        changed = true;
+      }
+    }
+
+    if (changed && emit) this._emitStateChange();
+    return changed;
+  }
+
+  _getRecentFailuresForScope(
+    scopeOrContext,
+    {
+      nowMs = this.clock.nowMs(),
+      prune = true,
+      emitPrune = false,
+    } = {},
+  ) {
+    const scope =
+      typeof scopeOrContext === "string"
+        ? scopeOrContext.trim()
+        : this._buildFailureScopeKey(scopeOrContext || {});
+    if (!scope) return { scope: "", failures: [] };
+
+    const didPrune = prune
+      ? this._pruneExpiredFailures({ nowMs, emit: false })
+      : false;
+    if (didPrune && emitPrune) this._emitStateChange();
+
+    const failures = this._sanitizeFailureEvents(
+      this.recentFailuresByScope.get(scope) || [],
+    );
+    if (
+      emitPrune &&
+      failures.length !== (this.recentFailuresByScope.get(scope) || []).length
+    ) {
+      this.recentFailuresByScope.set(scope, failures);
+      this._emitStateChange();
+    }
+    return { scope, failures };
+  }
+
+  markEntryFailure(context = {}) {
+    const nowMs = this.clock.nowMs();
+    const didPrune = this._pruneExpiredFailures({ nowMs, emit: false });
+    const failureScope = this._buildFailureScopeKey(context || {});
+    const maxAllowed = this._maxRecentEntryFailures();
+    const windowSec = this._failureWindowSec();
+
+    if (!failureScope) {
+      if (didPrune) this._emitStateChange();
+      return {
+        recorded: false,
+        blocked: false,
+        failureScope: null,
+        failureCount: 0,
+        maxAllowed,
+        windowSec,
+      };
+    }
+
+    const reason = String(context.reason || "ENTRY_FAILURE")
+      .trim()
+      .toUpperCase();
+    const existing = this._sanitizeFailureEvents(
+      this.recentFailuresByScope.get(failureScope) || [],
+    );
+    const next = [...existing, { ts: nowMs, reason: reason || "ENTRY_FAILURE" }];
+    this.recentFailuresByScope.set(failureScope, next);
+
+    const oldestTs = next[0]?.ts ?? nowMs;
+    const newestTs = next[next.length - 1]?.ts ?? nowMs;
+    const failureCount = next.length;
+    const blocked = failureCount >= maxAllowed;
+
+    this._emitStateChange();
+
+    return {
+      recorded: true,
+      blocked,
+      failureScope,
+      failureCount,
+      maxAllowed,
+      windowSec,
+      recentFailureReasons: next.map((event) => event.reason),
+      oldestFailureAt: new Date(oldestTs).toISOString(),
+      newestFailureAt: new Date(newestTs).toISOString(),
+      unblockEstimateAt: new Date(oldestTs + windowSec * 1000).toISOString(),
+    };
+  }
+
+  clearRecentFailuresForScope(scopeOrContext = null) {
+    const failureScope =
+      typeof scopeOrContext === "string"
+        ? scopeOrContext.trim()
+        : this._buildFailureScopeKey(scopeOrContext || {});
+    if (!failureScope) return false;
+
+    const deleted = this.recentFailuresByScope.delete(failureScope);
+    if (deleted) this._emitStateChange();
+    return deleted;
+  }
+
+  getFailureBlockMeta(context = {}) {
+    const nowMs = this.clock.nowMs();
+    const didPrune = this._pruneExpiredFailures({ nowMs, emit: false });
+    const { scope, failures } = this._getRecentFailuresForScope(context, {
+      nowMs,
+      prune: false,
+    });
+    const maxAllowed = this._maxRecentEntryFailures();
+    const windowSec = this._failureWindowSec();
+    const blocked = failures.length >= maxAllowed;
+
+    if (didPrune) this._emitStateChange();
+    if (!blocked) {
+      return { blocked: false, meta: null };
+    }
+
+    const oldestTs = failures[0]?.ts ?? nowMs;
+    const newestTs = failures[failures.length - 1]?.ts ?? nowMs;
+    return {
+      blocked: true,
+      meta: {
+        failureScope: scope,
+        failureCount: failures.length,
+        maxAllowed,
+        windowSec,
+        recentFailureReasons: failures.map((event) => event.reason),
+        oldestFailureAt: new Date(oldestTs).toISOString(),
+        newestFailureAt: new Date(newestTs).toISOString(),
+        unblockEstimateAt: new Date(oldestTs + windowSec * 1000).toISOString(),
+      },
+    };
+  }
+
   getState() {
     return {
       kill: this.kill,
       consecutiveFailures: this.consecutiveFailures,
+      recentFailuresByScope: Array.from(
+        this.recentFailuresByScope.entries(),
+      ).reduce((acc, [scope, events]) => {
+        const sanitized = this._sanitizeFailureEvents(events);
+        if (sanitized.length) acc[scope] = sanitized;
+        return acc;
+      }, {}),
       tradesToday: this.tradesToday,
       openPositions: Array.from(this.openPositions.entries()).map(
         ([token, pos]) => ({
@@ -65,6 +297,19 @@ class RiskEngine {
     if (Number.isFinite(Number(state.consecutiveFailures))) {
       this.consecutiveFailures = Number(state.consecutiveFailures);
     }
+    if (
+      state.recentFailuresByScope &&
+      typeof state.recentFailuresByScope === "object"
+    ) {
+      const restored = new Map();
+      for (const [scope, events] of Object.entries(state.recentFailuresByScope)) {
+        const key = String(scope || "").trim();
+        if (!key) continue;
+        const sanitized = this._sanitizeFailureEvents(events);
+        if (sanitized.length) restored.set(key, sanitized);
+      }
+      this.recentFailuresByScope = restored;
+    }
     if (Number.isFinite(Number(state.tradesToday))) {
       this.tradesToday = Number(state.tradesToday);
     }
@@ -81,6 +326,8 @@ class RiskEngine {
         ]),
       );
     }
+    const didPrune = this._pruneExpiredFailures({ emit: false });
+    if (didPrune) this._emitStateChange();
   }
 
   _emitStateChange() {
@@ -116,7 +363,22 @@ class RiskEngine {
     return { token: key, seconds: sec, reason: reason || null };
   }
 
-  canTrade(token) {
+  canTrade(tokenOrContext, maybeContext = {}) {
+    let token = tokenOrContext;
+    let failureContext = maybeContext || {};
+    if (
+      tokenOrContext &&
+      typeof tokenOrContext === "object" &&
+      !Array.isArray(tokenOrContext)
+    ) {
+      failureContext = tokenOrContext;
+      token =
+        tokenOrContext.token ??
+        tokenOrContext.riskKey ??
+        tokenOrContext.key ??
+        tokenOrContext.instrumentToken ??
+        tokenOrContext.instrument_token;
+    }
     token = this._keyOf(token);
 
     if (isHalted()) return { ok: false, reason: "halted" };
@@ -161,8 +423,20 @@ class RiskEngine {
       return { ok: false, reason: "after_entry_cutoff" };
     }
 
-    if (this.consecutiveFailures >= Number(env.MAX_CONSECUTIVE_FAILURES ?? 3)) {
-      return { ok: false, reason: "too_many_failures" };
+    const failureBlock = this.getFailureBlockMeta({
+      token,
+      instrumentToken:
+        failureContext.instrumentToken ?? failureContext.instrument_token,
+      side: failureContext.side ?? failureContext.entrySide,
+      underlying:
+        failureContext.underlying ?? failureContext.underlying_symbol,
+    });
+    if (failureBlock.blocked) {
+      return {
+        ok: false,
+        reason: "too_many_failures",
+        meta: failureBlock.meta,
+      };
     }
 
     if (this.kill) return { ok: false, reason: "kill_switch" };
@@ -264,6 +538,7 @@ class RiskEngine {
 
   resetFailures() {
     this.consecutiveFailures = 0;
+    this.recentFailuresByScope.clear();
     this._emitStateChange();
   }
 

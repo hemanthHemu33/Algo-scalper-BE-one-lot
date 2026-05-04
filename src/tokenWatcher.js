@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const { env } = require("./config");
 const { logger } = require("./logger");
 const { alert } = require("./alerts/alertService");
@@ -13,9 +14,11 @@ const {
 const { updateLivePreflightContext } = require("./runtime/livePreflight");
 const { isTransientMongoError } = require("./runtime/isTransientMongoError");
 const {
-  markMongoHealthy,
-  markMongoDegraded,
-} = require("./runtime/mongoRuntimeState");
+  evaluateMongoWorkGate,
+  deferMongoWorkForError,
+  noteMongoWorkSuccess,
+} = require("./runtime/mongoWorkGate");
+const { getMongoRuntimeState } = require("./runtime/mongoRuntimeState");
 
 const watcherState = {
   lastReason: null,
@@ -26,6 +29,13 @@ const watcherState = {
   ),
   activeSource: null,
   staleTokenBlockedAt: null,
+  fallbackActive: false,
+  changeStreamRestartCount: 0,
+  changeStreamNextAttemptAt: null,
+  mongoSeverity: "HEALTHY",
+  lastMongoDeferAt: null,
+  hasValidToken: false,
+  lastTokenFingerprint: null,
 };
 
 function getTokenWatcherStatus() {
@@ -39,6 +49,18 @@ function isMongoWatcherTransientError(error) {
   );
 }
 
+function stableTokenFingerprint(accessToken, doc = null) {
+  const updatedAt = doc?.updatedAt || doc?.createdAt || "na";
+  const environment =
+    doc?.environment || env.TOKEN_FILTER_ENV || env.APP_ENV || env.NODE_ENV || "local";
+  const tokenHash = crypto
+    .createHash("sha1")
+    .update(String(accessToken || ""))
+    .digest("hex")
+    .slice(0, 12);
+  return `${environment}|${updatedAt}|${tokenHash}`;
+}
+
 async function watchLatestToken({ onToken }) {
   let lastToken = null;
   let changeStream = null;
@@ -48,10 +70,13 @@ async function watchLatestToken({ onToken }) {
   let stopped = false;
   let missing = false;
   let lastMissingAlertAt = 0;
-  let mongoDegraded = false;
-  let mongoBackoffMs = 0;
+  let mongoDeferred = false;
+  let changeStreamRetryMs = 0;
+  let nextChangeStreamAttemptAt = 0;
+  let changeStreamRestartCount = 0;
 
   const pollMs = Math.max(5000, Number(env.TOKEN_POLL_INTERVAL_MS ?? 30000));
+  const currentRefreshPriority = () => (lastToken ? "important" : "critical");
 
   const maybeNotifyMissing = async (meta) => {
     const now = Date.now();
@@ -70,7 +95,7 @@ async function watchLatestToken({ onToken }) {
     logger.error(details, "[tokenWatcher] kite access token missing");
     alert(
       "warn",
-      "ðŸ”‘ Kite access token missing. Please login to Kite and sync token to Mongo.",
+      "Kite access token missing. Please login to Kite and sync token to Mongo.",
       details,
     ).catch((err) => {
       reportFault({
@@ -97,41 +122,88 @@ async function watchLatestToken({ onToken }) {
     pollTimer.unref?.();
   };
 
-  const nextMongoBackoffMs = () => {
-    mongoBackoffMs = mongoBackoffMs
-      ? Math.min(mongoBackoffMs * 2, 30_000)
-      : 1_000;
-    return mongoBackoffMs;
+  const syncWatcherMongoState = () => {
+    const runtime = getMongoRuntimeState();
+    watcherState.mongoSeverity = runtime?.severity || "HEALTHY";
+    return watcherState.mongoSeverity;
   };
 
-  const clearMongoDegraded = () => {
-    if (!mongoDegraded) {
-      mongoBackoffMs = 0;
-      return;
+  const nextChangeStreamRetryDelayMs = () => {
+    const minMs = Math.max(
+      500,
+      Number(env.MONGO_CHANGE_STREAM_BACKOFF_MIN_MS ?? 1_000) || 1_000,
+    );
+    const maxMs = Math.max(
+      minMs,
+      Number(env.MONGO_CHANGE_STREAM_BACKOFF_MAX_MS ?? 60_000) || 60_000,
+    );
+    changeStreamRetryMs = changeStreamRetryMs
+      ? Math.min(changeStreamRetryMs * 2, maxMs)
+      : minMs;
+    const jitterPct = Math.max(
+      0,
+      Math.min(0.5, Number(env.MONGO_BACKOFF_JITTER_PCT ?? 0.2) || 0.2),
+    );
+    const delta = changeStreamRetryMs * jitterPct;
+    const jitter = delta ? (Math.random() * 2 - 1) * delta : 0;
+    return Math.max(minMs, Math.round(changeStreamRetryMs + jitter));
+  };
+
+  const scheduleChangeStreamRetry = (reason = "change_stream_retry", delayMs = null) => {
+    const delay = Math.max(
+      500,
+      Number(delayMs == null ? nextChangeStreamRetryDelayMs() : delayMs) || 1_000,
+    );
+    nextChangeStreamAttemptAt = Date.now() + delay;
+    watcherState.changeStreamNextAttemptAt = new Date(
+      nextChangeStreamAttemptAt,
+    ).toISOString();
+    watcherState.changeStreamRestartCount = changeStreamRestartCount;
+    schedulePoll(Math.min(delay, pollMs));
+    reportWindowedFault({
+      windowKey: "token_watcher_change_stream_retry_scheduled",
+      windowMs: 30_000,
+      code: "TOKENWATCHER_CHANGE_STREAM_RETRY",
+      message: "[tokenWatcher] change stream retry scheduled",
+      meta: { reason, delayMs: delay },
+    });
+  };
+
+  const markMongoWatcherRecovered = ({ release = null } = {}) => {
+    const health = noteMongoWorkSuccess({
+      subsystem: "token_watcher",
+      priority: currentRefreshPriority(),
+      release,
+    });
+    syncWatcherMongoState();
+    if (!mongoDeferred) return health;
+    mongoDeferred = false;
+    watcherState.fallbackActive = false;
+    if (health?.recovered) {
+      logger.info("[tokenWatcher] mongo recovered; watcher resumed");
     }
-    mongoDegraded = false;
-    mongoBackoffMs = 0;
-    markMongoHealthy();
-    logger.info("[tokenWatcher] mongo recovered");
+    return health;
   };
 
-  const deferForMongo = (error, reason) => {
-    const backoffMs = nextMongoBackoffMs();
-    mongoDegraded = true;
-    markMongoDegraded({
+  const deferForMongo = (error, reason, { release = null } = {}) => {
+    const deferred = deferMongoWorkForError({
+      subsystem: "token_watcher",
+      priority: currentRefreshPriority(),
       error,
       reason: `token_watcher_${reason}`,
-    });
-    reportWindowedFault({
+      phase: "watch",
       windowKey: "token_watcher_mongo_degraded",
-      windowMs: 30_000,
       code: "TOKENWATCHER_MONGO_DEGRADED",
-      err: error,
       message: "[tokenWatcher] mongo degraded; watcher deferred",
-      meta: { reason, backoffMs },
+      release,
     });
-    schedulePoll(backoffMs);
-    return { ok: false, deferred: true, backoffMs };
+    if (!deferred?.deferred) return null;
+    mongoDeferred = true;
+    watcherState.fallbackActive = true;
+    watcherState.lastMongoDeferAt = new Date().toISOString();
+    syncWatcherMongoState();
+    schedulePoll(deferred.backoffMs || pollMs);
+    return deferred;
   };
 
   const refreshAndNotify = async (reason = "manual") => {
@@ -145,8 +217,10 @@ async function watchLatestToken({ onToken }) {
       clearTrackedSession("missing_token");
       updateLivePreflightContext({ tokenDoc: null });
       watcherState.missing = true;
+      watcherState.hasValidToken = false;
       watcherState.lastReason = res?.reason || "NO_TOKEN";
       watcherState.activeSource = null;
+      watcherState.lastTokenFingerprint = null;
       logger.warn(
         {
           reason,
@@ -161,8 +235,11 @@ async function watchLatestToken({ onToken }) {
     }
 
     const accessToken = String(res.accessToken);
+    const tokenFingerprint = stableTokenFingerprint(accessToken, res?.doc || null);
     missing = false;
     watcherState.missing = false;
+    watcherState.hasValidToken = true;
+    watcherState.lastTokenFingerprint = tokenFingerprint;
     watcherState.lastUpdatedAt =
       res?.doc?.updatedAt || res?.doc?.createdAt || null;
     watcherState.activeSource = res?.doc?.sessionSource || "token_store";
@@ -191,6 +268,8 @@ async function watchLatestToken({ onToken }) {
       updateLivePreflightContext({ tokenDoc: res.doc });
       watcherState.lastReason = "PREVIOUS_TRADING_DAY_TOKEN";
       watcherState.staleTokenBlockedAt = new Date().toISOString();
+      watcherState.hasValidToken = false;
+      watcherState.lastTokenFingerprint = null;
       lastToken = null;
       logger.error(
         {
@@ -210,48 +289,60 @@ async function watchLatestToken({ onToken }) {
 
     if (accessToken === lastToken) {
       watcherState.lastReason = reason;
+      watcherState.hasValidToken = true;
+      watcherState.lastTokenFingerprint = tokenFingerprint;
       return { ok: true, unchanged: true };
     }
 
     lastToken = accessToken;
     watcherState.lastReason = reason;
+    watcherState.hasValidToken = true;
+    watcherState.lastTokenFingerprint = tokenFingerprint;
     trackSession({
       accessToken,
       doc: res?.doc || null,
       source: reason,
     });
     updateLivePreflightContext({ tokenDoc: res?.doc || null });
-    logger.info(
-      {
-        reason,
-        updatedAt: res?.doc?.updatedAt || null,
-        environment:
-          res?.doc?.environment || env.TOKEN_FILTER_ENV || env.APP_ENV || null,
-        sessionSource: res?.doc?.sessionSource || null,
-      },
-      "[token] loaded/updated",
-    );
-    alert("info", "ðŸ”‘ Kite token loaded/updated").catch((err) => {
-      reportFault({
-        code: "TOKENWATCHER_ASYNC",
-        err,
-        message: "[src/tokenWatcher.js] async task failed",
-      });
-    });
     await onToken(accessToken, res?.doc || null, reason);
     return { ok: true, updated: true };
   };
 
   const maybeStartChangeStream = async () => {
     if (stopped || changeStream || changeStreamDisabled) return;
+    if (nextChangeStreamAttemptAt && Date.now() < nextChangeStreamAttemptAt) {
+      return;
+    }
+    const gate = evaluateMongoWorkGate({
+      subsystem: "token_watcher",
+      priority: currentRefreshPriority(),
+      phase: "change stream start",
+      allowDuringSevere: !lastToken,
+      allowDuringSevereReason: !lastToken ? "token_bootstrap_required" : null,
+      windowKey: "token_watcher_gate_deferred",
+      code: "TOKENWATCHER_MONGO_DEFERRED",
+      message: "[tokenWatcher] change stream start deferred by mongo coordinator",
+    });
+    if (gate?.deferred) {
+      watcherState.fallbackActive = true;
+      syncWatcherMongoState();
+      scheduleChangeStreamRetry("mongo_gate", gate.backoffMs || null);
+      return;
+    }
 
+    let release = gate?.release || null;
     let col;
     try {
       col = getDb().collection(env.TOKENS_COLLECTION);
     } catch (error) {
       if (isMongoWatcherTransientError(error)) {
-        deferForMongo(error, "change_stream_start");
+        deferForMongo(error, "change_stream_start", { release });
+        scheduleChangeStreamRetry("db_unavailable");
         return;
+      }
+      if (typeof release === "function") {
+        release();
+        release = null;
       }
       throw error;
     }
@@ -269,6 +360,8 @@ async function watchLatestToken({ onToken }) {
       });
       changeStream.on("error", (err) => {
         changeStream = null;
+        changeStreamRestartCount += 1;
+        watcherState.changeStreamRestartCount = changeStreamRestartCount;
         if (isMongoWatcherTransientError(err)) {
           reportWindowedFault({
             windowKey: "token_watcher_change_stream_degraded",
@@ -278,6 +371,7 @@ async function watchLatestToken({ onToken }) {
             message: "[tokenWatcher] change stream degraded (will rely on polling)",
           });
           deferForMongo(err, "change_stream_error");
+          scheduleChangeStreamRetry("stream_error");
           return;
         }
         logger.warn(
@@ -286,6 +380,15 @@ async function watchLatestToken({ onToken }) {
         );
         changeStreamDisabled = true;
       });
+      changeStreamRetryMs = 0;
+      nextChangeStreamAttemptAt = 0;
+      watcherState.changeStreamNextAttemptAt = null;
+      watcherState.fallbackActive = false;
+      syncWatcherMongoState();
+      if (typeof release === "function") {
+        release();
+        release = null;
+      }
       logger.info("[tokenWatcher] change stream started (collection-wide)");
     } catch (e) {
       if (isMongoWatcherTransientError(e)) {
@@ -296,8 +399,13 @@ async function watchLatestToken({ onToken }) {
           err: e,
           message: "[tokenWatcher] change stream degraded (will rely on polling)",
         });
-        deferForMongo(e, "change_stream_start");
+        deferForMongo(e, "change_stream_start", { release });
+        scheduleChangeStreamRetry("start_failure");
         return;
+      }
+      if (typeof release === "function") {
+        release();
+        release = null;
       }
       logger.warn(
         { e: e?.message || String(e) },
@@ -311,15 +419,39 @@ async function watchLatestToken({ onToken }) {
     if (refreshInFlight) return refreshInFlight;
 
     refreshInFlight = (async () => {
+      let release = null;
       try {
+        const gate = evaluateMongoWorkGate({
+          subsystem: "token_watcher",
+          priority: currentRefreshPriority(),
+          phase: "token refresh",
+          allowDuringSevere: !lastToken,
+          allowDuringSevereReason: !lastToken ? "token_bootstrap_required" : null,
+          windowKey: "token_watcher_refresh_deferred",
+          code: "TOKENWATCHER_REFRESH_DEFERRED",
+          message: "[tokenWatcher] refresh deferred by mongo coordinator",
+        });
+        if (gate?.deferred) {
+          mongoDeferred = true;
+          watcherState.fallbackActive = true;
+          watcherState.lastMongoDeferAt = new Date().toISOString();
+          syncWatcherMongoState();
+          schedulePoll(gate.backoffMs || pollMs);
+          return gate;
+        }
+        release = gate?.release || null;
         const result = await refreshAndNotify(reason);
-        clearMongoDegraded();
+        markMongoWatcherRecovered({ release });
+        release = null;
         await maybeStartChangeStream();
         schedulePoll(pollMs);
         return result;
       } catch (error) {
         if (isMongoWatcherTransientError(error)) {
-          return deferForMongo(error, reason);
+          return deferForMongo(error, reason, { release });
+        }
+        if (typeof release === "function") {
+          release();
         }
         throw error;
       } finally {
@@ -329,6 +461,8 @@ async function watchLatestToken({ onToken }) {
 
     return refreshInFlight;
   };
+
+  syncWatcherMongoState();
 
   try {
     await runRefresh("startup");
@@ -340,6 +474,8 @@ async function watchLatestToken({ onToken }) {
 
   return () => {
     stopped = true;
+    watcherState.fallbackActive = false;
+    watcherState.changeStreamNextAttemptAt = null;
     if (pollTimer) clearTimeout(pollTimer);
     if (changeStream) {
       try {

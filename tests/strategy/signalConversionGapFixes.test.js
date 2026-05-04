@@ -265,38 +265,40 @@ function testConversionSummaryIsNormalized() {
     },
   );
 
-  assert.deepEqual(summary, {
-    signalId: "sig-42",
-    strategyId: "ema_pullback",
-    side: "BUY",
-    regime: "TREND",
-    profileId: "strategy:ema_pullback",
-    signalStage: "bar_close_confirmed",
-    preEmitDecision: "EMITTED",
-    preEmitFailureReasons: [],
-    mtfState: "DEGRADED_ALIGNMENT",
-    routeAttempted: true,
-    selectedContract: {
-      token: 71234,
-      underlying: "NIFTY",
-      optType: "CE",
-      strike: 25200,
-      expiry: "2026-04-02",
-      premium: 124.5,
-      spreadBps: 18,
-      healthScore: 74,
-      selectedByFallback: false,
-      fallbackReason: null,
-      premiumReadinessState: "partial",
-    },
-    preRouteScore: null,
-    expectedRouteAdjustment: null,
-    routedConfidence: null,
-    postRouteDecision: "PASSED",
-    riskFitDecision: "PASSED",
-    finalOutcome: "READY_FOR_EXECUTION",
-    finalReasonCode: "ENTRY_PLACED",
+  assert.equal(summary.signalId, "sig-42");
+  assert.equal(summary.strategyId, "ema_pullback");
+  assert.equal(summary.side, "BUY");
+  assert.equal(summary.regime, "TREND");
+  assert.equal(summary.regimeSource, "SIGNAL_FALLBACK");
+  assert.equal(summary.regimeFallbackReason, "SNAPSHOT_UNAVAILABLE");
+  assert.equal(summary.profileId, "strategy:ema_pullback");
+  assert.equal(summary.signalStage, "bar_close_confirmed");
+  assert.equal(summary.preEmitDecision, "EMITTED");
+  assert.deepEqual(summary.preEmitFailureReasons, []);
+  assert.equal(summary.mtfState, "DEGRADED_ALIGNMENT");
+  assert.equal(summary.routeAttempted, true);
+  assert.equal(summary.routeConfidenceBasis, "ACTUAL_INFERRED");
+  assert.deepEqual(summary.selectedContract, {
+    token: 71234,
+    underlying: "NIFTY",
+    optType: "CE",
+    strike: 25200,
+    expiry: "2026-04-02",
+    premium: 124.5,
+    spreadBps: 18,
+    healthScore: 74,
+    selectedByFallback: false,
+    fallbackReason: null,
+    premiumReadinessState: "partial",
   });
+  assert.equal(summary.preRouteScore, null);
+  assert.equal(summary.expectedRouteAdjustment, null);
+  assert.equal(summary.routedConfidence, null);
+  assert.equal(summary.postRouteDecision, "PASSED");
+  assert.equal(summary.riskFitDecision, "PASSED");
+  assert.equal(summary.readinessState, "partial");
+  assert.equal(summary.finalOutcome, "READY_FOR_EXECUTION");
+  assert.equal(summary.finalReasonCode, "ENTRY_PLACED");
 }
 
 function testRouteConfidenceCapsExcessiveNegativeAdjustments() {

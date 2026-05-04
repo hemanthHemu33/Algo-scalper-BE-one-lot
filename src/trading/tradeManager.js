@@ -161,6 +161,26 @@ const STATUS = {
   CLOSED: "CLOSED",
 };
 const PANIC_EXIT_STATE_PENDING = "PANIC_EXIT_PENDING";
+const TRADE_TERMINAL_STATUSES = new Set([
+  STATUS.EXITED_TARGET,
+  STATUS.EXITED_SL,
+  STATUS.ENTRY_FAILED,
+  STATUS.ENTRY_CANCELLED,
+  STATUS.CLOSED,
+]);
+const POSITION_REQUIRED_TRADE_STATUSES = new Set([
+  STATUS.ENTRY_FILLED,
+  STATUS.LIVE,
+  STATUS.SL_PLACED,
+  STATUS.SL_OPEN,
+  STATUS.SL_CONFIRMED,
+  STATUS.EXIT_PLACED,
+  STATUS.EXIT_OPEN,
+  STATUS.EXIT_PARTIAL,
+  STATUS.PANIC_EXIT_PLACED,
+  STATUS.RECOVERY_REHYDRATED,
+  STATUS.GUARD_FAILED,
+]);
 const EXEC_COMMAND = Object.freeze({
   APPLY_ORDER_UPDATE: "APPLY_ORDER_UPDATE",
   FINALIZE_ENTRY_FILL: "FINALIZE_ENTRY_FILL",
@@ -1316,6 +1336,42 @@ function parseOrderUpdateTimestampMs(order) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+function parseTimestampMs(value) {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function inferAttemptedTradeStatusFromOrderUpdate(role, status) {
+  const normalizedRole = String(role || "").toUpperCase();
+  const normalizedStatus = String(status || "").toUpperCase();
+
+  if (normalizedRole === "ENTRY") {
+    if (normalizedStatus === "COMPLETE") return STATUS.ENTRY_FILLED;
+    if (normalizedStatus === "OPEN" || normalizedStatus === "PARTIAL") {
+      return STATUS.ENTRY_OPEN;
+    }
+    if (normalizedStatus === "REJECTED") return STATUS.ENTRY_FAILED;
+    if (
+      ["CANCELLED", "CANCELED", "EXPIRED"].includes(normalizedStatus)
+    ) {
+      return STATUS.ENTRY_CANCELLED;
+    }
+  }
+
+  if (normalizedRole === "PANIC_EXIT" && normalizedStatus === "COMPLETE") {
+    return STATUS.CLOSED;
+  }
+  if (normalizedRole === "TARGET" && normalizedStatus === "COMPLETE") {
+    return STATUS.EXITED_TARGET;
+  }
+  if (normalizedRole === "SL" && normalizedStatus === "COMPLETE") {
+    return STATUS.EXITED_SL;
+  }
+
+  return null;
+}
+
 function buildOrderUpdateSignature(order) {
   return JSON.stringify({
     status: String(order?.status || "").toUpperCase(),
@@ -1327,6 +1383,14 @@ function buildOrderUpdateSignature(order) {
 }
 
 const ORDER_UPDATE_SIGNATURE_CACHE_LIMIT = 12;
+const TERMINAL_TELEMETRY_ONLY_ORDER_ROLES = new Set([
+  "ENTRY",
+  "PANIC_EXIT",
+  "SL",
+  "TARGET",
+  "TP1",
+  "TP2",
+]);
 const ENTRY_REPLAY_BLOCKED_STATUSES = new Set([
   STATUS.ENTRY_FILLED,
   STATUS.SL_PLACED,
@@ -1583,6 +1647,14 @@ function isTerminalOrderStatus(status) {
   return ["COMPLETE", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"].includes(
     s,
   );
+}
+
+function isTerminalTradeStatus(status) {
+  return TRADE_TERMINAL_STATUSES.has(String(status || "").toUpperCase());
+}
+
+function tradeStatusRequiresOpenPosition(status) {
+  return POSITION_REQUIRED_TRADE_STATUSES.has(String(status || "").toUpperCase());
 }
 
 function worseSlippageBps({ side, expected, actual, leg }) {
@@ -2534,6 +2606,7 @@ class TradeManager {
     this._stopped = false;
     this._stopPromise = null;
     this._activeTradeDbMarker = null;
+    this._activeTradeValidationMarker = null;
     this._liveOrderSnapshotsHydrated = false;
 
     // OCO race safety: remember the most recently closed trade for a short window
@@ -2669,6 +2742,11 @@ class TradeManager {
     // Reconcile debouncer (order-update driven)
     this._reconcileTimer = null;
     this._reconcileScheduledAt = 0;
+    this._reconcileRunner = null;
+    this._reconcileRunnerCoordinatorAware = false;
+    this._reconcileDebouncedInFlight = false;
+    this._reconcilePendingReason = null;
+    this._reconcileDeferredActive = false;
 
     this._virtualTargetFetchInFlight = new Set(); // tradeId -> in-flight
 
@@ -2709,6 +2787,12 @@ class TradeManager {
 
   setRuntimeGetCandles(fn) {
     this.runtimeGetCandles = typeof fn === "function" ? fn : null;
+  }
+
+  setReconcileRunner(fn, { coordinatorAware = false } = {}) {
+    this._reconcileRunner = typeof fn === "function" ? fn : null;
+    this._reconcileRunnerCoordinatorAware =
+      this._reconcileRunner !== null && coordinatorAware === true;
   }
 
   async _runTradeCommand(
@@ -2766,6 +2850,8 @@ class TradeManager {
     const context = this._tradeCommandContexts.get(tradeKey) || null;
     const executeWrite = async () => {
       const currentTrade = options?.currentTrade || context?.trade || null;
+      const commandType =
+        options?.commandType || context?.type || EXEC_COMMAND.DIRECT_PATCH;
       const expectedVersion = Number.isInteger(Number(options?.expectedVersion))
         ? Number(options.expectedVersion)
         : context
@@ -2775,6 +2861,7 @@ class TradeManager {
         ...options,
         currentTrade,
         expectedVersion,
+        commandType,
       });
 
       if (
@@ -2807,7 +2894,7 @@ class TradeManager {
       if (result.status === "CONFLICT") {
         const err = new Error(
           `[trade] version conflict tradeId=${tradeKey} command=${String(
-            options?.commandType || context?.type || EXEC_COMMAND.DIRECT_PATCH,
+            commandType,
           )}`,
         );
         err.code = "TRADE_VERSION_CONFLICT";
@@ -2826,10 +2913,7 @@ class TradeManager {
       if (result.status === "APPLIED" && result.trade) {
         observeBackgroundTask(
           this._notifyTradeStateChange(currentTrade, result.trade, {
-            source:
-              options?.commandType ||
-              context?.type ||
-              EXEC_COMMAND.DIRECT_PATCH,
+            source: commandType,
           }),
           (err) => {
             reportFault({
@@ -2860,6 +2944,107 @@ class TradeManager {
         allowMissing: Boolean(options?.allowMissing),
       },
     );
+  }
+
+  _resolveTerminalTradeFenceTsMs(trade) {
+    const candidates = [
+      parseTimestampMs(trade?.closedAt),
+      parseTimestampMs(trade?.exitAt),
+      parseTimestampMs(trade?.lastEventAt),
+    ].filter((value) => Number.isFinite(value) && value > 0);
+
+    const tradeId = String(trade?.tradeId || "");
+    if (
+      tradeId &&
+      tradeId === String(this.lastClosedTradeId || "") &&
+      Number.isFinite(Number(this.lastClosedAt)) &&
+      Number(this.lastClosedAt) > 0
+    ) {
+      candidates.push(Number(this.lastClosedAt));
+    }
+
+    if (!candidates.length) return null;
+    return Math.max(...candidates);
+  }
+
+  _shouldSuppressTerminalOrderMutation({ trade, role, status, order }) {
+    const currentStatus = String(trade?.status || "").toUpperCase();
+    const eventRole = String(role || "").toUpperCase();
+    if (!isTerminalTradeStatus(currentStatus)) {
+      return { suppress: false };
+    }
+    if (!TERMINAL_TELEMETRY_ONLY_ORDER_ROLES.has(eventRole)) {
+      return { suppress: false };
+    }
+
+    const terminalFenceTs = this._resolveTerminalTradeFenceTsMs(trade);
+    const updateTs = parseOrderUpdateTimestampMs(order) ?? parseOrderTimestampMs(order);
+    if (eventRole === "ENTRY") {
+      return {
+        suppress: true,
+        dropReason: "TERMINAL_ENTRY_UPDATE_SUPPRESSED",
+        currentStatus,
+        updateTs,
+        terminalFenceTs,
+      };
+    }
+    if (!Number.isFinite(updateTs)) {
+      return {
+        suppress: true,
+        dropReason: "TERMINAL_ORDER_UPDATE_TS_MISSING",
+        currentStatus,
+        updateTs: null,
+        terminalFenceTs,
+      };
+    }
+    if (!Number.isFinite(terminalFenceTs)) {
+      return {
+        suppress: true,
+        dropReason: "TERMINAL_ORDER_EVENT_FENCE_MISSING",
+        currentStatus,
+        updateTs,
+        terminalFenceTs: null,
+      };
+    }
+    if (updateTs <= terminalFenceTs) {
+      return {
+        suppress: true,
+        dropReason: "EVENT_OLDER_THAN_TERMINAL_CLOSE",
+        currentStatus,
+        updateTs,
+        terminalFenceTs,
+      };
+    }
+    return { suppress: false };
+  }
+
+  _logTerminalOrderMutationSuppressed({
+    trade,
+    role,
+    orderStatus,
+    orderId,
+    attemptedStatus,
+    dropReason,
+    updateTs,
+    terminalFenceTs,
+  }) {
+    const meta = {
+      tradeId: trade?.tradeId || null,
+      currentStatus: String(trade?.status || "").toUpperCase() || null,
+      attemptedStatus: attemptedStatus || null,
+      command: EXEC_COMMAND.APPLY_ORDER_UPDATE,
+      eventRole: String(role || "").toUpperCase() || null,
+      patchKeys: ["status"],
+      dropReason: dropReason || "TERMINAL_ORDER_MUTATION_SUPPRESSED",
+      orderId: orderId || null,
+      orderStatus: String(orderStatus || "").toUpperCase() || null,
+      updateTs: Number.isFinite(updateTs) ? new Date(updateTs).toISOString() : null,
+      terminalFenceTs: Number.isFinite(terminalFenceTs)
+        ? new Date(terminalFenceTs).toISOString()
+        : null,
+    };
+    logger.info(meta, "[order_update] stale delayed order update recorded as telemetry-only");
+    logger.info(meta, "[trade] terminal trade mutation skipped");
   }
 
   _buildTradeNotificationRuntime(trade = null) {
@@ -3091,6 +3276,337 @@ class TradeManager {
     this._virtualTargetFetchInFlight.delete(id);
   }
 
+  _clearActiveTradeRuntimeState(
+    tradeId,
+    { instrumentToken = null, reason = "UNSPECIFIED", source = "runtime" } = {},
+  ) {
+    const id = String(tradeId || "");
+    if (!id) {
+      return {
+        staleTradeId: id,
+        clearedRuntime: false,
+        clearedActiveTrade: false,
+        reason,
+        source,
+      };
+    }
+
+    const runtimeActiveId = String(this.activeTradeId || "");
+    const activeTradeMatches = runtimeActiveId === id;
+    const token = Number(instrumentToken ?? NaN);
+    const recoveredToken = Number(this?.recoveredPosition?.instrument_token ?? NaN);
+    const tokenMatchesRecovered =
+      Number.isFinite(token) &&
+      Number.isFinite(recoveredToken) &&
+      Number(token) === Number(recoveredToken);
+
+    this._cleanupTradeRuntimeState(id);
+
+    if (activeTradeMatches) {
+      this.activeTradeId = null;
+      this._activeTradeToken = null;
+      this._activeTradeSide = null;
+      this.recoveredPosition = null;
+      this._activeTradeDbMarker = null;
+    } else if (!this.activeTradeId && tokenMatchesRecovered) {
+      this.recoveredPosition = null;
+    }
+
+    this._activeTradeValidationMarker = null;
+
+    return {
+      staleTradeId: id,
+      clearedRuntime: true,
+      clearedActiveTrade: activeTradeMatches,
+      reason: String(reason || "UNSPECIFIED"),
+      source: String(source || "runtime"),
+    };
+  }
+
+  async _resolveProtectiveOrderLiveness(trade, byId = null) {
+    const exitOrderIds = [
+      trade?.slOrderId,
+      trade?.targetOrderId,
+      trade?.tp1OrderId,
+      trade?.tp2OrderId,
+      trade?.panicExitOrderId,
+    ]
+      .map((x) => String(x || ""))
+      .filter(Boolean);
+
+    if (!exitOrderIds.length) {
+      return {
+        exitOrderIds,
+        hasLiveProtectiveOrders: false,
+        lookupFailed: false,
+      };
+    }
+
+    let lookupFailed = false;
+    for (const oid of exitOrderIds) {
+      const known = (byId && byId.get(oid)) || this._lastOrdersById.get(oid) || null;
+      let status = String(known?.status || "").toUpperCase();
+      if (!status && typeof this._getOrderStatus === "function") {
+        try {
+          const latest = await this._getOrderStatus(oid);
+          status = String(latest?.status || "").toUpperCase();
+        } catch (err) {
+          lookupFailed = true;
+          logger.warn(
+            {
+              tradeId: trade?.tradeId,
+              orderId: oid,
+              e: err?.message || String(err),
+            },
+            "[trade] protective order lookup failed during stale-active validation",
+          );
+          continue;
+        }
+      }
+
+      if (!status) continue;
+      if (!isTerminalOrderStatus(status)) {
+        return {
+          exitOrderIds,
+          hasLiveProtectiveOrders: true,
+          lookupFailed,
+        };
+      }
+    }
+
+    return {
+      exitOrderIds,
+      hasLiveProtectiveOrders: false,
+      lookupFailed,
+    };
+  }
+
+  async _validateAndHealActiveTradeRuntimeState({
+    source = "runtime",
+    activeTrades = null,
+    posQtyByToken = null,
+    ordersById = null,
+  } = {}) {
+    const staleTradeId = String(this.activeTradeId || "");
+    if (!staleTradeId) {
+      return {
+        checked: false,
+        active: false,
+        staleCleared: false,
+        reason: "no_runtime_active_trade",
+      };
+    }
+
+    let trade = null;
+    try {
+      trade = await getTrade(staleTradeId);
+    } catch (err) {
+      logger.warn(
+        {
+          source,
+          tradeId: staleTradeId,
+          e: err?.message || String(err),
+        },
+        "[trade] active-trade validation deferred (trade lookup failed)",
+      );
+      return {
+        checked: true,
+        active: true,
+        staleCleared: false,
+        retained: true,
+        uncertain: true,
+        reason: "trade_lookup_failed",
+      };
+    }
+
+    const clearStaleRuntime = ({
+      reason,
+      dbStatus = null,
+      brokerPositionState = "unknown",
+    }) => {
+      logger.warn(
+        {
+          source,
+          staleTradeId,
+          reason,
+          dbStatus,
+          brokerPositionState,
+        },
+        "[trade] stale active-trade detected",
+      );
+      const cleared = this._clearActiveTradeRuntimeState(staleTradeId, {
+        instrumentToken: trade?.instrument_token ?? null,
+        reason,
+        source,
+      });
+      const clearMessage =
+        source === "signal_gate"
+          ? "[trade] cleared stale active trade before signal gate"
+          : source === "reconcile"
+            ? "[reconcile] healed stale active-trade runtime state"
+            : "[trade] stale active-trade cleared";
+      logger.info(
+        {
+          source,
+          staleTradeId,
+          reason,
+          dbStatus,
+          brokerPositionState,
+          clearedActiveTrade: Boolean(cleared?.clearedActiveTrade),
+        },
+        clearMessage,
+      );
+      return {
+        checked: true,
+        active: false,
+        staleCleared: true,
+        reason,
+        dbStatus,
+        brokerPositionState,
+      };
+    };
+
+    if (!trade) {
+      return clearStaleRuntime({
+        reason: "trade_record_missing",
+        dbStatus: null,
+        brokerPositionState: "unknown",
+      });
+    }
+
+    const dbStatus = String(trade?.status || "").toUpperCase();
+    if (isTerminalTradeStatus(dbStatus)) {
+      return clearStaleRuntime({
+        reason: "trade_terminal_in_db",
+        dbStatus,
+        brokerPositionState: "unknown",
+      });
+    }
+
+    let brokerPositionState = "unknown";
+    let netQty = null;
+    const token = Number(trade?.instrument_token);
+    if (Number.isFinite(token)) {
+      if (posQtyByToken instanceof Map) {
+        netQty = Number(posQtyByToken.get(token) ?? 0);
+        if (Number.isFinite(netQty)) {
+          brokerPositionState = netQty === 0 ? "flat" : "open";
+        }
+      } else if (this.kite && typeof this.kite.getPositions === "function") {
+        try {
+          const positions = await this.kite.getPositions();
+          const net = positions?.net || positions?.day || [];
+          const p = Array.isArray(net)
+            ? net.find((x) => Number(x?.instrument_token) === token)
+            : null;
+          netQty = Number(p?.quantity ?? p?.net_quantity ?? 0);
+          if (Number.isFinite(netQty)) {
+            brokerPositionState = netQty === 0 ? "flat" : "open";
+          }
+        } catch (err) {
+          logger.warn(
+            {
+              source,
+              staleTradeId,
+              token,
+              e: err?.message || String(err),
+            },
+            "[trade] active-trade validation deferred (broker position lookup failed)",
+          );
+        }
+      }
+    }
+
+    const expectsOpenPosition = tradeStatusRequiresOpenPosition(dbStatus);
+    if (expectsOpenPosition && brokerPositionState === "flat") {
+      const liveness = await this._resolveProtectiveOrderLiveness(trade, ordersById);
+      if (liveness.lookupFailed) {
+        return {
+          checked: true,
+          active: true,
+          staleCleared: false,
+          retained: true,
+          uncertain: true,
+          reason: "protective_order_lookup_failed",
+          dbStatus,
+          brokerPositionState,
+        };
+      }
+      if (!liveness.hasLiveProtectiveOrders) {
+        let staleReason = "broker_flat_no_live_protection";
+        try {
+          const flatCheck = await this._isFlatStateLikelyExitInProgress(
+            trade,
+            ordersById,
+          );
+          if (flatCheck?.reason) {
+            staleReason = `broker_flat_${String(flatCheck.reason)}`;
+          }
+        } catch (err) {
+          logger.warn(
+            {
+              source,
+              staleTradeId,
+              e: err?.message || String(err),
+            },
+            "[trade] stale-active flat validation fallback used",
+          );
+        }
+        return clearStaleRuntime({
+          reason: staleReason,
+          dbStatus,
+          brokerPositionState,
+        });
+      }
+    }
+
+    if (
+      Array.isArray(activeTrades) &&
+      activeTrades.length === 0 &&
+      source === "reconcile"
+    ) {
+      logger.warn(
+        {
+          source,
+          tradeId: staleTradeId,
+          dbStatus,
+          brokerPositionState,
+        },
+        "[reconcile] runtime active trade not present in active DB scan; retained pending confirmation",
+      );
+    }
+
+    const retainMarker = [
+      source,
+      staleTradeId,
+      dbStatus,
+      brokerPositionState,
+      netQty,
+    ].join("|");
+    if (this._activeTradeValidationMarker !== retainMarker) {
+      logger.info(
+        {
+          source,
+          tradeId: staleTradeId,
+          dbStatus,
+          brokerPositionState,
+        },
+        "[trade] active trade retained (validated live)",
+      );
+      this._activeTradeValidationMarker = retainMarker;
+    }
+
+    return {
+      checked: true,
+      active: true,
+      staleCleared: false,
+      retained: true,
+      reason: "active_trade_valid",
+      dbStatus,
+      brokerPositionState,
+    };
+  }
+
   _cleanupAllRuntimeState() {
     for (const tradeId of this._collectTrackedTradeIds()) {
       this._cleanupTradeRuntimeState(tradeId);
@@ -3134,6 +3650,9 @@ class TradeManager {
         this._reconcileTimer = null;
       }
       this._reconcileScheduledAt = 0;
+      this._reconcileDebouncedInFlight = false;
+      this._reconcilePendingReason = null;
+      this._reconcileDeferredActive = false;
       this._cleanupAllRuntimeState();
       logger.info("[trade_manager] stopped");
     })();
@@ -3600,6 +4119,85 @@ class TradeManager {
     });
   }
 
+  _entryFailureScopeContext(trade = {}, overrides = {}) {
+    return {
+      token:
+        overrides.token ??
+        trade?.instrument_token ??
+        trade?.instrumentToken ??
+        trade?.token ??
+        null,
+      instrumentToken:
+        overrides.instrumentToken ??
+        overrides.token ??
+        trade?.instrument_token ??
+        trade?.instrumentToken ??
+        trade?.token ??
+        null,
+      side:
+        String(overrides.side ?? trade?.side ?? "")
+          .trim()
+          .toUpperCase() || null,
+      underlying:
+        overrides.underlying ??
+        trade?.underlying_symbol ??
+        trade?.option_meta?.underlying ??
+        trade?.instrument?.name ??
+        trade?.instrument?.tradingsymbol ??
+        null,
+    };
+  }
+
+  _normalizeEntryFailureReason(reason) {
+    const text = String(reason || "")
+      .trim()
+      .toUpperCase();
+    if (!text) return null;
+    if (text.includes("ENTRY_PLACE_FAILED")) return "ENTRY_PLACE_FAILED";
+    if (text.includes("ENTRY_REJECTED") || /\bREJECTED\b/.test(text)) {
+      return "ENTRY_REJECTED";
+    }
+    if (text.includes("ENTRY_LAPSED") || /\bLAPSED\b/.test(text)) {
+      return "ENTRY_LAPSED";
+    }
+    if (
+      text.includes("ENTRY_CANCELLED") ||
+      text.includes("ENTRY_CANCELED") ||
+      /\bCANCELLED\b/.test(text) ||
+      /\bCANCELED\b/.test(text)
+    ) {
+      return "ENTRY_CANCELLED";
+    }
+    return null;
+  }
+
+  _markRecentEntryFailure({ trade, token, instrumentToken, side, underlying, reason }) {
+    const normalizedReason = this._normalizeEntryFailureReason(reason);
+    if (!normalizedReason || !this.risk?.markEntryFailure) return null;
+    return this.risk.markEntryFailure({
+      ...this._entryFailureScopeContext(trade, {
+        token,
+        instrumentToken,
+        side,
+        underlying,
+      }),
+      reason: normalizedReason,
+    });
+  }
+
+  _clearRecentEntryFailuresForTrade(trade = {}, overrides = {}) {
+    if (this.risk?.clearRecentFailuresForScope) {
+      return this.risk.clearRecentFailuresForScope(
+        this._entryFailureScopeContext(trade, overrides),
+      );
+    }
+    if (this.risk?.resetFailures) {
+      this.risk.resetFailures();
+      return true;
+    }
+    return false;
+  }
+
   _tradeNeedsFactRecovery(trade) {
     const status = String(trade?.status || "").toUpperCase();
     const liveStatuses = new Set([
@@ -3750,7 +4348,7 @@ class TradeManager {
         this.risk.resetFailures();
         this.risk.setKillSwitch(false);
         logger.warn(
-          "[risk] RESET_FAILURES_ON_START enabled: cleared consecutive failures and kill switch",
+          "[risk] RESET_FAILURES_ON_START enabled: cleared failure state and kill switch",
         );
       }
       await this.refreshRiskLimits();
@@ -4272,6 +4870,7 @@ class TradeManager {
       this.risk.applyState({
         kill: rs.kill,
         consecutiveFailures: rs.consecutiveFailures,
+        recentFailuresByScope: rs.recentFailuresByScope,
         tradesToday: rs.tradesToday,
         openPositions: rs.openPositions,
         cooldownUntil: rs.cooldownUntil,
@@ -4284,6 +4883,11 @@ class TradeManager {
     await upsertRiskState(todayKey(), {
       kill: !!state.kill,
       consecutiveFailures: Number(state.consecutiveFailures ?? 0),
+      recentFailuresByScope:
+        state.recentFailuresByScope &&
+        typeof state.recentFailuresByScope === "object"
+          ? state.recentFailuresByScope
+          : {},
       tradesToday: Number(state.tradesToday ?? 0),
       openPositions: Array.isArray(state.openPositions)
         ? state.openPositions
@@ -5840,7 +6444,7 @@ class TradeManager {
     );
 
     await this._updateTrade(tradeId, riskPatch.patch);
-    this.risk.resetFailures();
+    this._clearRecentEntryFailuresForTrade(patchedTrade);
 
     const afterRiskPatch = (await getTrade(tradeId)) || patchedTrade;
     await this._placeExitsIfMissing({
@@ -6039,6 +6643,15 @@ class TradeManager {
             stage: "entry_timeout",
             reason: `ENTRY_${status}`,
             meta: { source, recovered: true },
+          });
+          this._markRecentEntryFailure({
+            trade,
+            token: trade?.instrument_token,
+            instrumentToken: trade?.instrument_token,
+            side: trade?.side,
+            underlying:
+              trade?.underlying_symbol || trade?.option_meta?.underlying || null,
+            reason: `ENTRY_${status}`,
           });
           await this._finalizeClosed(tradeId, trade.instrument_token);
           return { ok: true, cancelled: true, status };
@@ -6324,6 +6937,15 @@ class TradeManager {
           entryPendingLastCheckAt: new Date(),
         });
       }
+      this._markRecentEntryFailure({
+        trade,
+        token: trade?.instrument_token,
+        instrumentToken: trade?.instrument_token,
+        side: trade?.side,
+        underlying:
+          trade?.underlying_symbol || trade?.option_meta?.underlying || null,
+        reason: lateStatus === "REJECTED" ? "ENTRY_REJECTED" : "ENTRY_CANCELLED",
+      });
       await this._finalizeClosed(tradeId, trade.instrument_token);
       return { ok: true, done: true, cancelled: true };
     } finally {
@@ -8265,32 +8887,147 @@ class TradeManager {
     );
   }
 
-  _scheduleReconcile(reason = "order_update") {
+  _resolveReconcileRunner() {
+    if (typeof this._reconcileRunner === "function") {
+      return this._reconcileRunner;
+    }
+    if (typeof this.reconcile === "function") {
+      return this.reconcile.bind(this);
+    }
+    return null;
+  }
+
+  _coerceReconcileDelayMs(delayMs) {
+    const fallbackDebounceMs = Math.max(
+      250,
+      Number(env.RECONCILE_DEBOUNCE_MS ?? 1500),
+    );
+    if (!Number.isFinite(Number(delayMs))) return fallbackDebounceMs;
+    const parsed = Math.max(250, Number(delayMs) || 0);
+    const maxDelayMs = Math.max(
+      250,
+      Number(env.MONGO_RECONCILE_MAX_DEFER_MS ?? 20_000) || 20_000,
+    );
+    return Math.min(parsed, maxDelayMs);
+  }
+
+  async _runDebouncedReconcile(reason, queuedAtMs) {
+    if (this._stopped) return { ok: false, stopped: true };
+    if (this._reconcileDebouncedInFlight) {
+      this._reconcilePendingReason = this._reconcilePendingReason || reason;
+      return { ok: false, skipped: true, reason: "in_flight" };
+    }
+
+    const runner = this._resolveReconcileRunner();
+    if (typeof runner !== "function") {
+      logger.warn(
+        { reason },
+        "[reconcile] debounced run skipped (runner unavailable)",
+      );
+      return { ok: false, skipped: true, reason: "runner_unavailable" };
+    }
+
+    this._reconcileDebouncedInFlight = true;
+    try {
+      const result = await runner();
+      const severe =
+        String(
+          result?.severity || result?.status || result?.reason || "",
+        ).toUpperCase() === "SEVERELY_DEGRADED" ||
+        String(result?.reason || "")
+          .toLowerCase()
+          .includes("severe");
+      if (result?.deferred) {
+        const backoffMs = this._coerceReconcileDelayMs(result?.backoffMs);
+        this._reconcileDeferredActive = true;
+        logger.warn(
+          {
+            reason,
+            backoffMs,
+            severity: result?.severity || result?.status || null,
+          },
+          severe
+            ? "[reconcile] debounced run skipped due to severe mongo pressure"
+            : "[reconcile] debounced run deferred due to mongo degradation",
+        );
+        if (!this._reconcileRunnerCoordinatorAware) {
+          this._scheduleReconcile("mongo_deferred_retry", {
+            delayMs: backoffMs,
+          });
+        }
+        return result;
+      }
+
+      if (
+        this._reconcileRunnerCoordinatorAware &&
+        (result === undefined || result === null)
+      ) {
+        logger.warn(
+          {
+            reason,
+            waitedMs: Math.max(0, Date.now() - Number(queuedAtMs || Date.now())),
+          },
+          "[reconcile] debounced run failed",
+        );
+        return result;
+      }
+
+      const waitedMs = Math.max(0, Date.now() - Number(queuedAtMs || Date.now()));
+      if (this._reconcileDeferredActive) {
+        this._reconcileDeferredActive = false;
+        logger.info(
+          { reason, waitedMs },
+          "[reconcile] debounced run resumed after mongo recovery",
+        );
+      }
+      logger.info({ reason, waitedMs }, "[reconcile] debounced run complete");
+      return result;
+    } finally {
+      this._reconcileDebouncedInFlight = false;
+      const pendingReason = this._reconcilePendingReason;
+      this._reconcilePendingReason = null;
+      if (!this._stopped && pendingReason && !this._reconcileTimer) {
+        this._scheduleReconcile(pendingReason);
+      }
+    }
+  }
+
+  _scheduleReconcile(reason = "order_update", { delayMs = null } = {}) {
     if (this._stopped) return;
     const enabled = String(env.RECONCILE_ON_ORDER_UPDATE || "true") === "true";
     if (!enabled) return;
 
-    const debounceMs = Math.max(250, Number(env.RECONCILE_DEBOUNCE_MS ?? 1500));
+    const debounceMs = this._coerceReconcileDelayMs(delayMs);
+    const now = Date.now();
+    const dueAt = now + debounceMs;
 
-    if (this._reconcileTimer) return;
+    if (this._reconcileDebouncedInFlight) {
+      this._reconcilePendingReason = this._reconcilePendingReason || reason;
+      return;
+    }
 
-    this._reconcileScheduledAt = Date.now();
+    if (this._reconcileTimer) {
+      if (this._reconcileScheduledAt && this._reconcileScheduledAt <= dueAt) {
+        return;
+      }
+      clearTimeout(this._reconcileTimer);
+      this._reconcileTimer = null;
+    }
+
+    this._reconcileScheduledAt = dueAt;
+    const queuedAtMs = now;
     this._reconcileTimer = setTimeout(() => {
       this._reconcileTimer = null;
-      this.reconcile()
-        .then(() => {
-          logger.info(
-            { reason, waitedMs: Date.now() - this._reconcileScheduledAt },
-            "[reconcile] debounced run complete",
-          );
-        })
+      this._reconcileScheduledAt = 0;
+      this._runDebouncedReconcile(reason, queuedAtMs)
         .catch((e) =>
           logger.warn(
             { reason, e: e?.message || String(e) },
             "[reconcile] debounced run failed",
           ),
         );
-    }, debounceMs);
+    }, Math.max(1, dueAt - now));
+    this._reconcileTimer.unref?.();
   }
 
   _syncRiskFromPositions(posQtyByToken, actives = []) {
@@ -9717,8 +10454,11 @@ class TradeManager {
       "[reconcile] broker square-off matched and trade closed",
     );
 
-    await this._bookRealizedPnl(tradeId);
-    await this._finalizeClosed(tradeId, trade.instrument_token);
+    await this._finalizeTerminalCloseWithBestEffort({
+      tradeId,
+      instrumentToken: trade.instrument_token,
+      source: "BROKER_SQUAREOFF",
+    });
     return true;
   }
 
@@ -10347,6 +11087,12 @@ class TradeManager {
     this._syncRiskFromPositions(posQtyByToken, actives);
     await this._monitorPortfolioRisk("reconcile");
     await this._maybeHardFlatOnRestart(net);
+    await this._validateAndHealActiveTradeRuntimeState({
+      source: "reconcile",
+      activeTrades: actives,
+      posQtyByToken: positions ? posQtyByToken : null,
+      ordersById: byId,
+    });
 
     // 4) If broker shows open positions but we have no active trade in DB -> kill-switch (institutional safety)
     // This is more robust than scanning only the configured "tokens" list.
@@ -10868,7 +11614,8 @@ class TradeManager {
     return this._runTradeCommand(
       trade?.tradeId,
       EXEC_COMMAND.RECONCILE_DIFF_RESOLUTION,
-      async () => this._reconcileTradeImpl(trade, byId, posQtyByToken),
+      async (context) =>
+        this._reconcileTradeImpl(context?.trade || trade, byId, posQtyByToken),
       {
         seedTrade: trade,
         allowMissing: true,
@@ -10877,6 +11624,30 @@ class TradeManager {
   }
 
   async _reconcileTradeImpl(trade, byId, posQtyByToken) {
+    if (!trade?.tradeId) {
+      return { ok: false, skipped: true, reason: "MISSING_TRADE" };
+    }
+    const currentStatus = String(trade?.status || "").toUpperCase();
+    if (isTerminalTradeStatus(currentStatus)) {
+      logger.info(
+        {
+          tradeId: trade.tradeId,
+          currentStatus,
+          attemptedStatus: null,
+          command: EXEC_COMMAND.RECONCILE_DIFF_RESOLUTION,
+          eventRole: "RECONCILE",
+          patchKeys: ["status", "entryPrice", "actualEntry", "qty", "entryFinalized"],
+          dropReason: "TERMINAL_RECONCILE_MUTATION_SUPPRESSED",
+        },
+        "[trade] terminal trade mutation skipped",
+      );
+      return {
+        ok: true,
+        skipped: true,
+        reason: "TERMINAL_RECONCILE_MUTATION_SUPPRESSED",
+      };
+    }
+
     const tradeId = trade.tradeId;
     const token = Number(trade.instrument_token);
     const hasPosInfo = posQtyByToken instanceof Map;
@@ -11012,8 +11783,11 @@ class TradeManager {
             exitAt: new Date(),
             closedAt: new Date(),
           });
-          await this._bookRealizedPnl(tradeId);
-          await this._finalizeClosed(tradeId, token);
+          await this._finalizeTerminalCloseWithBestEffort({
+            tradeId,
+            instrumentToken: token,
+            source: "RECONCILE_GUARD_FAILED_PANIC_EXIT",
+          });
           return;
         }
 
@@ -11079,6 +11853,15 @@ class TradeManager {
           closeReason: `ENTRY_${entryStatusUpper}${
             entryMsg ? " | " + String(entryMsg) : ""
           }`,
+        });
+        this._markRecentEntryFailure({
+          trade,
+          token: trade?.instrument_token,
+          instrumentToken: trade?.instrument_token,
+          side: trade?.side,
+          underlying:
+            trade?.underlying_symbol || trade?.option_meta?.underlying || null,
+          reason: `ENTRY_${entryStatusUpper}`,
         });
         await this._finalizeClosed(tradeId, trade.instrument_token);
         return;
@@ -13122,6 +13905,14 @@ class TradeManager {
           status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
           closeReason: `ENTRY_${status}${msg ? " | " + msg : ""}`,
         });
+        this._markRecentEntryFailure({
+          trade: t,
+          token: t?.instrument_token,
+          instrumentToken: t?.instrument_token,
+          side: t?.side,
+          underlying: t?.underlying_symbol || t?.option_meta?.underlying || null,
+          reason: `ENTRY_${status}`,
+        });
         await this._finalizeClosed(tradeId, t.instrument_token);
         return;
       }
@@ -13272,6 +14063,15 @@ class TradeManager {
         status: isRejected ? STATUS.ENTRY_FAILED : STATUS.ENTRY_CANCELLED,
 
         closeReason: `ENTRY_${status}${msg ? " | " + String(msg) : ""}`,
+      });
+      this._markRecentEntryFailure({
+        trade: tFinal,
+        token: tFinal?.instrument_token,
+        instrumentToken: tFinal?.instrument_token,
+        side: tFinal?.side,
+        underlying:
+          tFinal?.underlying_symbol || tFinal?.option_meta?.underlying || null,
+        reason: `ENTRY_${status}`,
       });
 
       await this._finalizeClosed(tradeId, tFinal.instrument_token);
@@ -13464,6 +14264,15 @@ class TradeManager {
             status: STATUS.ENTRY_FAILED,
             closeReason: `ENTRY_${status}`,
           });
+          this._markRecentEntryFailure({
+            trade: t,
+            token: t?.instrument_token,
+            instrumentToken: t?.instrument_token,
+            side: t?.side,
+            underlying:
+              t?.underlying_symbol || t?.option_meta?.underlying || null,
+            reason: `ENTRY_${status}`,
+          });
           await this._finalizeClosed(tradeId, t.instrument_token);
           this._clearEntryLimitFallbackTimer(tradeId);
           return;
@@ -13605,6 +14414,15 @@ class TradeManager {
             await this._updateTrade(tradeId, {
               status: STATUS.ENTRY_FAILED,
               closeReason: `ENTRY_${againStatus}`,
+            });
+            this._markRecentEntryFailure({
+              trade: t,
+              token: t?.instrument_token,
+              instrumentToken: t?.instrument_token,
+              side: t?.side,
+              underlying:
+                t?.underlying_symbol || t?.option_meta?.underlying || null,
+              reason: `ENTRY_${againStatus}`,
             });
             await this._finalizeClosed(tradeId, t.instrument_token);
             this._clearEntryLimitFallbackTimer(tradeId);
@@ -14528,11 +15346,50 @@ class TradeManager {
 
     // Strategy-aware regime gating (pro-level, but tunable)
     if (String(env.STRATEGY_STYLE_REGIME_GATES_ENABLED || "true") === "true") {
+      const styleGate = isStrategyStyleAllowedForRegime({
+        strategyStyle: style,
+        strategyId,
+        regime: baseMeta.regime,
+        marketState:
+          signal?.marketState ||
+          signal?.meta?.marketState ||
+          signal?.conversionSummary?.marketState ||
+          baseMeta.regime,
+        candidate: signal,
+        levelAcceptance:
+          signal?.meta?.levelAcceptance ||
+          signal?.scoreBreakdown?.levelAcceptance ||
+          signal?.levelAcceptance ||
+          null,
+        dangerStack:
+          signal?.meta?.dangerStack ||
+          signal?.scoreBreakdown?.dangerStack ||
+          signal?.dangerStack ||
+          null,
+        mtf: {
+          mtfState: signal?.mtfState || signal?.scoreBreakdown?.mtfState || null,
+          mtfBias: signal?.mtfBias || signal?.scoreBreakdown?.mtfBias || null,
+          mtfAgreementScore:
+            signal?.mtfAgreementScore ?? signal?.scoreBreakdown?.mtfAgreementScore ?? null,
+        },
+        dteDays:
+          signal?.dteDays ??
+          signal?.dte ??
+          signal?.meta?.dteDays ??
+          signal?.meta?.dte ??
+          signal?.meta?.productAdaptation?.dte ??
+          signal?.scoreBreakdown?.dte ??
+          null,
+        confidence: signal?.rawConfidence ?? signal?.confidence ?? null,
+        regimeSnapshot,
+        env,
+      });
       if (
         Array.isArray(admissionProfile.allowedRegimeFamilies) &&
         admissionProfile.allowedRegimeFamilies.length &&
         baseMeta.regimeFamily &&
-        !admissionProfile.allowedRegimeFamilies.includes(String(baseMeta.regimeFamily).toUpperCase())
+        !admissionProfile.allowedRegimeFamilies.includes(String(baseMeta.regimeFamily).toUpperCase()) &&
+        styleGate.allowedByException !== true
       ) {
         return {
           ok: false,
@@ -14540,14 +15397,13 @@ class TradeManager {
           meta: {
             ...baseMeta,
             allowedRegimeFamilies: admissionProfile.allowedRegimeFamilies,
+            exceptionChecked: styleGate.exceptionChecked === true,
+            exceptionAllowed: styleGate.exceptionAllowed === true,
+            exceptionReasonCode: styleGate.exceptionReasonCode || null,
+            exceptionFailedChecks: styleGate.exceptionMeta?.failedChecks || [],
           },
         };
       }
-      const styleGate = isStrategyStyleAllowedForRegime({
-        strategyStyle: style,
-        regime: baseMeta.regime,
-        env,
-      });
       if (!styleGate.allowed) {
         return {
           ok: false,
@@ -14555,6 +15411,10 @@ class TradeManager {
           meta: {
             ...baseMeta,
             allowedRegimes: styleGate.allowedRegimes,
+            exceptionChecked: styleGate.exceptionChecked === true,
+            exceptionAllowed: styleGate.exceptionAllowed === true,
+            exceptionReasonCode: styleGate.exceptionReasonCode || null,
+            exceptionFailedChecks: styleGate.exceptionMeta?.failedChecks || [],
           },
         };
       }
@@ -14934,11 +15794,26 @@ class TradeManager {
     };
 
     if (this.activeTradeId) {
-      logger.info(
-        withSignalLifecycleMeta(signal, { activeTradeId: this.activeTradeId }),
-        "[signal] ignored (active trade exists)",
-      );
-      return;
+      try {
+        await this._validateAndHealActiveTradeRuntimeState({
+          source: "signal_gate",
+        });
+      } catch (err) {
+        logger.warn(
+          {
+            tradeId: this.activeTradeId,
+            e: err?.message || String(err),
+          },
+          "[trade] active-trade validation failed in signal gate; retaining block",
+        );
+      }
+      if (this.activeTradeId) {
+        logger.info(
+          withSignalLifecycleMeta(signal, { activeTradeId: this.activeTradeId }),
+          "[signal] ignored (active trade exists)",
+        );
+        return;
+      }
     }
 
     if (this._isBlockedByNoTradeWindow()) {
@@ -15670,12 +16545,27 @@ class TradeManager {
       logger.warn({ token, dailyState }, "[trade] blocked (daily hard stop)");
       return;
     }
-    const check = this.risk.canTrade(riskKey);
+    const check = this.risk.canTrade({
+      token: riskKey,
+      instrumentToken: token,
+      underlying: s.underlying_symbol || s.option_meta?.underlying || null,
+      side: s.side,
+    });
     if (!check.ok) {
+      const riskBlockMeta =
+        check?.meta && typeof check.meta === "object" ? check.meta : null;
       trackDecision("BLOCKED", "admission", check.reason || "RISK_CAN_TRADE", {
         riskKey,
+        ...(riskBlockMeta || {}),
       });
-      logger.info({ token, reason: check.reason }, "[trade] blocked");
+      logger.info(
+        {
+          token,
+          reason: check.reason,
+          ...(riskBlockMeta || {}),
+        },
+        "[trade] blocked",
+      );
       return;
     }
 
@@ -17458,7 +18348,14 @@ class TradeManager {
           meta: { context: "trade_manager" },
         }),
       );
-      this.risk.markFailure("ENTRY_PLACE_FAILED");
+      this._markRecentEntryFailure({
+        trade,
+        token,
+        instrumentToken: token,
+        side: s.side,
+        underlying: s.underlying_symbol || s.option_meta?.underlying || null,
+        reason: "ENTRY_PLACE_FAILED",
+      });
       await this._updateTrade(tradeId, {
         status: STATUS.ENTRY_FAILED,
         closeReason: "ENTRY_PLACE_FAILED | " + e.message,
@@ -17700,6 +18597,29 @@ class TradeManager {
           "[order_update]",
         );
 
+        const terminalOrderGuard = this._shouldSuppressTerminalOrderMutation({
+          trade,
+          role: link.role,
+          status,
+          order,
+        });
+        if (terminalOrderGuard?.suppress) {
+          this._logTerminalOrderMutationSuppressed({
+            trade,
+            role: link.role,
+            orderStatus: status,
+            orderId,
+            attemptedStatus: inferAttemptedTradeStatusFromOrderUpdate(
+              link.role,
+              status,
+            ),
+            dropReason: terminalOrderGuard.dropReason,
+            updateTs: terminalOrderGuard.updateTs,
+            terminalFenceTs: terminalOrderGuard.terminalFenceTs,
+          });
+          return;
+        }
+
     if (link.role === "BROKER_SQUAREOFF") {
       if (status === "COMPLETE") {
         await this._closeByBrokerSquareoff(trade, order, "BROKER_SQUAREOFF");
@@ -17772,8 +18692,11 @@ class TradeManager {
             meta: { context: "trade_manager" },
           }),
         );
-        await this._bookRealizedPnl(trade.tradeId);
-        await this._finalizeClosed(trade.tradeId, trade.instrument_token);
+        await this._finalizeTerminalCloseWithBestEffort({
+          tradeId: trade.tradeId,
+          instrumentToken: trade.instrument_token,
+          source: "PANIC_EXIT_FILLED",
+        });
         return;
       }
 
@@ -18228,7 +19151,12 @@ class TradeManager {
             meta: { context: "trade_manager" },
           }),
         );
-        this.risk.resetFailures();
+        this._clearRecentEntryFailuresForTrade(trade, {
+          token: trade?.instrument_token,
+          side: trade?.side,
+          underlying:
+            trade?.underlying_symbol || trade?.option_meta?.underlying || null,
+        });
 
         // PATCH-10: Post-fill risk recheck (actual fill can make ₹ risk exceed cap)
         const pf = await this._postFillRiskRecheckAndAdjust({
@@ -18467,14 +19395,15 @@ class TradeManager {
             message: "[src/trading/tradeManager.js] async task failed",
           });
         });
-        if (isRejected) {
-          const fail = this.risk.markFailure("ENTRY_" + status);
-          if (fail.killed) {
-            alert("error", "🛑 Too many failures -> kill switch", fail).catch(
-              () => {},
-            );
-          }
-        }
+        this._markRecentEntryFailure({
+          trade,
+          token: trade?.instrument_token,
+          instrumentToken: trade?.instrument_token,
+          side: trade?.side,
+          underlying:
+            trade?.underlying_symbol || trade?.option_meta?.underlying || null,
+          reason: "ENTRY_" + status,
+        });
         await this._finalizeClosed(trade.tradeId, trade.instrument_token);
         return;
       }
@@ -20295,8 +21224,11 @@ class TradeManager {
         exitSlippageInrWorse: tp1SlippageInrWorse,
         closeReason: "TP1_FULL_EXIT",
       });
-      await this._bookRealizedPnl(tradeId);
-      await this._finalizeClosed(tradeId, fresh.instrument_token);
+      await this._finalizeTerminalCloseWithBestEffort({
+        tradeId,
+        instrumentToken: fresh.instrument_token,
+        source: "TP1_FULL_EXIT",
+      });
       return;
     }
 
@@ -21184,9 +22116,11 @@ class TradeManager {
         message: "[src/trading/tradeManager.js] async task failed",
       });
     });
-    this.risk.resetFailures();
-    await this._bookRealizedPnl(tradeId);
-    await this._finalizeClosed(tradeId, trade.instrument_token);
+    await this._finalizeTerminalCloseWithBestEffort({
+      tradeId,
+      instrumentToken: trade.instrument_token,
+      source: "TARGET_HIT",
+    });
   }
 
   async _onSlFilled(tradeId, trade, slOrder) {
@@ -21302,9 +22236,11 @@ class TradeManager {
         message: "[src/trading/tradeManager.js] async task failed",
       });
     });
-    this.risk.resetFailures();
-    await this._bookRealizedPnl(tradeId);
-    await this._finalizeClosed(tradeId, trade.instrument_token);
+    await this._finalizeTerminalCloseWithBestEffort({
+      tradeId,
+      instrumentToken: trade.instrument_token,
+      source: "STOP_HIT",
+    });
   }
 
   async _guardFail(trade, reason) {
@@ -21397,6 +22333,30 @@ class TradeManager {
 
     // SL/exit leg failed => panic exit immediately (safety critical)
     await this._panicExit(trade, reason);
+  }
+
+  async _finalizeTerminalCloseWithBestEffort({
+    tradeId,
+    instrumentToken,
+    source = "terminal_close",
+    bookRealizedPnl = true,
+  }) {
+    if (!tradeId) return;
+    if (bookRealizedPnl) {
+      try {
+        await this._bookRealizedPnl(tradeId);
+      } catch (err) {
+        logger.error(
+          {
+            tradeId,
+            source,
+            e: err?.message || String(err),
+          },
+          "[trade] cleanup attempted after terminal close but secondary work failed",
+        );
+      }
+    }
+    await this._finalizeClosed(tradeId, instrumentToken);
   }
 
   async _bookRealizedPnl(tradeId) {
@@ -21724,12 +22684,28 @@ class TradeManager {
   }
 
   async _finalizeClosed(tradeId, instrument_token) {
-    return this._runTradeCommand(
-      tradeId,
-      EXEC_COMMAND.FINALIZE_CLOSE,
-      async () => this._finalizeClosedImpl(tradeId, instrument_token),
-      { allowMissing: true },
-    );
+    try {
+      return await this._runTradeCommand(
+        tradeId,
+        EXEC_COMMAND.FINALIZE_CLOSE,
+        async () => this._finalizeClosedImpl(tradeId, instrument_token),
+        { allowMissing: true },
+      );
+    } finally {
+      try {
+        this._clearActiveTradeRuntimeState(tradeId, {
+          instrumentToken: instrument_token,
+          reason: "terminal_close_finalize",
+          source: "finalize_close",
+        });
+      } catch (err) {
+        reportFault({
+          code: "TRADING_TRADEMANAGER_CATCH",
+          err,
+          message: "[src/trading/tradeManager.js] caught and continued",
+        });
+      }
+    }
   }
 
   async _finalizeClosedImpl(tradeId, instrument_token) {
@@ -21779,11 +22755,11 @@ class TradeManager {
       });
     }
 
-    this.activeTradeId = null;
-    this.recoveredPosition = null;
-    this._activeTradeToken = null;
-    this._activeTradeSide = null;
-    this._cleanupTradeRuntimeState(tradeId);
+    this._clearActiveTradeRuntimeState(tradeId, {
+      instrumentToken: instrument_token,
+      reason: "terminal_close_impl",
+      source: "finalize_close",
+    });
     const qty = Number(tradeWithPnl?.qty ?? t?.qty ?? 0);
     const entry = Number(tradeWithPnl?.entryPrice ?? t?.entryPrice ?? 0);
     const exit = Number(tradeWithPnl?.exitPrice ?? t?.exitPrice ?? 0);
@@ -22178,3 +23154,4 @@ module.exports = {
   resolveOptimizerAdmission,
   resolveOptimizerRrTarget,
 };
+

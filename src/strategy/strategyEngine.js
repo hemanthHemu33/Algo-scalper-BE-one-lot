@@ -456,6 +456,92 @@ function sortSignals(signals) {
   });
 }
 
+function styleGateContextForCandidate(candidate) {
+  const scoreBreakdown = candidate?.scoreBreakdown || {};
+  const meta = candidate?.meta || {};
+  return {
+    strategyId: candidate?.strategyId || null,
+    strategyStyle: candidate?.strategyStyle || null,
+    regime: candidate?.regimeSnapshot?.regime || candidate?.regime || null,
+    marketState:
+      candidate?.marketState ||
+      meta.marketState ||
+      scoreBreakdown.marketState ||
+      candidate?.regimeMeta?.marketState ||
+      null,
+    candidate,
+    levelAcceptance:
+      meta.levelAcceptance ||
+      scoreBreakdown.levelAcceptance ||
+      candidate?.levelAcceptance ||
+      null,
+    dangerStack:
+      meta.dangerStack ||
+      scoreBreakdown.dangerStack ||
+      candidate?.dangerStack ||
+      null,
+    mtf: {
+      mtfState: candidate?.mtfState || scoreBreakdown.mtfState || null,
+      mtfBias: candidate?.mtfBias || scoreBreakdown.mtfBias || null,
+      mtfAgreementScore:
+        candidate?.mtfAgreementScore ?? scoreBreakdown.mtfAgreementScore ?? null,
+    },
+    dteDays:
+      candidate?.dteDays ??
+      candidate?.dte ??
+      meta.dteDays ??
+      meta.dte ??
+      meta.productAdaptation?.dte ??
+      scoreBreakdown.dte ??
+      null,
+    confidence: candidate?.rawConfidence ?? candidate?.confidence ?? null,
+    regimeSnapshot: candidate?.regimeSnapshot || null,
+    env,
+  };
+}
+
+function styleGateConversionPatch(styleGate) {
+  const exceptionMeta = styleGate?.exceptionMeta || null;
+  const exceptionReasonCode =
+    styleGate?.exceptionReasonCode || exceptionMeta?.reasonCode || null;
+  return {
+    styleGateDecision: styleGate?.allowedByException
+      ? "PASS_EXCEPTION"
+      : styleGate?.allowed
+        ? "PASS"
+        : "BLOCK",
+    styleGateReasonCode:
+      exceptionReasonCode ||
+      (styleGate?.allowed ? "STYLE_REGIME_ALLOWED" : "STYLE_REGIME_MISMATCH"),
+    styleGateExceptionType:
+      styleGate?.exceptionType || exceptionMeta?.exceptionType || null,
+    styleGateFailedChecks: exceptionMeta?.failedChecks || [],
+    marketState: exceptionMeta?.marketState || null,
+    exceptionAllowed: styleGate?.allowedByException === true,
+  };
+}
+
+function styleGateSuppressionReason(styleGate) {
+  return (
+    styleGate?.exceptionReasonCode ||
+    styleGate?.exceptionMeta?.reasonCode ||
+    "STYLE_REGIME_MISMATCH"
+  );
+}
+
+function signalReasonCodeFromSuppression(reason) {
+  if (String(reason || "").startsWith("FRAGILE_REVERSAL_")) {
+    return `SIGNAL_SUPPRESSED_${reason}`;
+  }
+  return "SIGNAL_SUPPRESSED_STYLE_REGIME_MISMATCH";
+}
+
+function finalOutcomeForPreEmitSuppression(reason) {
+  if (String(reason || "").includes("MTF")) return "SUPPRESSED_MTF";
+  if (reason) return "SUPPRESSED_CONFIDENCE";
+  return null;
+}
+
 function materializeSelectedSignal(best, { last, intervalMin, instrument_token, stage, selectorState }) {
   return {
     ...best,
@@ -682,12 +768,20 @@ function evaluateSignalSetFromCandles({
       continue;
     }
 
-    const styleGate = isStrategyStyleAllowedForRegime({
-      strategyStyle: liveCandidate.strategyStyle,
-      regime: liveCandidate.regimeSnapshot?.regime || liveCandidate.regime,
-      env,
-    });
+    const styleGate = isStrategyStyleAllowedForRegime(
+      styleGateContextForCandidate(liveCandidate),
+    );
     if (!styleGate.allowed) {
+      const styleSuppressionReason = styleGateSuppressionReason(styleGate);
+      const conversionPatch = {
+        ...styleGateConversionPatch(styleGate),
+        preEmitDecision: "SUPPRESSED",
+        preEmitFailureReasons: [styleSuppressionReason],
+        mtfState: liveCandidate?.mtfState || liveCandidate?.scoreBreakdown?.mtfState || null,
+        routeAttempted: false,
+        finalReasonCode: styleSuppressionReason,
+        finalOutcome: "SUPPRESSED_STYLE_REGIME",
+      };
       const suppressedCandidate = attachSignalDecisionState(liveCandidate, context, sel, {
         routing: {
           decisionStage: "signal_preemit",
@@ -696,10 +790,12 @@ function evaluateSignalSetFromCandles({
           routed: false,
           accepted: false,
           beforeRouting: true,
-          suppressionReason: "STYLE_REGIME_MISMATCH",
-          suppressionReasons: ["STYLE_REGIME_MISMATCH"],
+          suppressionReason: styleSuppressionReason,
+          suppressionReasons: [styleSuppressionReason],
         },
+        conversion: conversionPatch,
       });
+      const exceptionMeta = styleGate.exceptionMeta || null;
       const suppressionMeta = {
         signalId: suppressedCandidate.signalId,
         signalOutcomeKey: suppressedCandidate.signalOutcomeKey,
@@ -707,6 +803,11 @@ function evaluateSignalSetFromCandles({
         strategy: suppressedCandidate.strategyId,
         strategyStyle: styleGate.strategyStyle,
         regime: styleGate.regime,
+        marketState:
+          exceptionMeta?.marketState ||
+          suppressedCandidate.marketState ||
+          suppressedCandidate.meta?.marketState ||
+          null,
         regimeFamily: styleGate.regimeFamily,
         timeframeUsed:
           suppressedCandidate.regimeSnapshot?.sourceTimeframeMin ?? Number(intervalMin),
@@ -714,13 +815,37 @@ function evaluateSignalSetFromCandles({
           suppressedCandidate.rawConfidence ?? suppressedCandidate.confidence ?? 0,
         ),
         allowedRegimes: styleGate.allowedRegimes,
+        exceptionChecked: styleGate.exceptionChecked === true,
+        exceptionAllowed: styleGate.exceptionAllowed === true,
+        exceptionReasonCode:
+          styleGate.exceptionReasonCode || exceptionMeta?.reasonCode || null,
+        exceptionFailedChecks: exceptionMeta?.failedChecks || [],
+        confidenceUsed: exceptionMeta?.confidenceUsed ?? null,
+        mtfState:
+          exceptionMeta?.mtfState ||
+          suppressedCandidate.mtfState ||
+          suppressedCandidate.scoreBreakdown?.mtfState ||
+          null,
+        mtfAgreementScore:
+          exceptionMeta?.mtfAgreementScore ??
+          suppressedCandidate.mtfAgreementScore ??
+          suppressedCandidate.scoreBreakdown?.mtfAgreementScore ??
+          null,
+        dteDays: exceptionMeta?.dteDays ?? suppressedCandidate.dteDays ?? suppressedCandidate.dte ?? null,
+        dangerStackScore:
+          exceptionMeta?.dangerStackScore ??
+          suppressedCandidate.dangerStackScore ??
+          suppressedCandidate.meta?.dangerStack?.dangerStackScore ??
+          null,
+        levelRejectionDetected: exceptionMeta?.levelRejectionDetected === true,
+        sessionExtremeDetected: exceptionMeta?.sessionExtremeDetected === true,
         regimeSnapshotId: suppressedCandidate.regimeSnapshotId,
         conversionSummary: suppressedCandidate.conversionSummary || null,
       };
       if (recordTelemetry) {
         logger.info(
           {
-            reasonCode: "SIGNAL_SUPPRESSED_STYLE_REGIME_MISMATCH",
+            reasonCode: signalReasonCodeFromSuppression(styleSuppressionReason),
             ...suppressionMeta,
           },
           "[signal] suppressed (style/regime mismatch)",
@@ -730,7 +855,7 @@ function evaluateSignalSetFromCandles({
           token: Number(instrument_token),
           outcome: "SUPPRESSED",
           stage: "signal_preemit",
-          reason: "SIGNAL_SUPPRESSED_STYLE_REGIME_MISMATCH",
+          reason: signalReasonCodeFromSuppression(styleSuppressionReason),
           meta: suppressionMeta,
         });
       }
@@ -741,11 +866,51 @@ function evaluateSignalSetFromCandles({
       continue;
     }
 
+    if (
+      styleGate.allowedByException === true &&
+      recordTelemetry &&
+      String(env.FRAGILE_REVERSAL_TELEMETRY_ENABLED ?? "true") === "true"
+    ) {
+      const exceptionMeta = styleGate.exceptionMeta || null;
+      logger.info(
+        {
+          reasonCode: "SIGNAL_ALLOWED_FRAGILE_REVERSAL_EXCEPTION",
+          exceptionType: "FRAGILE_REVERSAL",
+          strategy: liveCandidate.strategyId,
+          regime: styleGate.regime,
+          marketState:
+            exceptionMeta?.marketState ||
+            liveCandidate.marketState ||
+            liveCandidate.meta?.marketState ||
+            null,
+          checksPassed: exceptionMeta?.checksPassed || [],
+          riskTier: "STRICT_EXCEPTION",
+          confidenceUsed: exceptionMeta?.confidenceUsed ?? null,
+          mtfState: exceptionMeta?.mtfState || null,
+          mtfAgreementScore: exceptionMeta?.mtfAgreementScore ?? null,
+          dteDays: exceptionMeta?.dteDays ?? null,
+          dangerStackScore: exceptionMeta?.dangerStackScore ?? null,
+          levelRejectionDetected: exceptionMeta?.levelRejectionDetected === true,
+          sessionExtremeDetected: exceptionMeta?.sessionExtremeDetected === true,
+        },
+        "[signal] allowed (fragile reversal exception)",
+      );
+    }
+
     const preEmitGate = shouldEmitLiveCandidate({
       candidate: liveCandidate,
       env,
     });
     if (!preEmitGate.emit) {
+      const conversionPatch = {
+        ...styleGateConversionPatch(styleGate),
+        preEmitDecision: "SUPPRESSED",
+        preEmitFailureReasons: preEmitGate.suppressionReasons,
+        mtfState: liveCandidate?.mtfState || liveCandidate?.scoreBreakdown?.mtfState || null,
+        routeAttempted: false,
+        finalReasonCode: preEmitGate.suppressionReason,
+        finalOutcome: finalOutcomeForPreEmitSuppression(preEmitGate.suppressionReason),
+      };
       const suppressedCandidate = attachSignalDecisionState(liveCandidate, context, sel, {
         preEmit: preEmitGate.qualityMeta,
         routing: {
@@ -758,6 +923,7 @@ function evaluateSignalSetFromCandles({
           suppressionReason: preEmitGate.suppressionReason,
           suppressionReasons: preEmitGate.suppressionReasons,
         },
+        conversion: conversionPatch,
       });
       const suppressionMeta = {
         signalId: suppressedCandidate.signalId,
@@ -802,6 +968,15 @@ function evaluateSignalSetFromCandles({
         routed: false,
         accepted: false,
         beforeRouting: true,
+      },
+      conversion: {
+        ...styleGateConversionPatch(styleGate),
+        preEmitDecision: "EMITTED",
+        preEmitFailureReasons: [],
+        mtfState: liveCandidate?.mtfState || liveCandidate?.scoreBreakdown?.mtfState || null,
+        routeAttempted: false,
+        finalReasonCode: null,
+        finalOutcome: null,
       },
     });
     emittedSignals.push(emittedCandidate);

@@ -198,10 +198,12 @@ function loadHarness({
   fakeDb = new FakeDb(),
   sendImpl = null,
   editImpl = null,
+  mongoWorkGateOverrides = {},
 } = {}) {
   const paths = {
     config: path.join(ROOT, "src", "config.js"),
     db: path.join(ROOT, "src", "db.js"),
+    mongoWorkGate: path.join(ROOT, "src", "runtime", "mongoWorkGate.js"),
     telegram: path.join(ROOT, "src", "alerts", "telegram.js"),
     policy: path.join(ROOT, "src", "alerts", "notificationPolicy.js"),
     builder: path.join(ROOT, "src", "alerts", "tradeStatusBuilder.js"),
@@ -242,8 +244,14 @@ function loadHarness({
   }
 
   const dbModule = require(paths.db);
+  const mongoWorkGateModule = require(paths.mongoWorkGate);
   const originalGetDb = dbModule.getDb;
   dbModule.getDb = () => fakeDb;
+  const originalMongoWorkGate = {};
+  for (const [key, value] of Object.entries(mongoWorkGateOverrides || {})) {
+    originalMongoWorkGate[key] = mongoWorkGateModule[key];
+    mongoWorkGateModule[key] = value;
+  }
 
   const calls = {
     send: [],
@@ -303,6 +311,9 @@ function loadHarness({
     restore() {
       dispatcher.stopNotificationDispatcher();
       dbModule.getDb = originalGetDb;
+      for (const [key, value] of Object.entries(originalMongoWorkGate)) {
+        mongoWorkGateModule[key] = value;
+      }
       telegramModule.sendMessage = originalSend;
       telegramModule.editMessageText = originalEdit;
       telegramModule.isEnabled = originalIsEnabled;
@@ -1189,6 +1200,116 @@ async function testTerminalClassificationDistinguishesOutcomes() {
   }
 }
 
+async function testBlankNotificationsOverrideFallsBackToTelegramEnabled() {
+  const harness = loadHarness({
+    envOverrides: {
+      TELEGRAM_ENABLED: "true",
+      TELEGRAM_NOTIFICATIONS_ENABLED: "",
+    },
+  });
+  try {
+    await harness.alertService.alert(
+      "info",
+      "Notification fallback gate check",
+    );
+    await harness.drain();
+    assert.equal(harness.calls.send.length, 1);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testExplicitNotificationsDisableStillSkipsSends() {
+  const harness = loadHarness({
+    envOverrides: {
+      TELEGRAM_ENABLED: "true",
+      TELEGRAM_NOTIFICATIONS_ENABLED: "false",
+    },
+  });
+  try {
+    const result = await harness.alertService.alert(
+      "info",
+      "Notification disable gate check",
+    );
+    await harness.drain();
+    assert.equal(Boolean(result?.skipped), true);
+    assert.equal(result?.reason, "telegram_disabled");
+    assert.equal(harness.calls.send.length, 0);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testOutboxPollDeferredDuringMongoDegradation() {
+  const harness = loadHarness({
+    mongoWorkGateOverrides: {
+      evaluateMongoWorkGate: () => ({
+        deferred: true,
+        severity: "DEGRADED",
+        status: "DEGRADED",
+        backoffMs: 0,
+      }),
+    },
+  });
+  try {
+    const result = await harness.dispatcher.processOutboxOnce();
+    const status = harness.dispatcher.getNotificationDispatcherStatus();
+    assert.equal(result.deferred, true);
+    assert.equal(status.health.pollDeferredCount, 1);
+    assert.equal(status.health.backlogEstimate, "unknown");
+    assert.equal(harness.calls.send.length, 0);
+  } finally {
+    harness.restore();
+  }
+}
+
+async function testOutboxResumeAfterRecoveryDoesNotDoubleSend() {
+  let gateDeferred = true;
+  const harness = loadHarness({
+    mongoWorkGateOverrides: {
+      evaluateMongoWorkGate: () =>
+        gateDeferred
+          ? {
+              deferred: true,
+              severity: "DEGRADED",
+              status: "DEGRADED",
+              backoffMs: 0,
+            }
+          : {
+              deferred: false,
+              severity: "HEALTHY",
+              status: "HEALTHY",
+              release() {},
+            },
+    },
+  });
+  try {
+    await harness.alertService.dispatchNotification({
+      kind: "incident",
+      severity: "info",
+      entityType: "engine",
+      entityId: "primary",
+      dedupeKey: "engine:test:mongo-recovery",
+      event: "TEST_MONGO_RECOVERY",
+      payload: { message: "mongo recovery resume" },
+    });
+
+    await harness.dispatcher.processOutboxOnce();
+    assert.equal(harness.calls.send.length, 0);
+
+    gateDeferred = false;
+    await harness.dispatcher.processOutboxOnce();
+    await harness.dispatcher.processOutboxOnce();
+
+    const status = harness.dispatcher.getNotificationDispatcherStatus();
+    assert.equal(harness.calls.send.length, 1);
+    assert.ok(status.health.lastPollOkAt);
+    assert.equal(status.health.pollDeferredCount, 1);
+  } finally {
+    harness.restore();
+  }
+}
+
 async function main() {
   await testEntryPlacementRejectedImmediately();
   await testEntryAcceptedThenFilledWithoutDuplicateFillSpam();
@@ -1206,6 +1327,10 @@ async function main() {
   await testRestartRecoveryResumesLiveRefresh();
   await testHeartbeatEmitsAcrossIntervalsEvenWhenUnchanged();
   await testTerminalClassificationDistinguishesOutcomes();
+  await testBlankNotificationsOverrideFallsBackToTelegramEnabled();
+  await testExplicitNotificationsDisableStillSkipsSends();
+  await testOutboxPollDeferredDuringMongoDegradation();
+  await testOutboxResumeAfterRecoveryDoesNotDoubleSend();
   console.log("notificationPipeline.test.js passed");
 }
 

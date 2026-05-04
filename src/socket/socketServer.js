@@ -9,6 +9,7 @@ const {
 const { isHalted, getHaltInfo } = require("../runtime/halt");
 const { getTradingEnabled } = require("../runtime/tradingEnabled");
 const { getDb, getMongoRuntimeState } = require("../db");
+const { getTokenWatcherStatus } = require("../tokenWatcher");
 const { telemetry } = require("../telemetry/signalTelemetry");
 const { tradeTelemetry } = require("../telemetry/tradeTelemetry");
 const { optimizer } = require("../optimizer/adaptiveOptimizer");
@@ -33,22 +34,129 @@ const {
   normalizeTradeRow,
 } = require("../trading/tradeNormalization");
 const { isTransientMongoError } = require("../runtime/isTransientMongoError");
+const {
+  evaluateMongoWorkGate,
+  deferMongoWorkForError,
+  noteMongoWorkSuccess,
+} = require("../runtime/mongoWorkGate");
+const { noteMongoStatusStaleness } = require("../runtime/mongoRuntimeState");
 
 const pipelineStatusCache = {
   snapshot: null,
   atMs: 0,
 };
 
+function resetPipelineStatusCacheForTests() {
+  pipelineStatusCache.snapshot = null;
+  pipelineStatusCache.atMs = 0;
+}
+
+function setPipelineStatusCacheForTests(snapshot, atMs = Date.now()) {
+  pipelineStatusCache.snapshot =
+    snapshot && typeof snapshot === "object" ? { ...snapshot } : null;
+  pipelineStatusCache.atMs = Number(atMs) || Date.now();
+}
+
 function mongoStatusFields() {
   const state = getMongoRuntimeState();
   return {
     mongoConnected: !!state?.connected,
     mongoDegraded: !!state?.degraded,
+    mongoSeverity: state?.severity || state?.status || "HEALTHY",
+    mongoState: state?.state || state?.status || "HEALTHY",
+    mongoEnteredAt: state?.enteredAt || null,
+    mongoLastFailureAt: state?.lastFailureAt || null,
+    mongoLastRecoveryAt: state?.lastRecoveryAt || null,
+    mongoFailureStreak: Number(state?.failureStreak || 0),
+    mongoBurstCount: Number(state?.burstCount || 0),
+    mongoCheckoutTimeoutCount: Number(state?.checkoutTimeoutCount || 0),
+    mongoSubsystemDeferCount: Number(state?.subsystemDeferCount || 0),
+    mongoSubsystemResumeCount: Number(state?.subsystemResumeCount || 0),
+    mongoDegradedDurationMs: Number(state?.degradedDurationMs || 0),
+    mongoTotalBacklog: Number(state?.totalBacklog || 0),
     mongoLastHealthyAt: state?.lastHealthyAt || null,
     mongoLastErrorAt: state?.lastErrorAt || null,
     mongoLastErrorMessage: state?.lastErrorMessage || null,
     mongoPoolClearedCount: Number(state?.poolClearedCount || 0),
-    mongoState: state,
+    mongoSnapshot: state,
+  };
+}
+
+function buildPipelineWaitingStatus() {
+  const tokenWatcher = getTokenWatcherStatus?.() || {};
+  const ticker = getTickerStatus?.() || {};
+  const updatedAt = new Date().toISOString();
+
+  if (!tokenWatcher?.hasValidToken) {
+    const reasonCode = tokenWatcher?.lastReason || "WAITING_FOR_TOKEN";
+    const reason =
+      reasonCode === "PREVIOUS_TRADING_DAY_TOKEN"
+        ? "Previous-day token blocked; waiting for a fresh token."
+        : "Waiting for a valid Kite token.";
+    return {
+      ok: true,
+      pipelineReady: false,
+      pipelineState: "WAITING_FOR_TOKEN",
+      reasonCode,
+      reason,
+      updatedAt,
+    };
+  }
+
+  if (!ticker?.connected) {
+    return {
+      ok: true,
+      pipelineReady: false,
+      pipelineState: "PRIMING",
+      reasonCode: ticker?.hasSession ? "TICKER_CONNECTING" : "SESSION_PRIMING",
+      reason: ticker?.hasSession
+        ? "Kite session is active; waiting for ticker connectivity."
+        : "Kite session is being initialized.",
+      updatedAt,
+    };
+  }
+
+  return {
+    ok: true,
+    pipelineReady: false,
+    pipelineState: "BACKFILLING",
+    reasonCode: "PIPELINE_PRIMING",
+    reason: "Pipeline bootstrap is still priming runtime state.",
+    updatedAt,
+  };
+}
+
+function socketStatusFreshnessFields({
+  dbStatusMode = "live",
+  dbStatusStaleMs = null,
+  mongoStatus = {},
+}) {
+  const statusStale = dbStatusMode === "cache";
+  const staleMs = statusStale ? Math.max(0, Number(dbStatusStaleMs || 0)) : 0;
+  const maxStaleMs = Math.max(
+    1000,
+    Number(env.SOCKET_STATUS_MAX_STALE_MS ?? 60_000) || 60_000,
+  );
+  const statusVeryStale = statusStale && staleMs > maxStaleMs;
+  return {
+    statusSource:
+      dbStatusMode === "cache"
+        ? "cache"
+        : dbStatusMode === "unavailable"
+          ? "unavailable"
+          : dbStatusMode === "live"
+            ? "live"
+            : "memory",
+    statusStale,
+    statusStaleMs: staleMs,
+    statusVeryStale,
+    warning: statusStale
+      ? statusVeryStale
+        ? "DB_DEGRADED_STATUS_VERY_STALE"
+        : "DB_DEGRADED_STATUS_STALE"
+      : null,
+    mongoSeverity: mongoStatus?.mongoSeverity || "HEALTHY",
+    mongoState: mongoStatus?.mongoState || "HEALTHY",
   };
 }
 
@@ -106,35 +214,309 @@ function assertAdminKey(socket) {
 }
 
 async function buildStatusSnapshot() {
+  const toSnapshot = ({
+    pipeline = null,
+    status = {},
+    dbDegraded = false,
+    dbStatusStaleMs = null,
+    dbStatusMode = "live",
+    dbStatusReason = null,
+    dbStatusNoCache = false,
+    mongoGateDeferred = false,
+    mongoGateSeverity = null,
+  } = {}) => {
+    const normalizedStatus = status && typeof status === "object" ? status : {};
+    const ticker = getTickerStatus();
+    const halted = isHalted();
+    const mongoStatus = mongoStatusFields();
+    const freshness = socketStatusFreshnessFields({
+      dbStatusMode,
+      dbStatusStaleMs,
+      mongoStatus,
+    });
+    noteMongoStatusStaleness({
+      subsystem: "socket_status",
+      staleMs: freshness.statusStale ? freshness.statusStaleMs : 0,
+    });
+    const normalizedTicker = {
+      connected: false,
+      lastDisconnect: null,
+      hasSession: false,
+      ...(ticker || {}),
+    };
+    const dailyPnL =
+      normalizedStatus?.dailyRisk?.lastTotal ??
+      normalizedStatus?.dailyRisk?.lastRealizedPnl ??
+      normalizedStatus?.dailyRisk?.realizedPnl ??
+      null;
+    const state =
+      normalizedStatus?.dailyRiskState ??
+      normalizedStatus?.dailyRisk?.state ??
+      "RUNNING";
+    const activeTrade = normalizeActiveTrade(normalizedStatus?.activeTrade);
+    const activeTradeId = normalizedStatus?.activeTradeId ?? null;
+    const targetMode =
+      activeTrade?.optTargetMode ||
+      (activeTrade?.targetVirtual ? "VIRTUAL" : null) ||
+      (env.OPT_TARGET_MODE ? String(env.OPT_TARGET_MODE).toUpperCase() : null);
+    const stopMode = activeTrade?.optStopMode || env.OPT_STOP_MODE || null;
+    const targetStatus = activeTrade
+      ? activeTrade?.targetOrderId
+        ? activeTrade?.targetVirtual
+          ? "VIRTUAL"
+          : "PLACED"
+        : activeTrade?.targetPrice
+          ? "PENDING"
+          : null
+      : null;
+    const tradeTracking = {
+      tracker: activeTrade?.strategyId || activeTrade?.tracker || null,
+      targetMode,
+      targetStatus,
+      stopMode,
+      lastEvent: activeTrade?.lastEvent || null,
+      lastUpdate: activeTrade?.updatedAt || null,
+      activeTradeId,
+      activeTrade,
+    };
+    const systemHealth = {
+      lastSocketEvent: normalizedStatus?.lastSocketEvent || null,
+      lastDisconnect: normalizedTicker.lastDisconnect || null,
+      rejectedTrades:
+        normalizedStatus?.rejectedTrades ??
+        normalizedStatus?.dailyRisk?.rejectedTrades ??
+        normalizedStatus?.dailyRisk?.rejections ??
+        null,
+      mongoDegraded: mongoStatus.mongoDegraded,
+    };
+    const pipelineReady = normalizedStatus?.pipelineReady ?? !!pipeline;
+    return {
+      ok: normalizedStatus?.ok ?? !!pipeline,
+      pipelineReady,
+      pipelineState:
+        normalizedStatus?.pipelineState || (pipelineReady ? "READY" : "PRIMING"),
+      reasonCode: normalizedStatus?.reasonCode || null,
+      reason: normalizedStatus?.reason || null,
+      updatedAt: normalizedStatus?.updatedAt || new Date().toISOString(),
+      ...normalizedStatus,
+      tradingEnabled: normalizedStatus?.tradingEnabled ?? getTradingEnabled(),
+      killSwitch: normalizedStatus?.killSwitch ?? false,
+      halted,
+      haltInfo: getHaltInfo(),
+      ticker: normalizedTicker,
+      now: new Date().toISOString(),
+      tradesToday: normalizedStatus?.tradesToday ?? 0,
+      ordersPlacedToday: normalizedStatus?.ordersPlacedToday ?? 0,
+      dailyPnL,
+      state,
+      activeTradeId,
+      activeTrade,
+      tradeTracking,
+      systemHealth,
+      dbDegraded: dbDegraded || mongoStatus.mongoDegraded,
+      dbStatusStaleMs,
+      dbStatusMode,
+      dbStatusReason,
+      dbStatusNoCache: !!dbStatusNoCache,
+      dbStatusFreshnessUnavailable: dbStatusMode === "unavailable",
+      mongoGateDeferred: !!mongoGateDeferred,
+      mongoGateSeverity: mongoGateSeverity || null,
+      ...freshness,
+      ...mongoStatus,
+    };
+  };
+
   let pipeline = null;
   let s = null;
   let dbDegraded = false;
   let dbStatusStaleMs = null;
+  let dbStatusMode = "live";
+  let dbStatusReason = null;
+  let dbStatusNoCache = false;
+  let mongoGateDeferred = false;
+  let mongoGateSeverity = null;
+  const staleWarnMs = Math.max(
+    1000,
+    Number(env.MONGO_SOCKET_STALE_WARN_MS ?? 15_000) || 15_000,
+  );
+  const resolvePipeline = () => {
+    if (pipeline) return pipeline;
+    try {
+      pipeline = getPipeline() || null;
+    } catch {
+      pipeline = null;
+    }
+    return pipeline;
+  };
+  const cachedSnapshot = ({
+    reason,
+    severity = null,
+    windowKey,
+    error = null,
+  }) => {
+    if (!pipelineStatusCache.snapshot) return null;
+    s = { ...pipelineStatusCache.snapshot };
+    dbDegraded = true;
+    dbStatusMode = "cache";
+    dbStatusReason = reason;
+    dbStatusNoCache = false;
+    dbStatusStaleMs = Math.max(0, Date.now() - pipelineStatusCache.atMs);
+    reportWindowedFault({
+      windowKey,
+      windowMs: 30_000,
+      code: "SOCKET_STATUS_MONGO_CACHED",
+      err: error || undefined,
+      message: "[socket] serving cached pipeline status during mongo degradation",
+      meta: {
+        statusStaleMs: dbStatusStaleMs,
+        statusStale: true,
+        staleWarn: dbStatusStaleMs >= staleWarnMs,
+        severity,
+      },
+    });
+    return toSnapshot({
+      pipeline: resolvePipeline(),
+      status: s,
+      dbDegraded,
+      dbStatusStaleMs,
+      dbStatusMode,
+      dbStatusReason,
+      dbStatusNoCache,
+      mongoGateDeferred,
+      mongoGateSeverity,
+    });
+  };
+  const gate = evaluateMongoWorkGate({
+    subsystem: "socket_status",
+    priority: "non_critical",
+    phase: "status refresh",
+    windowKey: "socket_pipeline_status_gate_deferred",
+    code: "SOCKET_STATUS_MONGO_DEFERRED",
+    message: "[socket] status refresh deferred by mongo coordinator",
+  });
+  if (gate?.deferred) {
+    const severe =
+      String(gate.status || gate.severity || "").toUpperCase() ===
+      "SEVERELY_DEGRADED";
+    mongoGateDeferred = true;
+    mongoGateSeverity = gate.severity || gate.status || null;
+    const cached = cachedSnapshot({
+      reason: severe ? "mongo_gate_severe_pressure" : "mongo_gate_deferred",
+      severity: gate.severity || gate.status || null,
+      windowKey: "socket_pipeline_status_cached_gate",
+    });
+    if (cached) {
+      return cached;
+    }
+
+    pipeline = resolvePipeline();
+    if (!pipeline) {
+      return toSnapshot({
+        pipeline: null,
+        status: buildPipelineWaitingStatus(),
+        dbDegraded: true,
+        dbStatusMode: "memory",
+        dbStatusReason: severe
+          ? "mongo_gate_severe_pressure_pipeline_waiting"
+          : "mongo_gate_deferred_pipeline_waiting",
+        dbStatusNoCache: true,
+        mongoGateDeferred,
+        mongoGateSeverity,
+      });
+    }
+
+    dbDegraded = true;
+    dbStatusMode = "unavailable";
+    dbStatusNoCache = true;
+    dbStatusReason = severe
+      ? "mongo_gate_severe_pressure_no_cache"
+      : "mongo_gate_deferred_no_cache";
+    reportWindowedFault({
+      windowKey: "socket_pipeline_status_unavailable_gate",
+      windowMs: 30_000,
+      code: "SOCKET_STATUS_MONGO_UNAVAILABLE",
+      message: "[socket] pipeline status unavailable",
+      meta: {
+        reason: dbStatusReason,
+        severity: gate.severity || gate.status || null,
+        noCache: true,
+      },
+    });
+    return toSnapshot({
+      pipeline: resolvePipeline(),
+      status: null,
+      dbDegraded,
+      dbStatusStaleMs: null,
+      dbStatusMode,
+      dbStatusReason,
+      dbStatusNoCache,
+      mongoGateDeferred,
+      mongoGateSeverity,
+    });
+  }
+  let release = gate?.release || null;
   try {
-    pipeline = getPipeline();
+    pipeline = resolvePipeline();
+    if (!pipeline) {
+      if (typeof release === "function") {
+        release();
+        release = null;
+      }
+      return toSnapshot({
+        pipeline: null,
+        status: buildPipelineWaitingStatus(),
+        dbDegraded: false,
+        dbStatusMode: "memory",
+        dbStatusReason: "pipeline_not_ready",
+        dbStatusNoCache: true,
+        mongoGateDeferred: false,
+        mongoGateSeverity: null,
+      });
+    }
     if (pipeline?.status) {
       s = await pipeline.status();
       if (s && typeof s === "object") {
         pipelineStatusCache.snapshot = { ...s };
         pipelineStatusCache.atMs = Date.now();
       }
+      dbStatusMode = "live";
+      dbStatusReason = null;
+      dbStatusNoCache = false;
+      noteMongoWorkSuccess({
+        subsystem: "socket_status",
+        priority: "non_critical",
+        release,
+      });
+      release = null;
     }
   } catch (e) {
     const transientMongo = isTransientMongoError(e);
-    if (transientMongo && pipelineStatusCache.snapshot) {
-      s = { ...pipelineStatusCache.snapshot };
-      dbDegraded = true;
-      dbStatusStaleMs = Math.max(0, Date.now() - pipelineStatusCache.atMs);
-      reportWindowedFault({
-        windowKey: "socket_pipeline_status_cached_mongo",
-        windowMs: 30_000,
-        code: "SOCKET_STATUS_MONGO_CACHED",
-        err: e,
-        message: "[socket] serving cached pipeline status during mongo degradation",
-        meta: { dbStatusStaleMs },
+    if (transientMongo) {
+      deferMongoWorkForError({
+        subsystem: "socket_status",
+        priority: "non_critical",
+        error: e,
+        reason: "socket_status_refresh",
+        phase: "status refresh",
+        windowKey: "socket_pipeline_status_error_deferred",
+        code: "SOCKET_STATUS_MONGO_DEGRADED",
+        message: "[socket] status refresh deferred due to mongo degradation",
+        release,
       });
-    } else if (transientMongo) {
+      release = null;
+      const cached = cachedSnapshot({
+        reason: "mongo_error_cached",
+        severity: getMongoRuntimeState()?.severity || "DEGRADED",
+        windowKey: "socket_pipeline_status_cached_mongo",
+        error: e,
+      });
+      if (cached) {
+        return cached;
+      }
       dbDegraded = true;
+      dbStatusMode = "unavailable";
+      dbStatusReason = "mongo_error_no_cache";
+      dbStatusNoCache = true;
       reportWindowedFault({
         windowKey: "socket_pipeline_status_unavailable_mongo",
         windowMs: 30_000,
@@ -143,86 +525,32 @@ async function buildStatusSnapshot() {
         message: "[socket] pipeline status unavailable",
       });
     } else {
+      if (typeof release === "function") {
+        release();
+        release = null;
+      }
+      if (!s) {
+        dbStatusMode = "unavailable";
+        dbStatusReason = "pipeline_status_error";
+        dbStatusNoCache = pipelineStatusCache.snapshot ? false : true;
+      }
       logger.warn(
         { err: e?.message || String(e) },
         "[socket] pipeline status unavailable",
       );
     }
   }
-  const status = s && typeof s === "object" ? s : {};
-  const ticker = getTickerStatus();
-  const halted = isHalted();
-  const mongoStatus = mongoStatusFields();
-  const normalizedTicker = {
-    connected: false,
-    lastDisconnect: null,
-    hasSession: false,
-    ...(ticker || {}),
-  };
-  const dailyPnL =
-    status?.dailyRisk?.lastTotal ??
-    status?.dailyRisk?.lastRealizedPnl ??
-    status?.dailyRisk?.realizedPnl ??
-    null;
-  const state = status?.dailyRiskState ?? status?.dailyRisk?.state ?? "RUNNING";
-  const activeTrade = normalizeActiveTrade(status?.activeTrade);
-  const activeTradeId = status?.activeTradeId ?? null;
-  const targetMode =
-    activeTrade?.optTargetMode ||
-    (activeTrade?.targetVirtual ? "VIRTUAL" : null) ||
-    (env.OPT_TARGET_MODE ? String(env.OPT_TARGET_MODE).toUpperCase() : null);
-  const stopMode = activeTrade?.optStopMode || env.OPT_STOP_MODE || null;
-  const targetStatus = activeTrade
-    ? activeTrade?.targetOrderId
-      ? activeTrade?.targetVirtual
-        ? "VIRTUAL"
-        : "PLACED"
-      : activeTrade?.targetPrice
-        ? "PENDING"
-        : null
-    : null;
-  const tradeTracking = {
-    tracker: activeTrade?.strategyId || activeTrade?.tracker || null,
-    targetMode,
-    targetStatus,
-    stopMode,
-    lastEvent: activeTrade?.lastEvent || null,
-    lastUpdate: activeTrade?.updatedAt || null,
-    activeTradeId,
-    activeTrade,
-  };
-  const systemHealth = {
-    lastSocketEvent: status?.lastSocketEvent || null,
-    lastDisconnect: normalizedTicker.lastDisconnect || null,
-    rejectedTrades:
-      status?.rejectedTrades ??
-      status?.dailyRisk?.rejectedTrades ??
-      status?.dailyRisk?.rejections ??
-      null,
-    mongoDegraded: mongoStatus.mongoDegraded,
-  };
-  return {
-    ok: status?.ok ?? !!pipeline,
-    pipelineReady: !!pipeline,
-    ...status,
-    tradingEnabled: status?.tradingEnabled ?? getTradingEnabled(),
-    killSwitch: status?.killSwitch ?? false,
-    halted,
-    haltInfo: getHaltInfo(),
-    ticker: normalizedTicker,
-    now: new Date().toISOString(),
-    tradesToday: status?.tradesToday ?? 0,
-    ordersPlacedToday: status?.ordersPlacedToday ?? 0,
-    dailyPnL,
-    state,
-    activeTradeId,
-    activeTrade,
-    tradeTracking,
-    systemHealth,
-    dbDegraded: dbDegraded || mongoStatus.mongoDegraded,
+  return toSnapshot({
+    pipeline,
+    status: s,
+    dbDegraded,
     dbStatusStaleMs,
-    ...mongoStatus,
-  };
+    dbStatusMode,
+    dbStatusReason,
+    dbStatusNoCache,
+    mongoGateDeferred,
+    mongoGateSeverity,
+  });
 }
 
 function getKiteClient() {
@@ -477,8 +805,12 @@ function attachSocketServer(httpServer) {
 
     const resolveStatusIntervalMs = () => {
       const base = Math.max(200, Number(requestedStatusIntervalMs) || 2000);
-      if (!getMongoRuntimeState()?.degraded) return base;
-      return Math.min(Math.max(base, 2000) * 3, 15_000);
+      const mongo = getMongoRuntimeState() || {};
+      if (!mongo.degraded) return base;
+      const severe = String(mongo.severity || "").toUpperCase() === "SEVERELY_DEGRADED";
+      const factor = severe ? 5 : 3;
+      const maxMs = severe ? 20_000 : 15_000;
+      return Math.min(Math.max(base, 2000) * factor, maxMs);
     };
 
     const ensureStatusTimer = () => {
@@ -1072,4 +1404,11 @@ function attachSocketServer(httpServer) {
   return io;
 }
 
-module.exports = { attachSocketServer };
+module.exports = {
+  attachSocketServer,
+  __test: {
+    buildStatusSnapshot,
+    resetPipelineStatusCacheForTests,
+    setPipelineStatusCacheForTests,
+  },
+};

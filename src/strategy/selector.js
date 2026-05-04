@@ -9,13 +9,13 @@ const {
   getCurrentSessionCandles,
 } = require("./utils");
 const { getMinCandlesForRegime } = require("./minCandles");
-
-function parseList(s) {
-  return String(s || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
+const {
+  baseMarketStateFromRegime,
+  resolveMarketState,
+  bucketStrategiesForState,
+  buildStrategyPermissionMatrix,
+  parseList,
+} = require("./marketStateMachine");
 
 function uniq(arr) {
   return Array.from(new Set((arr || []).filter(Boolean)));
@@ -26,8 +26,8 @@ function directionalPersistence(closes, window = 12) {
   const recent = closes.slice(-Math.max(3, Math.min(window, closes.length)));
   let up = 0;
   let down = 0;
-  for (let i = 1; i < recent.length; i++) {
-    const diff = recent[i] - recent[i - 1];
+  for (let index = 1; index < recent.length; index += 1) {
+    const diff = recent[index] - recent[index - 1];
     if (diff > 0) up += 1;
     if (diff < 0) down += 1;
   }
@@ -49,7 +49,12 @@ function resolveSessionPhase({
     return directionalBias >= 0.55 ? "OPEN_EXPANSION" : "OPEN_INIT";
   }
   if (minsToClose <= 45) return "LATE_SESSION";
-  if (minsFromOpen >= 90 && minsToClose >= 90 && rangePct <= rangePctMax * 1.2 && directionalBias < 0.58) {
+  if (
+    minsFromOpen >= 90 &&
+    minsToClose >= 90 &&
+    rangePct <= rangePctMax * 1.2 &&
+    directionalBias < 0.58
+  ) {
     return "MIDDAY_COMPRESSION";
   }
   return "REGULAR";
@@ -93,7 +98,9 @@ function detectRegime({ candles, env, now = new Date() }) {
   const minsFromOpen = open.isValid ? dt.diff(open, "minutes").minutes : 9999;
   const minsToClose = close.isValid ? close.diff(dt, "minutes").minutes : 9999;
   const sessionBars = getCurrentSessionCandles(candles, { endTs: now });
-  const sessionCloses = sessionBars.map((candle) => Number(candle?.close)).filter(Number.isFinite);
+  const sessionCloses = sessionBars
+    .map((candle) => Number(candle?.close))
+    .filter(Number.isFinite);
   const sessionBias = directionalPersistence(sessionCloses, 14);
   const rangePctMax = Number(env.SELECTOR_RANGE_PCT_MAX ?? 0.012);
 
@@ -108,22 +115,35 @@ function detectRegime({ candles, env, now = new Date() }) {
 
   const minCandles = getMinCandlesForRegime(env);
   if (!sessionBars || sessionBars.length < Math.max(2, minCandles)) {
+    const fallbackRegime =
+      minsFromOpen >= 0 && minsFromOpen <= openWinMin ? "OPEN" : "UNKNOWN";
+    const fallbackWeights = normalizeScores({
+      OPEN: fallbackRegime === "OPEN" ? 100 : 0,
+      TREND: 0,
+      TREND_COMPRESSED: 0,
+      RANGE: 0,
+      BREAKOUT_WATCH: 0,
+    });
+    const marketState = baseMarketStateFromRegime({
+      regime: fallbackRegime,
+      primaryRegime: fallbackRegime,
+      regimeWeights: fallbackWeights,
+    });
     return {
-      regime: minsFromOpen >= 0 && minsFromOpen <= openWinMin ? "OPEN" : "UNKNOWN",
-      primaryRegime: minsFromOpen >= 0 && minsFromOpen <= openWinMin ? "OPEN" : "UNKNOWN",
+      regime: fallbackRegime,
+      primaryRegime: fallbackRegime,
       secondaryRegime: null,
-      regimeWeights: normalizeScores({
-        OPEN: minsFromOpen >= 0 && minsFromOpen <= openWinMin ? 100 : 0,
-        TREND: 0,
-        TREND_COMPRESSED: 0,
-        RANGE: 0,
-        BREAKOUT_WATCH: 0,
-      }),
+      regimeWeights: fallbackWeights,
+      marketState,
+      marketStateFamily:
+        marketState === "OPEN_DRIVE" ? "OPEN" : marketState === "NO_TRADE" ? "NO_TRADE" : "UNKNOWN",
       meta: {
         reason: "INSUFFICIENT_CANDLES",
         minsFromOpen,
         minsToClose,
         sessionPhase: openPhase,
+        compressionActive: false,
+        breakoutWatchActive: false,
       },
     };
   }
@@ -133,22 +153,27 @@ function detectRegime({ candles, env, now = new Date() }) {
   const lookback = Number(env.SELECTOR_RANGE_LOOKBACK ?? 30);
   const atrPeriod = Number(env.SELECTOR_ATR_PERIOD ?? 14);
   if (sessionCloses.length < slow + 2) {
+    const fallbackWeights = normalizeScores({
+      OPEN: 0,
+      TREND: 0,
+      TREND_COMPRESSED: 0,
+      RANGE: 0,
+      BREAKOUT_WATCH: 0,
+    });
     return {
       regime: "UNKNOWN",
       primaryRegime: "UNKNOWN",
       secondaryRegime: null,
-      regimeWeights: normalizeScores({
-        OPEN: 0,
-        TREND: 0,
-        TREND_COMPRESSED: 0,
-        RANGE: 0,
-        BREAKOUT_WATCH: 0,
-      }),
+      regimeWeights: fallbackWeights,
+      marketState: "RANGE_CHOP",
+      marketStateFamily: "RANGE",
       meta: {
         reason: "BAD_CLOSES",
         minsFromOpen,
         minsToClose,
         sessionPhase: openPhase,
+        compressionActive: false,
+        breakoutWatchActive: false,
       },
     };
   }
@@ -156,7 +181,9 @@ function detectRegime({ candles, env, now = new Date() }) {
   const ef = emaSeries(sessionCloses, fast);
   const es = emaSeries(sessionCloses, slow);
   const cur = sessionCloses[sessionCloses.length - 1];
-  const emaDiff = Math.abs(Number(ef[ef.length - 1] || 0) - Number(es[es.length - 1] || 0));
+  const emaDiff = Math.abs(
+    Number(ef[ef.length - 1] || 0) - Number(es[es.length - 1] || 0),
+  );
   const atrVal = atr(sessionBars, atrPeriod) || cur * 0.001;
   const diffInAtr = atrVal > 0 ? emaDiff / atrVal : 0;
   const lookbackUsed = Math.min(lookback, sessionBars.length);
@@ -195,7 +222,7 @@ function detectRegime({ candles, env, now = new Date() }) {
     100,
   );
   const trendScore = clamp(
-    diffInAtr / Math.max(0.1, trendDiffAtr) * 48 +
+    (diffInAtr / Math.max(0.1, trendDiffAtr)) * 48 +
       persistence * 34 +
       (trendUpBias || trendDownBias ? 12 : 0) -
       Math.max(0, (rangePctMax - rangePct) * 1200),
@@ -203,7 +230,7 @@ function detectRegime({ candles, env, now = new Date() }) {
     100,
   );
   const trendCompressedScore = clamp(
-    diffInAtr / Math.max(0.1, compressedTrendDiffAtr) * 34 +
+    (diffInAtr / Math.max(0.1, compressedTrendDiffAtr)) * 34 +
       persistence * 28 +
       Math.max(0, 1 - rangePct / Math.max(compressedTrendRangePct, 0.0001)) * 30 +
       (trendUpBias || trendDownBias ? 8 : 0),
@@ -236,7 +263,12 @@ function detectRegime({ candles, env, now = new Date() }) {
   const ranked = rankWeights(regimeWeights);
   const primaryRegime = ranked[0]?.regime || "UNKNOWN";
   const secondaryRegime = ranked[1]?.weight >= 0.18 ? ranked[1].regime : null;
-  const regime = primaryRegime === "BREAKOUT_WATCH" ? "TREND_COMPRESSED" : primaryRegime;
+  const regime = primaryRegime;
+  const marketState = baseMarketStateFromRegime({
+    regime,
+    primaryRegime,
+    regimeWeights,
+  });
   const dayShape =
     breakoutWatchScore >= 0.22
       ? "BREAKOUT_WATCH"
@@ -251,6 +283,15 @@ function detectRegime({ candles, env, now = new Date() }) {
     primaryRegime,
     secondaryRegime,
     regimeWeights,
+    marketState,
+    marketStateFamily:
+      marketState === "OPEN_DRIVE"
+        ? "OPEN"
+        : marketState === "CLEAN_TREND"
+          ? "TREND"
+          : marketState === "RANGE_CHOP"
+            ? "RANGE"
+            : "FRAGILE",
     meta: {
       diffInAtr,
       rangePct,
@@ -269,70 +310,156 @@ function detectRegime({ candles, env, now = new Date() }) {
       trendCompressedScore,
       rangeScore,
       breakoutWatchScore,
+      compressionActive:
+        primaryRegime === "TREND_COMPRESSED" ||
+        Number(regimeWeights.TREND_COMPRESSED ?? 0) >= 0.32,
+      breakoutWatchActive:
+        primaryRegime === "BREAKOUT_WATCH" ||
+        Number(regimeWeights.BREAKOUT_WATCH ?? 0) >= 0.24,
     },
   };
 }
 
 function addBucketStrategies(target, strategyIds, weight, bonus = 0) {
   for (const id of strategyIds || []) {
+    const normalized = String(id || "").trim();
+    if (!normalized) continue;
     const nextWeight = clamp(Number(weight ?? 0) + bonus, 0, 1);
-    target.set(id, Math.max(Number(target.get(id) ?? 0), nextWeight));
+    target.set(normalized, Math.max(Number(target.get(normalized) ?? 0), nextWeight));
   }
 }
 
-function pickStrategies({ candles, env, now = new Date() }) {
-  const det = detectRegime({ candles, env, now });
-  const always = parseList(env.STRATEGIES_ALWAYS || env.STRATEGIES || "ema_cross");
+function resolveStateWeightsFromRegimeWeights(regimeWeights = {}) {
+  return {
+    OPEN_DRIVE: Number(regimeWeights.OPEN ?? 0),
+    CLEAN_TREND: Number(regimeWeights.TREND ?? 0),
+    TREND_COMPRESSED: Number(regimeWeights.TREND_COMPRESSED ?? 0),
+    BREAKOUT_WATCH: Number(regimeWeights.BREAKOUT_WATCH ?? 0),
+    RANGE_CHOP: Number(regimeWeights.RANGE ?? 0),
+  };
+}
+
+function selectStrategiesFromDetection({ det, env }) {
+  const allStrategies = parseList(env.STRATEGIES || process.env.STRATEGIES || "");
+  const always = parseList(env.STRATEGIES_ALWAYS || process.env.STRATEGIES_ALWAYS || "");
   const strategyWeights = new Map();
 
-  const bucketMap = {
-    OPEN: parseList(env.STRATEGIES_OPEN),
-    TREND: parseList(env.STRATEGIES_TREND),
-    TREND_COMPRESSED: parseList(
-      env.STRATEGIES_TREND_COMPRESSED || process.env.STRATEGIES_TREND_COMPRESSED,
-    ),
-    RANGE: parseList(env.STRATEGIES_RANGE),
-    BREAKOUT_WATCH: parseList(
-      env.STRATEGIES_BREAKOUT_WATCH ||
-        process.env.STRATEGIES_BREAKOUT_WATCH ||
-        env.STRATEGIES_TREND_COMPRESSED ||
-        env.STRATEGIES_TREND,
-    ),
-  };
+  const stateResolution = resolveMarketState({
+    regime: det?.regime,
+    primaryRegime: det?.primaryRegime,
+    regimeWeights: det?.regimeWeights,
+    env,
+  });
+  const marketState = stateResolution.marketState;
+  const marketStateFamily = stateResolution.marketStateFamily;
+  const stateWeights = resolveStateWeightsFromRegimeWeights(det?.regimeWeights || {});
+  const stateRanked = Object.entries(stateWeights)
+    .sort((a, b) => Number(b[1] ?? 0) - Number(a[1] ?? 0))
+    .map(([state]) => state);
+  const primaryState = stateRanked[0] || marketState;
+  const secondaryState = stateRanked[1] || null;
 
-  addBucketStrategies(strategyWeights, always, 0.55, 0);
-  for (const [bucket, weight] of Object.entries(det.regimeWeights || {})) {
-    if (Number(weight ?? 0) < 0.14 && bucket !== det.primaryRegime && bucket !== det.secondaryRegime) {
+  addBucketStrategies(strategyWeights, always, 0.42, 0);
+
+  for (const [state, weight] of Object.entries(stateWeights)) {
+    const numericWeight = Number(weight ?? 0);
+    if (
+      numericWeight < 0.12 &&
+      state !== primaryState &&
+      state !== secondaryState &&
+      state !== marketState
+    ) {
       continue;
     }
-    const fallbackBucket =
-      bucket === "TREND_COMPRESSED" && !bucketMap.TREND_COMPRESSED.length
-        ? bucketMap.TREND
-        : bucketMap[bucket];
-    addBucketStrategies(strategyWeights, fallbackBucket, Number(weight ?? 0), 0);
+    const bucket = bucketStrategiesForState(env, state);
+    addBucketStrategies(strategyWeights, bucket, numericWeight, 0);
   }
+
+  const strictStateBucket = bucketStrategiesForState(env, marketState);
+  addBucketStrategies(strategyWeights, strictStateBucket, 0.26, 0.08);
 
   const sessionPhase = String(det?.meta?.sessionPhase || "");
   const phaseBucket = parseList(
     env[`STRATEGIES_${sessionPhase}`] || process.env[`STRATEGIES_${sessionPhase}`],
   );
-  addBucketStrategies(strategyWeights, phaseBucket, 0.22, 0.08);
+  addBucketStrategies(strategyWeights, phaseBucket, 0.22, 0.06);
+
+  const permissionMatrix = buildStrategyPermissionMatrix({
+    marketState,
+    allowedStrategies: Array.from(strategyWeights.keys()),
+    allStrategies,
+    env,
+  });
+
+  for (const strategyId of permissionMatrix.blockedStrategies) {
+    strategyWeights.delete(strategyId);
+  }
+  for (const strategyId of permissionMatrix.penalizedStrategies) {
+    const current = Number(strategyWeights.get(strategyId) ?? 0);
+    if (!Number.isFinite(current) || current <= 0) continue;
+    strategyWeights.set(strategyId, Number((current * 0.65).toFixed(6)));
+  }
 
   const sortedStrategies = Array.from(strategyWeights.entries())
     .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
     .map(([strategyId]) => strategyId);
-  const strategyIds = uniq(sortedStrategies);
-  const strategyWeightObj = Object.fromEntries(strategyWeights.entries());
+  let strategyIds = uniq(sortedStrategies);
 
+  if (marketState === "NO_TRADE") {
+    strategyIds = ["__NO_TRADE__"];
+  } else if (!strategyIds.length) {
+    const fallback = bucketStrategiesForState(env, marketState);
+    const fallbackPermission = buildStrategyPermissionMatrix({
+      marketState,
+      allowedStrategies: fallback,
+      allStrategies,
+      env,
+    });
+    strategyIds = fallbackPermission.allowedStrategies.length
+      ? fallbackPermission.allowedStrategies
+      : ["__NO_TRADE__"];
+  }
+
+  const strategyWeightObj = Object.fromEntries(strategyWeights.entries());
   return {
-    ...det,
     strategyIds,
     strategyWeights: strategyWeightObj,
+    marketState,
+    marketStateFamily,
+    strategyPermissions: permissionMatrix,
+    stateEscalations: stateResolution.escalations || [],
+  };
+}
+
+function pickStrategies({ candles, env, now = new Date() }) {
+  const det = detectRegime({ candles, env, now });
+  const selection = selectStrategiesFromDetection({ det, env });
+  return {
+    ...det,
+    marketState: selection.marketState,
+    marketStateFamily: selection.marketStateFamily,
+    strategyIds: selection.strategyIds,
+    strategyWeights: selection.strategyWeights,
+    strategyPermissions: selection.strategyPermissions,
     meta: {
       ...(det.meta || {}),
-      strategyWeights: strategyWeightObj,
+      strategyWeights: selection.strategyWeights,
+      strategyPermissions: selection.strategyPermissions,
+      marketState: selection.marketState,
+      marketStateFamily: selection.marketStateFamily,
+      stateEscalations: selection.stateEscalations,
+      rawRegime: det.regime,
+      compressionActive: det?.meta?.compressionActive === true,
+      breakoutWatchActive: det?.meta?.breakoutWatchActive === true,
     },
   };
 }
 
-module.exports = { detectRegime, pickStrategies };
+module.exports = {
+  detectRegime,
+  pickStrategies,
+  __debug: {
+    selectStrategiesFromDetection,
+    resolveStateWeightsFromRegimeWeights,
+  },
+};

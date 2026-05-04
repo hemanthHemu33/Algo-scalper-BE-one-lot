@@ -11,7 +11,7 @@ const {
   getTradingEnabledSource,
   setTradingEnabled,
 } = require("./runtime/tradingEnabled");
-const { getDb } = require("./db");
+const { getDb, getMongoRuntimeState } = require("./db");
 const { telemetry } = require("./telemetry/signalTelemetry");
 const { tradeTelemetry } = require("./telemetry/tradeTelemetry");
 const { optimizer } = require("./optimizer/adaptiveOptimizer");
@@ -47,6 +47,9 @@ const {
   reloadMarketCalendar,
 } = require("./market/marketCalendar");
 const { getRecentCandles } = require("./market/candleStore");
+const {
+  getCandleWriterHealth,
+} = require("./market/candleWriteBuffer");
 const { getLatestLtp, getLatestLtps } = require("./market/ltpStream");
 const { getQuoteGuardStats } = require("./kite/quoteGuard");
 const { exchangeAndStoreKiteSession } = require("./kite/kiteLogin");
@@ -56,6 +59,9 @@ const {
 } = require("./runtime/livePreflight");
 const { getSessionControlStatus } = require("./kite/sessionControl");
 const { getTokenWatcherStatus } = require("./tokenWatcher");
+const {
+  getNotificationDispatcherStatus,
+} = require("./alerts/notificationDispatcher");
 const {
   normalizeActiveTrade,
   normalizeTradeRow,
@@ -183,7 +189,39 @@ function buildApp() {
 
   // ------------------------------------------
 
-  app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+  app.get("/health", async (req, res) => {
+    try {
+      const pipeline = getPipelineSafe();
+      const ticker = getTickerStatus?.() || null;
+      const halted = isHalted();
+      const livePreflight = await refreshLiveStatus("health");
+      const mongo = buildMongoEndpointSnapshot();
+      const readiness = buildReadinessAssessment({
+        pipeline,
+        ticker,
+        halted,
+        livePreflight,
+        mongo,
+      });
+
+      res.json({
+        ok: true,
+        now: new Date().toISOString(),
+        pipelineReady: !!pipeline,
+        ticker,
+        halted,
+        livePreflight,
+        mongo,
+        readiness,
+      });
+    } catch (error) {
+      res.status(503).json({
+        ok: false,
+        error: error?.message || String(error),
+        now: new Date().toISOString(),
+      });
+    }
+  });
 
   app.get("/metrics", async (req, res) => {
     try {
@@ -306,6 +344,156 @@ function buildApp() {
     });
   }
 
+  function buildPipelineWaitingStatus() {
+    const tokenWatcher = getTokenWatcherStatus?.() || {};
+    const ticker = getTickerStatus?.() || {};
+    const updatedAt = new Date().toISOString();
+
+    if (!tokenWatcher?.hasValidToken) {
+      const reasonCode = tokenWatcher?.lastReason || "WAITING_FOR_TOKEN";
+      return {
+        ok: true,
+        pipelineReady: false,
+        pipelineState: "WAITING_FOR_TOKEN",
+        reasonCode,
+        reason:
+          reasonCode === "PREVIOUS_TRADING_DAY_TOKEN"
+            ? "Previous-day token blocked; waiting for a fresh token."
+            : "Waiting for a valid Kite token.",
+        updatedAt,
+      };
+    }
+
+    if (!ticker?.connected) {
+      return {
+        ok: true,
+        pipelineReady: false,
+        pipelineState: "PRIMING",
+        reasonCode: ticker?.hasSession ? "TICKER_CONNECTING" : "SESSION_PRIMING",
+        reason: ticker?.hasSession
+          ? "Kite session is active; waiting for ticker connectivity."
+          : "Kite session is being initialized.",
+        updatedAt,
+      };
+    }
+
+    return {
+      ok: true,
+      pipelineReady: false,
+      pipelineState: "BACKFILLING",
+      reasonCode: "PIPELINE_PRIMING",
+      reason: "Pipeline bootstrap is still priming runtime state.",
+      updatedAt,
+    };
+  }
+
+  function buildMongoEndpointSnapshot() {
+    const mongoState = getMongoRuntimeState() || {};
+    const notifications = getNotificationDispatcherStatus?.() || {};
+    const candleWriter = getCandleWriterHealth?.() || {};
+    const signalTelemetry = telemetry.snapshot?.().health || {};
+    const tradeTelemetryHealth = tradeTelemetry.snapshot?.().health || {};
+    const backlogSummary = mongoState?.backlogSummary || {};
+
+    return {
+      state: mongoState?.state || mongoState?.status || "HEALTHY",
+      severity: mongoState?.severity || mongoState?.status || "HEALTHY",
+      degradedSince: mongoState?.degradedSince || null,
+      recoveringSince: mongoState?.recoveringSince || null,
+      failureStreak: Number(mongoState?.failureStreak || 0),
+      lastFailureAt: mongoState?.lastFailureAt || null,
+      lastSuccessAt: mongoState?.lastSuccessAt || null,
+      recommendedAction: mongoState?.recommendedAction || null,
+      pool: mongoState?.pool || mongoState?.poolMetrics?.global || {},
+      backlogs: {
+        candleWriter: {
+          ...(backlogSummary.candleWriter || {}),
+          ...candleWriter,
+        },
+        notifications: {
+          ...(backlogSummary.notifications || {}),
+          ...(notifications.health || {}),
+        },
+        signalTelemetry: {
+          ...(backlogSummary.signalTelemetry || {}),
+          ...signalTelemetry,
+        },
+        tradeTelemetry: {
+          ...(backlogSummary.tradeTelemetry || {}),
+          ...tradeTelemetryHealth,
+        },
+      },
+    };
+  }
+
+  function buildReadinessAssessment({
+    pipeline = null,
+    ticker = null,
+    halted = false,
+    livePreflight = null,
+    mongo = null,
+    tradeStatus = null,
+  } = {}) {
+    const warnings = [];
+    const blockers = [];
+    const normalizedTicker = ticker || {};
+    const mongoSnapshot = mongo || buildMongoEndpointSnapshot();
+    const mongoState = mongoSnapshot?.state || "HEALTHY";
+    const candleBacklog = mongoSnapshot?.backlogs?.candleWriter || {};
+    const candleReadinessReasons = Array.isArray(candleBacklog.readinessReasons)
+      ? candleBacklog.readinessReasons
+      : [];
+    const candleDataUnsafe =
+      candleBacklog.readinessBlocked === true ||
+      candleReadinessReasons.includes("CANDLE_WRITER_BACKLOG_MAXED") ||
+      candleReadinessReasons.includes("CANDLE_PERSISTENCE_BACKLOG_HIGH");
+    const activeTradeProtectionRequired = Boolean(
+      tradeStatus?.activeTradeId || tradeStatus?.activeTrade,
+    );
+
+    if (!pipeline) blockers.push("PIPELINE_NOT_READY");
+    if (!normalizedTicker?.connected) blockers.push("TICKER_NOT_CONNECTED");
+    if (halted) blockers.push("HALTED");
+    if (livePreflight?.requestedByEnv && livePreflight?.ok === false) {
+      blockers.push("LIVE_PREFLIGHT_BLOCKED");
+    }
+    if (candleDataUnsafe) {
+      blockers.push(
+        candleReadinessReasons[0] || "CANDLE_PERSISTENCE_BACKLOG_HIGH",
+      );
+    }
+
+    if (mongoState === "DEGRADED") warnings.push("MONGO_DEGRADED");
+    if (mongoState === "SEVERELY_DEGRADED") warnings.push("MONGO_SEVERELY_DEGRADED");
+    if (mongoState === "RECOVERING") warnings.push("MONGO_RECOVERING");
+
+    const coreReady =
+      blockers.filter((code) => code !== "CANDLE_PERSISTENCE_BACKLOG_HIGH" &&
+        code !== "CANDLE_WRITER_BACKLOG_MAXED").length === 0;
+    let allowNewTrades = coreReady && !candleDataUnsafe;
+    let ready = allowNewTrades;
+
+    if (mongoState === "DEGRADED") {
+      ready = coreReady && !candleDataUnsafe;
+    } else if (mongoState === "SEVERELY_DEGRADED") {
+      ready = false;
+      allowNewTrades = false;
+      warnings.push("MONGO_ALLOW_ONLY_CRITICAL_DB_WORK");
+    } else if (mongoState === "RECOVERING") {
+      ready = coreReady && !candleDataUnsafe;
+      allowNewTrades = ready;
+      if (!ready) warnings.push("MONGO_RECOVERY_NOT_STABLE");
+    }
+
+    return {
+      ready,
+      allowNewTrades,
+      activeTradeProtectionRequired,
+      blockers: Array.from(new Set(blockers)),
+      warnings: Array.from(new Set(warnings)),
+    };
+  }
+
   // Optional: FE can exchange request_token (if your Kite redirect_url points to FE).
   // In production, this endpoint is protected by ADMIN_API_KEY (same as other /admin routes).
   app.post("/admin/kite/session", requirePerm("admin"), async (req, res) => {
@@ -357,6 +545,15 @@ function buildApp() {
       subscribeTokens: env.SUBSCRIBE_TOKENS || "",
       subscribeSymbols: env.SUBSCRIBE_SYMBOLS || "",
       candleIntervals: env.CANDLE_INTERVALS,
+      runtimeLogs: {
+        dbEnabled: env.RUNTIME_LOGS_DB_ENABLED,
+        collection: env.RUNTIME_LOGS_COLLECTION,
+        bufferMax: env.RUNTIME_LOGS_BUFFER_MAX,
+        batchSize: env.RUNTIME_LOGS_BATCH_SIZE,
+        flushIntervalMs: env.RUNTIME_LOGS_FLUSH_INTERVAL_MS,
+        ttlEnabled: env.RUNTIME_LOGS_TTL_ENABLED,
+        ttlDays: env.RUNTIME_LOGS_TTL_DAYS,
+      },
       strategyId: env.STRATEGY_ID,
       strategies: env.STRATEGIES,
       signalIntervals: env.SIGNAL_INTERVALS,
@@ -400,23 +597,40 @@ function buildApp() {
 
   app.get("/ready", async (req, res) => {
     try {
-      const pipeline = getPipeline();
+      const pipeline = getPipelineSafe();
       const ticker = getTickerStatus();
       const halted = isHalted();
       const livePreflight = await refreshLiveStatus("ready");
+      const mongo = buildMongoEndpointSnapshot();
+      let tradeStatus = null;
+      if (pipeline?.status) {
+        try {
+          tradeStatus = await pipeline.status();
+        } catch {
+          tradeStatus = null;
+        }
+      }
+      const readiness = buildReadinessAssessment({
+        pipeline,
+        ticker,
+        halted,
+        livePreflight,
+        mongo,
+        tradeStatus,
+      });
 
-      const ok =
-        !!pipeline &&
-        ticker.connected &&
-        !halted &&
-        (livePreflight?.requestedByEnv ? livePreflight?.ok !== false : true);
-
-      res.status(ok ? 200 : 503).json({
-        ok,
+      res.status(readiness.ready ? 200 : 503).json({
+        ok: readiness.ready,
+        pipelineReady: !!pipeline,
         halted,
         haltInfo: getHaltInfo(),
         ticker,
         livePreflight,
+        mongo,
+        readiness,
+        ...(tradeStatus
+          ? { tradeStatus }
+          : { pipelineStatus: buildPipelineWaitingStatus() }),
         now: new Date().toISOString(),
       });
     } catch (e) {
@@ -433,11 +647,8 @@ function buildApp() {
       const haltInfo = getHaltInfo();
       const quoteGuard = getQuoteGuardStats();
       const livePreflight = await refreshLiveStatus("critical_health");
-
-      let pipeline = null;
-      try {
-        pipeline = getPipeline();
-      } catch (err) { reportFault({ code: "APP_CATCH", err, message: "[src/app.js] caught and continued" }); }
+      const mongo = buildMongoEndpointSnapshot();
+      const pipeline = getPipelineSafe();
 
       const risk = pipeline?.trader?.risk;
       const killSwitch = !!(risk?.getKillSwitch?.() ?? risk?.kill);
@@ -498,8 +709,35 @@ function buildApp() {
 
       const deep = String(req.query.deep || "").trim() === "1";
       const pipeStatus = deep && pipeline ? await pipeline.status() : null;
+      const readiness = buildReadinessAssessment({
+        pipeline,
+        ticker,
+        halted,
+        livePreflight,
+        mongo,
+        tradeStatus: pipeStatus,
+      });
 
-      const ok = checks.every((c) => c.ok);
+      if (mongo.state === "DEGRADED") {
+        checks.push({ ok: true, code: "MONGO_DEGRADED", meta: { severity: mongo.severity } });
+      } else if (mongo.state === "RECOVERING") {
+        checks.push({ ok: readiness.ready, code: "MONGO_RECOVERING", meta: { severity: mongo.severity } });
+      } else if (mongo.state === "SEVERELY_DEGRADED") {
+        checks.push({
+          ok: false,
+          code: "MONGO_SEVERELY_DEGRADED",
+          meta: { severity: mongo.severity, recommendedAction: mongo.recommendedAction },
+        });
+      }
+
+      if (readiness.blockers.includes("CANDLE_PERSISTENCE_BACKLOG_HIGH")) {
+        checks.push({ ok: false, code: "CANDLE_PERSISTENCE_BACKLOG_HIGH" });
+      }
+      if (readiness.blockers.includes("CANDLE_WRITER_BACKLOG_MAXED")) {
+        checks.push({ ok: false, code: "CANDLE_WRITER_BACKLOG_MAXED" });
+      }
+
+      const ok = checks.every((c) => c.ok) && readiness.ready;
 
       res.status(ok ? 200 : 503).json({
         ok,
@@ -511,8 +749,12 @@ function buildApp() {
         killSwitch,
         quoteGuard,
         livePreflight,
+        mongo,
+        readiness,
         pipeline: pipeline ? { ok: true } : { ok: false },
-        ...(pipeStatus ? { deepStatus: pipeStatus } : {}),
+        ...(pipeStatus
+          ? { deepStatus: pipeStatus }
+          : { pipelineStatus: buildPipelineWaitingStatus() }),
       });
     } catch (e) {
       res
@@ -523,13 +765,22 @@ function buildApp() {
 
   app.get("/admin/status", requirePerm("read"), async (req, res) => {
     try {
-      const pipeline = getPipeline();
-      const s = await pipeline.status();
+      const pipeline = getPipelineSafe();
+      let s = null;
+      let statusError = null;
+      if (pipeline?.status) {
+        try {
+          s = await pipeline.status();
+        } catch (error) {
+          statusError = error;
+        }
+      }
       const ticker = getTickerStatus();
       const halted = isHalted();
       const livePreflight = await refreshLiveStatus("admin_status");
       const sessionControl = getSessionControlStatus();
       const tokenWatcher = getTokenWatcherStatus();
+      const mongo = buildMongoEndpointSnapshot();
       const normalizedTicker = {
         connected: false,
         lastDisconnect: null,
@@ -576,11 +827,23 @@ function buildApp() {
           s?.dailyRisk?.rejectedTrades ??
           s?.dailyRisk?.rejections ??
           null,
+        mongoSeverity: mongo?.severity || "HEALTHY",
+        mongoDegradedDurationMs: Number(
+          mongo?.degradedSince ? Date.now() - new Date(mongo.degradedSince).getTime() : 0,
+        ),
       };
+      const readiness = buildReadinessAssessment({
+        pipeline,
+        ticker,
+        halted,
+        livePreflight,
+        mongo,
+        tradeStatus: s,
+      });
 
       res.json({
         ok: true,
-        ...s,
+        ...(s || buildPipelineWaitingStatus()),
         tradingEnabled: s?.tradingEnabled ?? getTradingEnabled(),
         killSwitch: s?.killSwitch ?? false,
         effectiveLiveEnabled:
@@ -593,6 +856,8 @@ function buildApp() {
         ticker: normalizedTicker,
         kiteSession: sessionControl,
         tokenWatcher,
+        mongo,
+        readiness,
         now: new Date().toISOString(),
         tradesToday: s?.tradesToday ?? 0,
         ordersPlacedToday: s?.ordersPlacedToday ?? 0,
@@ -603,6 +868,9 @@ function buildApp() {
         tradeTracking,
         systemHealth,
         faults: s?.faults || snapshotFaults(),
+        ...(statusError
+          ? { statusError: statusError?.message || String(statusError) }
+          : {}),
       });
     } catch (e) {
       res.status(503).json({ ok: false, error: e.message });
